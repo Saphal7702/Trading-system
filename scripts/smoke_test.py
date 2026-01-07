@@ -1,0 +1,1 @@
+print("Trading project setup OK ✅")
