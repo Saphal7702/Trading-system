@@ -5,6 +5,8 @@ from .config import get_settings
 from .db import init_db, connect
 from datetime import datetime, timedelta, timezone
 from .compliance import can_sell
+from .universe import load_watchlist_csv
+from .runloop import run_once
 
 log = logging.getLogger("trading")
 
@@ -36,6 +38,28 @@ def cmd_compliance_test() -> int:
 
     return 0
 
+def cmd_load_watchlist(csv_path: str) -> int:
+    n = load_watchlist_csv(csv_path)
+    log.info("Loaded/updated %s symbols from %s", n, csv_path)
+    return 0
+
+def cmd_run(notes: str) -> int:
+    res = run_once(notes=notes or None)
+    log.info("Run completed. run_id=%s", res.run_id)
+    return 0
+
+def cmd_status() -> int:
+    from .db import connect
+    with connect() as conn:
+        sym = conn.execute("SELECT COUNT(*) AS c FROM symbols;").fetchone()["c"]
+        runs = conn.execute("SELECT COUNT(*) AS c FROM runs;").fetchone()["c"]
+        pos = conn.execute("SELECT COUNT(*) AS c FROM positions;").fetchone()["c"]
+        ords = conn.execute("SELECT COUNT(*) AS c FROM orders;").fetchone()["c"]
+
+    log.info("symbols=%s | runs=%s | positions=%s | orders=%s", sym, runs, pos, ords)
+    return 0
+
+
 def main() -> int:
     setup_logging()
 
@@ -45,6 +69,14 @@ def main() -> int:
     sub.add_parser("healthcheck", help="Verify config + initialize DB schema")
     sub.add_parser("compliance-test")
 
+    p_watch = sub.add_parser("load-watchlist", help="Load symbols from a watchlist CSV into the DB")
+    p_watch.add_argument("--csv", default="data/watchlist.csv", help="Path to watchlist CSV (default: data/watchlist.csv)")
+
+    p_run = sub.add_parser("run", help="Execute one trading cycle (Phase 1 skeleton)")
+    p_run.add_argument("--notes", default="", help="Optional notes to store in runs table")
+
+    sub.add_parser("status", help="Show quick DB status counts")
+
     args = p.parse_args()
 
     if args.cmd == "healthcheck":
@@ -52,5 +84,14 @@ def main() -> int:
     
     if args.cmd == "compliance-test":
         return cmd_compliance_test()
+    
+    if args.cmd == "load-watchlist":
+        return cmd_load_watchlist(args.csv)
+        
+    if args.cmd == "run":
+        return cmd_run(args.notes)
+    
+    if args.cmd == "status":
+        return cmd_status()
 
     return 1
