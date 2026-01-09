@@ -2,3 +2,4 @@ python-dotenv
 requests
 pandas
 numpy
+python-dotenv==1.0.1
