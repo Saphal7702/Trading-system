@@ -53,3 +53,14 @@ CREATE TABLE IF NOT EXISTS executions (
   filled_at TEXT,
   raw_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS bars_daily (
+  symbol TEXT NOT NULL,
+  t TEXT NOT NULL,  
+  o REAL,
+  h REAL,
+  l REAL,
+  c REAL,
+  v REAL,
+  PRIMARY KEY(symbol, t)
+);

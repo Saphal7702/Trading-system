@@ -75,7 +75,12 @@ def cmd_sync_positions() -> int:
     log.info("Synced %s positions from %s", n, b.name)
     return 0
 
-
+def cmd_fetch_bars(days: int) -> int:
+    from .marketdata.alpaca_data import fetch_and_store_for_universe
+    counts = fetch_and_store_for_universe(days=days)
+    total = sum(counts.values())
+    log.info("Fetched bars: total=%s | per_symbol=%s", total, counts)
+    return 0
 
 def main() -> int:
     setup_logging()
@@ -96,6 +101,10 @@ def main() -> int:
 
     sub.add_parser("broker-check", help="Check broker connection and store account snapshot")
     sub.add_parser("sync-positions", help="Sync broker positions into SQLite")
+
+    p_fb = sub.add_parser("fetch-bars", help="Fetch and store daily OHLCV bars for active symbols")
+    p_fb.add_argument("--days", type=int, default=365, help="Lookback days (default 365)")
+
 
     args = p.parse_args()
 
@@ -119,5 +128,8 @@ def main() -> int:
 
     if args.cmd == "sync-positions":
         return cmd_sync_positions()
+    
+    if args.cmd == "fetch-bars":
+        return cmd_fetch_bars(args.days)
 
     return 1
