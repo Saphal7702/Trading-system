@@ -7,6 +7,9 @@ from datetime import datetime, timedelta, timezone
 from .compliance import can_sell
 from .universe import load_watchlist_csv
 from .runloop import run_once
+from trading.broker.alpaca_broker import AlpacaPaperBroker
+from trading.broker.sync import upsert_account, sync_positions
+
 
 log = logging.getLogger("trading")
 
@@ -59,6 +62,20 @@ def cmd_status() -> int:
     log.info("symbols=%s | runs=%s | positions=%s | orders=%s", sym, runs, pos, ords)
     return 0
 
+def cmd_broker_check() -> int:
+    b = AlpacaPaperBroker()
+    upsert_account(b)
+    a = b.get_account()
+    log.info("Broker OK: %s | status=%s | buying_power=%s | equity=%s", a.broker, a.status, a.buying_power, a.equity)
+    return 0
+
+def cmd_sync_positions() -> int:
+    b = AlpacaPaperBroker()
+    n = sync_positions(b)
+    log.info("Synced %s positions from %s", n, b.name)
+    return 0
+
+
 
 def main() -> int:
     setup_logging()
@@ -77,6 +94,9 @@ def main() -> int:
 
     sub.add_parser("status", help="Show quick DB status counts")
 
+    sub.add_parser("broker-check", help="Check broker connection and store account snapshot")
+    sub.add_parser("sync-positions", help="Sync broker positions into SQLite")
+
     args = p.parse_args()
 
     if args.cmd == "healthcheck":
@@ -93,5 +113,11 @@ def main() -> int:
     
     if args.cmd == "status":
         return cmd_status()
+    
+    if args.cmd == "broker-check":
+        return cmd_broker_check()
+
+    if args.cmd == "sync-positions":
+        return cmd_sync_positions()
 
     return 1

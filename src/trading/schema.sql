@@ -31,3 +31,25 @@ CREATE TABLE IF NOT EXISTS runs (
   status TEXT NOT NULL DEFAULT 'running',
   notes TEXT
 );
+
+CREATE TABLE IF NOT EXISTS broker_accounts (
+  broker TEXT PRIMARY KEY,
+  account_id TEXT,
+  status TEXT,
+  currency TEXT,
+  buying_power REAL,
+  equity REAL,
+  last_synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS executions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  broker TEXT NOT NULL,
+  broker_order_id TEXT,
+  symbol TEXT NOT NULL,
+  side TEXT NOT NULL CHECK(side IN ('buy','sell')),
+  qty REAL NOT NULL,
+  filled_avg_price REAL,
+  filled_at TEXT,
+  raw_json TEXT
+);

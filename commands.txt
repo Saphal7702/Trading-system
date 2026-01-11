@@ -1,0 +1,39 @@
+/*********************************** General Commands ****************************************************/
+#Pyproject Info
+Database: Sqlite
+Broker: Alpaca
+
+#Install requirements
+pip install -e .
+
+#Activate venv
+source .venv/bin/activate (Linux)
+.\.venv\Scripts\Activate.ps1 (Windows)
+
+
+/*************************  Git Commands:  **************************************************************/
+#All Git Commands:
+git init	                -> Creates a new Git repository in the current directory.
+git status	                -> Shows the state of your working directory and staging area (which files are modified, staged, or untracked).
+git log	                    -> Shows the commit history
+
+#Git Push
+git branch                  -> Shows all the Branches
+git checkout -b branchName  -> Create a new Branch
+git checkout branchName     -> Switch to the Branch
+git add .                   -> Puts a file from the Working Directory into the Staging Area of the Branch.
+git commit -m "message"     -> Permanently records the staged changes as a new commit in the Branch.
+git push -u origin branchName - > Push the branch to the remote
+
+#Git Pull
+git fetch
+git branch -a
+git checkout branchName
+git pull
+
+# Merging to the main Branch
+git checkout main           -> Switch to Main
+git pull origin main        -> Pull from Main
+git merge branchName        -> Merge the Branch
+git push origin main        -> Push to the Main
+git branch -d branchName    -> Delete the branch

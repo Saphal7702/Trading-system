@@ -12,6 +12,7 @@ dependencies = [
   "requests>=2.31",
   "numpy>=1.26",
   "pandas>=2.1",
+  "alpaca-py==0.28.0",
 ]
 
 [project.scripts]

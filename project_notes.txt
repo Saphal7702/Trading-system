@@ -1,0 +1,14 @@
+#Key Python Concepts 
+
+.toml file 
+-> Tom’s Obvious, Minimal Language
+-> A configuration file format that is the single source of truth for how your Python project is built, installed, and executed.
+-> It replaces setup.py, setup.cfg, requirements.txt, and CLI wiring — all in one place.
+
+@dataclass 
+-> It turns a class into a typed, immutable struct and automatically generate all the boilerplate code needed to safely use it.
+
+The ... means “this method is declared but intentionally not implemented here”, usually to define an interface or abstract contract. 
+Similar to the pass keyword but used for abstract class.
+
+3 quotaions = multi line strings
