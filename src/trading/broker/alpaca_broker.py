@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 from .base import AccountSummary, PositionSnapshot
 
@@ -56,3 +58,12 @@ class AlpacaPaperBroker:
             )
 
         return out
+    
+    def place_market_order(self, symbol: str, side: str, qty: float):
+        req = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        )
+        return self.client.submit_order(req)

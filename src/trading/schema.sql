@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS orders (
   qty REAL NOT NULL,
   requested_at TEXT NOT NULL DEFAULT (datetime('now')),
   status TEXT NOT NULL DEFAULT 'created',
-  reason TEXT
+  reason TEXT,
+  idempotency_key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -64,3 +65,17 @@ CREATE TABLE IF NOT EXISTS bars_daily (
   v REAL,
   PRIMARY KEY(symbol, t)
 );
+
+CREATE TABLE IF NOT EXISTS intents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  symbol TEXT NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('buy','sell','hold')),
+  strength REAL,
+  reason TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency
+ON orders(idempotency_key)
+WHERE idempotency_key IS NOT NULL;
