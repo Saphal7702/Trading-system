@@ -14,8 +14,9 @@ class AccountSummary:
 @dataclass(frozen=True)
 class PositionSnapshot:
     symbol: str
-    quantity: float
-    average_entry_price: float | None
+    qty: float
+    avg_entry_price: float | None
+
 
 class Broker(Protocol):
     name: str

@@ -30,10 +30,47 @@ def sync_positions(broker: Broker) -> int:
                 INSERT INTO positions(symbol, qty, avg_entry_price, opened_at, last_updated_at)
                 VALUES (?, ?, ?, datetime('now'), datetime('now'))
                 ON CONFLICT(symbol) DO UPDATE SET
-                    qty=excluded.qty,
+                  qty=excluded.qty,
                   avg_entry_price=excluded.avg_entry_price,
                   last_updated_at=datetime('now');
                 """,
                 (p.symbol, p.qty, p.avg_entry_price),
             )
+
+    # NEW: backfill opened_at from executions.filled_at (true fill time)
+    updated = backfill_opened_at_from_fills()
+    # optional log if you want:
+    # log.info("Backfilled opened_at from fills: updated=%s", updated)
+
     return len(positions)
+
+
+def backfill_opened_at_from_fills() -> int:
+    """
+    Set positions.opened_at from latest BUY execution filled_at per symbol.
+    Returns number of rows updated (best-effort).
+    """
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE positions
+            SET opened_at = (
+                SELECT e.filled_at
+                FROM executions e
+                WHERE e.symbol = positions.symbol
+                  AND e.side = 'buy'
+                  AND e.filled_at IS NOT NULL
+                ORDER BY e.filled_at DESC
+                LIMIT 1
+            )
+            WHERE qty > 0
+              AND EXISTS (
+                SELECT 1
+                FROM executions e
+                WHERE e.symbol = positions.symbol
+                  AND e.side = 'buy'
+                  AND e.filled_at IS NOT NULL
+              );
+            """
+        )
+        return cur.rowcount

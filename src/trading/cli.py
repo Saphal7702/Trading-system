@@ -58,8 +58,15 @@ def cmd_status() -> int:
         runs = conn.execute("SELECT COUNT(*) AS c FROM runs;").fetchone()["c"]
         pos = conn.execute("SELECT COUNT(*) AS c FROM positions;").fetchone()["c"]
         ords = conn.execute("SELECT COUNT(*) AS c FROM orders;").fetchone()["c"]
+        broker_accounts = conn.execute("SELECT COUNT(*) AS c FROM broker_accounts;").fetchone()["c"]
+        execs = conn.execute("SELECT COUNT(*) AS c FROM executions;").fetchone()["c"]
+        intents = conn.execute("SELECT COUNT(*) AS c FROM intents;").fetchone()["c"]
 
-    log.info("symbols=%s | runs=%s | positions=%s | orders=%s", sym, runs, pos, ords)
+    log.info(
+        "symbols=%s | runs=%s | intents=%s | positions=%s | orders=%s | executions=%s | broker_accounts=%s",
+        sym, runs, intents, pos, ords, execs, broker_accounts
+    )
+
     return 0
 
 def cmd_broker_check() -> int:
@@ -150,7 +157,7 @@ def cmd_explain(symbol: str, fast: int, slow: int) -> int:
         log.info("  %s close=%s", d, c)
     return 0
 
-def cmd_execute(run_id: int, qty: float, submit: bool) -> int:
+def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> int:
     from .execution import build_orders_from_intents, persist_orders, is_paper_submit_allowed
     from .broker.alpaca_broker import AlpacaPaperBroker
     from .db import connect
@@ -160,10 +167,11 @@ def cmd_execute(run_id: int, qty: float, submit: bool) -> int:
     inserted = persist_orders(run_id=run_id, orders=proposed)
 
     log.info(
-        "Execute(run_id=%s): proposed=%s | inserted_into_db=%s",
+        "Execute(run_id=%s): proposed=%s | inserted_into_db=%s | retry_failed=%s",
         run_id,
         len(proposed),
         inserted,
+        retry_failed,
     )
 
     if not proposed:
@@ -178,17 +186,16 @@ def cmd_execute(run_id: int, qty: float, submit: bool) -> int:
         return 0
 
     if not is_paper_submit_allowed():
-        log.info(
-            "Submission blocked: set TRADING_ALLOW_PAPER_ORDERS=true in .env to allow paper submissions."
-        )
+        log.info("Submission blocked: set TRADING_ALLOW_PAPER_ORDERS=true in .env to allow paper submissions.")
         return 0
+
+    allowed_statuses = ("created", "failed") if retry_failed else ("created",)
 
     broker = AlpacaPaperBroker()
 
     submitted = 0
     with connect() as conn:
         for o in proposed:
-            # Fetch the DB order row and ensure it is still eligible to submit.
             row = conn.execute(
                 "SELECT id, status FROM orders WHERE idempotency_key = ?;",
                 (o.idempotency_key,),
@@ -199,8 +206,8 @@ def cmd_execute(run_id: int, qty: float, submit: bool) -> int:
             order_id = row["id"]
             status = row["status"]
 
-            # Idempotency: only submit orders that are still in 'created' state.
-            if status != "created":
+            # Idempotency: only submit eligible statuses
+            if status not in allowed_statuses:
                 log.info(
                     "Skip %s %s: status=%s (idempotency)",
                     o.side.upper(),
@@ -209,10 +216,11 @@ def cmd_execute(run_id: int, qty: float, submit: bool) -> int:
                 )
                 continue
 
-            # Atomically claim the order so concurrent runs don't double-submit.
+            # Atomically claim it to prevent concurrent submits
+            placeholders = ",".join(["?"] * len(allowed_statuses))
             cur = conn.execute(
-                "UPDATE orders SET status='submitting' WHERE id=? AND status='created';",
-                (order_id,),
+                f"UPDATE orders SET status='submitting' WHERE id=? AND status IN ({placeholders});",
+                (order_id, *allowed_statuses),
             )
             if cur.rowcount != 1:
                 log.info(
@@ -223,40 +231,39 @@ def cmd_execute(run_id: int, qty: float, submit: bool) -> int:
                 continue
 
             try:
-                bo = broker.place_market_order(o.symbol, o.side, o.qty)
+                # Convert qty to int if it's a whole number (often safer with broker APIs)
+                qty_to_send = int(o.qty) if float(o.qty).is_integer() else o.qty
+
+                bo = broker.place_market_order(o.symbol, o.side, qty_to_send)
                 broker_order_id = str(getattr(bo, "id", None))
 
-                conn.execute(
-                    "UPDATE orders SET status='submitted' WHERE id=?;",
-                    (order_id,),
-                )
+                # If you have broker_order_id column, store it too (recommended)
+                try:
+                    conn.execute(
+                        "UPDATE orders SET status='submitted', broker_order_id=? WHERE id=?;",
+                        (broker_order_id, order_id),
+                    )
+                except Exception:
+                    # fallback if column doesn't exist yet
+                    conn.execute(
+                        "UPDATE orders SET status='submitted' WHERE id=?;",
+                        (order_id,),
+                    )
+
+                # Save execution snapshot (idempotent if you add a unique index on broker_order_id)
                 conn.execute(
                     """
                     INSERT INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
                     VALUES (?, ?, ?, ?, ?, ?);
                     """,
-                    (
-                        "alpaca",
-                        broker_order_id,
-                        o.symbol,
-                        o.side,
-                        o.qty,
-                        json.dumps(bo.model_dump(), default=str),
-                    ),
+                    ("alpaca", broker_order_id, o.symbol, o.side, float(qty_to_send), json.dumps(bo.model_dump(), default=str)),
                 )
 
                 submitted += 1
-                log.info(
-                    "Submitted %s %s -> broker_order_id=%s",
-                    o.side.upper(),
-                    o.symbol,
-                    broker_order_id,
-                )
+                log.info("Submitted %s %s -> broker_order_id=%s", o.side.upper(), o.symbol, broker_order_id)
+
             except Exception as e:
-                conn.execute(
-                    "UPDATE orders SET status='failed', reason=? WHERE id=?;",
-                    (str(e), order_id),
-                )
+                conn.execute("UPDATE orders SET status='failed', reason=? WHERE id=?;", (str(e), order_id))
                 log.info("FAILED submitting %s %s: %s", o.side.upper(), o.symbol, e)
 
     log.info("Submitted total=%s", submitted)
@@ -276,6 +283,12 @@ def cmd_seed_intent(run_id: int, symbol: str, action: str, reason: str) -> int:
         )
 
     log.info("Seeded intent: run_id=%s %s %s | %s", run_id, action.upper(), sym, reason)
+    return 0
+
+def cmd_sync_orders(limit: int) -> int:
+    from .broker.orders_sync import sync_orders
+    res = sync_orders(limit=limit)
+    log.info("sync-orders: executions_upserted=%s | orders_updated=%s", res["executions_upserted"], res["orders_updated"])
     return 0
 
 
@@ -325,6 +338,11 @@ def main() -> int:
     p_seed.add_argument("--action", choices=["buy", "sell"], required=True)
     p_seed.add_argument("--reason", default="manual test")
 
+    p_so = sub.add_parser("sync-orders", help="Sync recent Alpaca orders into SQLite (executions + order status)")
+    p_so.add_argument("--limit", type=int, default=200)
+
+    p_exec.add_argument("--retry-failed", action="store_true", help="Allow resubmitting orders that previously failed")
+
     args = p.parse_args()
 
     if args.cmd == "healthcheck":
@@ -361,9 +379,12 @@ def main() -> int:
         return cmd_explain(args.symbol, args.fast, args.slow)
 
     if args.cmd == "execute":
-        return cmd_execute(args.run_id, args.qty, args.submit)
+        return cmd_execute(args.run_id, args.qty, args.submit, args.retry_failed)
 
     if args.cmd == "seed-intent":
         return cmd_seed_intent(args.run_id, args.symbol, args.action, args.reason)
+    
+    if args.cmd == "sync-orders":
+        return cmd_sync_orders(args.limit)
 
     return 1

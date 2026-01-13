@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS orders (
   requested_at TEXT NOT NULL DEFAULT (datetime('now')),
   status TEXT NOT NULL DEFAULT 'created',
   reason TEXT,
-  idempotency_key TEXT
+  idempotency_key TEXT,
+  broker_order_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -79,3 +80,6 @@ CREATE TABLE IF NOT EXISTS intents (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency
 ON orders(idempotency_key)
 WHERE idempotency_key IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_executions_broker_order
+ON executions(broker, broker_order_id);

@@ -7,6 +7,10 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 
 from .base import AccountSummary, PositionSnapshot
 
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
+
+
 class AlpacaPaperBroker:
     name = "alpaca"
 
@@ -67,3 +71,11 @@ class AlpacaPaperBroker:
             time_in_force=TimeInForce.DAY,
         )
         return self.client.submit_order(req)
+    
+    def list_recent_orders(self, status: str = "all", limit: int = 200):
+        req = GetOrdersRequest(
+            status=QueryOrderStatus(status),
+            limit=limit,
+            nested=True,
+        )
+        return self.client.get_orders(req)
