@@ -10,7 +10,6 @@ from .runloop import run_once
 from trading.broker.alpaca_broker import AlpacaPaperBroker
 from trading.broker.sync import upsert_account, sync_positions
 
-
 log = logging.getLogger("trading")
 
 def cmd_healthcheck() -> int:
@@ -26,7 +25,6 @@ def cmd_healthcheck() -> int:
 
     log.info("DB OK. Tables: %s", ", ".join(tables))
     return 0
-
 
 def cmd_compliance_test() -> int:
     now = datetime.now(timezone.utc)
@@ -163,6 +161,7 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
     from .db import connect
     import json
 
+    # 1) Build + persist (idempotent) from intents
     proposed = build_orders_from_intents(run_id=run_id, default_qty=qty)
     inserted = persist_orders(run_id=run_id, orders=proposed)
 
@@ -178,8 +177,9 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
         log.info("No actionable intents (buy/sell). Nothing to do.")
         return 0
 
+    # Print what the strategy/intents want to do (informational)
     for o in proposed:
-        log.info("ORDER %s %s qty=%s | %s", o.side.upper(), o.symbol, o.qty, o.reason)
+        log.info("PROPOSED %s %s qty=%s | %s", o.side.upper(), o.symbol, o.qty, o.reason)
 
     if not submit:
         log.info("Dry-run only. Use --submit to send orders (paper-gated).")
@@ -189,84 +189,149 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
         log.info("Submission blocked: set TRADING_ALLOW_PAPER_ORDERS=true in .env to allow paper submissions.")
         return 0
 
-    allowed_statuses = ("created", "failed") if retry_failed else ("created",)
+    eligible_statuses = ("created", "failed") if retry_failed else ("created",)
+    #placeholders = ",".join(["?"] * len(eligible_statuses))
+    placeholders = ",".join("?" for _ in eligible_statuses)
 
     broker = AlpacaPaperBroker()
 
     submitted = 0
     with connect() as conn:
-        for o in proposed:
-            row = conn.execute(
-                "SELECT id, status FROM orders WHERE idempotency_key = ?;",
-                (o.idempotency_key,),
-            ).fetchone()
-            if not row:
-                continue
+        # 2) Submit ONLY DB-eligible orders (DB is source of truth)
+        db_orders = conn.execute(
+            f"""
+            SELECT id, symbol, side, qty, reason, idempotency_key, status
+            FROM orders
+            WHERE run_id = ?
+            AND status IN ({placeholders})
+            ORDER BY id ASC;
+            """,
+            (run_id, *eligible_statuses),
+        ).fetchall()
 
-            order_id = row["id"]
-            status = row["status"]
+        if not db_orders:
+            log.info("No DB-eligible orders to submit (statuses=%s).", eligible_statuses)
+            log.info("Submitted total=0")
+            return 0
 
-            # Idempotency: only submit eligible statuses
-            if status not in allowed_statuses:
-                log.info(
-                    "Skip %s %s: status=%s (idempotency)",
-                    o.side.upper(),
-                    o.symbol,
-                    status,
-                )
-                continue
+        for r in db_orders:
+            order_id = r["id"]
+            symbol = (r["symbol"] or "").upper()
+            side = (r["side"] or "").lower()
+            db_qty = float(r["qty"])
+            status = (r["status"] or "").lower()
+            reason = r["reason"]
 
-            # Atomically claim it to prevent concurrent submits
-            placeholders = ",".join(["?"] * len(allowed_statuses))
+            log.info("ORDER %s %s qty=%s | %s", side.upper(), symbol, db_qty, reason)
+
+            # Atomically claim this DB order (prevents concurrent submits)
             cur = conn.execute(
                 f"UPDATE orders SET status='submitting' WHERE id=? AND status IN ({placeholders});",
-                (order_id, *allowed_statuses),
+                (order_id, *eligible_statuses),
             )
             if cur.rowcount != 1:
-                log.info(
-                    "Skip %s %s: could not claim order (already being handled)",
-                    o.side.upper(),
-                    o.symbol,
-                )
+                log.info("Skip %s %s: could not claim order (already handled)", side.upper(), symbol)
                 continue
 
             try:
-                # Convert qty to int if it's a whole number (often safer with broker APIs)
-                qty_to_send = int(o.qty) if float(o.qty).is_integer() else o.qty
+                # Convert whole-number qty to int (often safer with broker APIs)
+                qty_to_send = int(db_qty) if float(db_qty).is_integer() else db_qty
 
-                bo = broker.place_market_order(o.symbol, o.side, qty_to_send)
+                bo = broker.place_market_order(symbol, side, qty_to_send)
                 broker_order_id = str(getattr(bo, "id", None))
 
-                # If you have broker_order_id column, store it too (recommended)
+                # Save broker order id on orders row if column exists
                 try:
                     conn.execute(
                         "UPDATE orders SET status='submitted', broker_order_id=? WHERE id=?;",
                         (broker_order_id, order_id),
                     )
                 except Exception:
-                    # fallback if column doesn't exist yet
-                    conn.execute(
-                        "UPDATE orders SET status='submitted' WHERE id=?;",
-                        (order_id,),
-                    )
+                    conn.execute("UPDATE orders SET status='submitted' WHERE id=?;", (order_id,))
 
-                # Save execution snapshot (idempotent if you add a unique index on broker_order_id)
+                # Save execution snapshot (idempotent if you have a unique index on (broker, broker_order_id))
                 conn.execute(
                     """
                     INSERT INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
                     VALUES (?, ?, ?, ?, ?, ?);
                     """,
-                    ("alpaca", broker_order_id, o.symbol, o.side, float(qty_to_send), json.dumps(bo.model_dump(), default=str)),
+                    (
+                        "alpaca",
+                        broker_order_id,
+                        symbol,
+                        side,
+                        float(qty_to_send),
+                        json.dumps(bo.model_dump(), default=str),
+                    ),
                 )
 
                 submitted += 1
-                log.info("Submitted %s %s -> broker_order_id=%s", o.side.upper(), o.symbol, broker_order_id)
+                log.info("Submitted %s %s -> broker_order_id=%s", side.upper(), symbol, broker_order_id)
 
             except Exception as e:
                 conn.execute("UPDATE orders SET status='failed', reason=? WHERE id=?;", (str(e), order_id))
-                log.info("FAILED submitting %s %s: %s", o.side.upper(), o.symbol, e)
+                log.info("FAILED submitting %s %s: %s", side.upper(), symbol, e)
 
     log.info("Submitted total=%s", submitted)
+    return 0
+
+
+def cmd_orders(limit: int) -> int:
+    from .db import connect
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, symbol, side, qty, status, requested_at, broker_order_id, reason
+            FROM orders
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        ).fetchall()
+
+    if not rows:
+        log.info("No orders.")
+        return 0
+
+    for r in rows:
+        msg = f"#{r['id']} {r['side'].upper()} {r['symbol']} qty={r['qty']} status={r['status']} at={r['requested_at']}"
+        if r["broker_order_id"]:
+            msg += f" broker_order_id={r['broker_order_id']}"
+        if r["reason"]:
+            msg += f" | reason={r['reason']}"
+        log.info(msg)
+
+    return 0
+
+def cmd_executions(limit: int) -> int:
+    from .db import connect
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, broker, broker_order_id, symbol, side, qty, filled_avg_price, filled_at
+            FROM executions
+            ORDER BY id DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        ).fetchall()
+
+    if not rows:
+        log.info("No executions.")
+        return 0
+
+    for r in rows:
+        log.info(
+            "#%s %s %s %s %s qty=%s avg=%s filled_at=%s",
+            r["id"],
+            r["broker"],
+            r["broker_order_id"],
+            r["side"].upper(),
+            r["symbol"],
+            r["qty"],
+            r["filled_avg_price"],
+            r["filled_at"],
+        )
     return 0
 
 def cmd_seed_intent(run_id: int, symbol: str, action: str, reason: str) -> int:
@@ -299,21 +364,29 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("healthcheck", help="Verify config + initialize DB schema")
-    sub.add_parser("compliance-test")
+    sub.add_parser("status", help="Show quick DB status counts")
+    #sub.add_parser("compliance-test", help="Test if complaince is working")
 
     p_watch = sub.add_parser("load-watchlist", help="Load symbols from a watchlist CSV into the DB")
     p_watch.add_argument("--csv", default="data/watchlist.csv", help="Path to watchlist CSV (default: data/watchlist.csv)")
 
-    p_run = sub.add_parser("run", help="Execute one trading cycle (Phase 1 skeleton)")
-    p_run.add_argument("--notes", default="", help="Optional notes to store in runs table")
-
-    sub.add_parser("status", help="Show quick DB status counts")
+    p_fb = sub.add_parser("fetch-bars", help="Fetch and store daily OHLCV bars for active symbols")
+    p_fb.add_argument("--days", type=int, default=365, help="Lookback days (default 365)")
 
     sub.add_parser("broker-check", help="Check broker connection and store account snapshot")
     sub.add_parser("sync-positions", help="Sync broker positions into SQLite")
 
-    p_fb = sub.add_parser("fetch-bars", help="Fetch and store daily OHLCV bars for active symbols")
-    p_fb.add_argument("--days", type=int, default=365, help="Lookback days (default 365)")
+    p_so = sub.add_parser("sync-orders", help="Sync recent Alpaca orders into SQLite (executions + order status)")
+    p_so.add_argument("--limit", type=int, default=200)
+
+    p_o = sub.add_parser("orders", help="Show recent internal orders")
+    p_o.add_argument("--limit", type=int, default=20)
+
+    p_e = sub.add_parser("executions", help="Show recent broker executions snapshots")
+    p_e.add_argument("--limit", type=int, default=20)
+
+    p_run = sub.add_parser("run", help="Execute one trading cycle (Phase 1 skeleton)")
+    p_run.add_argument("--notes", default="", help="Optional notes to store in runs table")
 
     p_plan = sub.add_parser("plan", help="Generate today's trade plan (signals + intents). No orders placed.")
     p_plan.add_argument("--fast", type=int, default=20)
@@ -331,17 +404,13 @@ def main() -> int:
     p_exec.add_argument("--run-id", type=int, required=True)
     p_exec.add_argument("--qty", type=float, default=1.0, help="Default quantity per order (Day 5 fixed sizing)")
     p_exec.add_argument("--submit", action="store_true", help="Actually submit to broker (requires TRADING_ALLOW_PAPER_ORDERS=true)")
+    p_exec.add_argument("--retry-failed", action="store_true", help="Allow resubmitting orders that previously failed")
 
     p_seed = sub.add_parser("seed-intent", help="Create a manual intent for testing (no broker action).")
     p_seed.add_argument("--run-id", type=int, required=True)
     p_seed.add_argument("--symbol", required=True)
     p_seed.add_argument("--action", choices=["buy", "sell"], required=True)
     p_seed.add_argument("--reason", default="manual test")
-
-    p_so = sub.add_parser("sync-orders", help="Sync recent Alpaca orders into SQLite (executions + order status)")
-    p_so.add_argument("--limit", type=int, default=200)
-
-    p_exec.add_argument("--retry-failed", action="store_true", help="Allow resubmitting orders that previously failed")
 
     args = p.parse_args()
 
@@ -386,5 +455,11 @@ def main() -> int:
     
     if args.cmd == "sync-orders":
         return cmd_sync_orders(args.limit)
+    
+    if args.cmd == "orders":
+        return cmd_orders(args.limit)
+    
+    if args.cmd == "executions":
+        return cmd_executions(args.limit)
 
     return 1

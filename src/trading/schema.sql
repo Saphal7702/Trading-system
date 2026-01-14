@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS orders (
   status TEXT NOT NULL DEFAULT 'created',
   reason TEXT,
   idempotency_key TEXT,
-  broker_order_id TEXT
+  broker_order_id TEXT,
+  run_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -83,3 +84,5 @@ WHERE idempotency_key IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_executions_broker_order
 ON executions(broker, broker_order_id);
+
+CREATE INDEX IF NOT EXISTS ix_orders_run_id ON orders(run_id);

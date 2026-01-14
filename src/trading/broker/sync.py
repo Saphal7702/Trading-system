@@ -60,7 +60,7 @@ def backfill_opened_at_from_fills() -> int:
                 WHERE e.symbol = positions.symbol
                   AND e.side = 'buy'
                   AND e.filled_at IS NOT NULL
-                ORDER BY e.filled_at DESC
+                ORDER BY e.filled_at ASC
                 LIMIT 1
             )
             WHERE qty > 0

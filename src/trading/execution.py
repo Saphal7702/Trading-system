@@ -72,10 +72,10 @@ def persist_orders(run_id: int, orders: list[ProposedOrder]) -> int:
         for o in orders:
             cur = conn.execute(
                 """
-                INSERT OR IGNORE INTO orders(symbol, side, qty, status, reason, idempotency_key, requested_at)
-                VALUES (?, ?, ?, 'created', ?, ?, datetime('now'));
+                INSERT OR IGNORE INTO orders(run_id,symbol, side, qty, status, reason, idempotency_key, requested_at)
+                VALUES (?,?, ?, ?, 'created', ?, ?, datetime('now'));
                 """,
-                (o.symbol, o.side, o.qty, o.reason, o.idempotency_key),
+                (run_id,o.symbol, o.side, o.qty, o.reason, o.idempotency_key),
             )
             if cur.rowcount == 1:
                 inserted += 1
