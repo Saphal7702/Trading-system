@@ -8,10 +8,7 @@ con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
 
 rows = con.execute("""
-SELECT broker_order_id, side, qty, filled_avg_price, filled_at
-FROM executions
-WHERE symbol = 'AAPL'
-ORDER BY filled_at DESC
+SELECT symbol, tradable, fractionable, status, exchange FROM assets_cache WHERE symbol='LLY';
 """).fetchall()
 
 for r in rows:

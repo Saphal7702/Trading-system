@@ -86,3 +86,39 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_executions_broker_order
 ON executions(broker, broker_order_id);
 
 CREATE INDEX IF NOT EXISTS ix_orders_run_id ON orders(run_id);
+
+-- Candidate list: universe membership (e.g., SP500)
+CREATE TABLE IF NOT EXISTS universe_membership (
+  universe TEXT NOT NULL,          -- 'sp500'
+  symbol   TEXT NOT NULL,
+  added_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (universe, symbol)
+);
+
+-- Alpaca asset metadata cache
+CREATE TABLE IF NOT EXISTS assets_cache (
+  symbol       TEXT PRIMARY KEY,
+  tradable     INTEGER NOT NULL,
+  fractionable INTEGER NOT NULL,
+  status       TEXT,
+  exchange     TEXT,
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Daily computed snapshot for selection
+CREATE TABLE IF NOT EXISTS universe_daily (
+  asof_date  TEXT NOT NULL,        -- 'YYYY-MM-DD'
+  universe   TEXT NOT NULL,         -- 'sp500'
+  symbol     TEXT NOT NULL,
+  close      REAL,
+  adv20      REAL,                 -- avg dollar volume 20d
+  ret60      REAL,                 -- 60d return
+  include    INTEGER NOT NULL,      -- 1/0
+  reason     TEXT,
+  score      REAL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (asof_date, universe, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS ix_universe_daily_lookup
+ON universe_daily(asof_date, universe, include, score DESC);

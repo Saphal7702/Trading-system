@@ -28,6 +28,7 @@ def generate_signals_sma(
     fast: int = 20,
     slow: int = 50,
     lookback_min: int = 120,
+    universe: str = "sp500",
 ) -> list[Signal]:
     """
     SMA crossover:
@@ -35,10 +36,28 @@ def generate_signals_sma(
       - SELL when fast crosses below slow
       - otherwise HOLD
     """
+    # 1) Get selected symbols from latest universe snapshot
     with connect() as conn:
-        syms = [r["symbol"] for r in conn.execute(
-            "SELECT symbol FROM symbols WHERE is_active=1 ORDER BY symbol;"
-        ).fetchall()]
+        r = conn.execute(
+            "SELECT MAX(asof_date) AS d FROM universe_daily WHERE universe=?;",
+            (universe,),
+        ).fetchone()
+        asof = r["d"] if r and r["d"] else None
+
+        if not asof:
+            raise RuntimeError("No universe_daily snapshot found. Run build-universe first.")
+
+        rows = conn.execute(
+            """
+            SELECT symbol
+            FROM universe_daily
+            WHERE asof_date=? AND universe=? AND include=1
+            ORDER BY score DESC;
+            """,
+            (asof, universe),
+        ).fetchall()
+
+    syms = [row["symbol"] for row in rows] 
 
     signals: list[Signal] = []
     with connect() as conn:

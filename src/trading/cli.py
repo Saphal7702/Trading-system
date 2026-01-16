@@ -5,7 +5,7 @@ from .config import get_settings
 from .db import init_db, connect
 from datetime import datetime, timedelta, timezone
 from .compliance import can_sell
-from .universe import load_watchlist_csv
+from .universe_watchlist import load_watchlist_csv
 from .runloop import run_once
 from trading.broker.alpaca_broker import AlpacaPaperBroker
 from trading.broker.sync import upsert_account, sync_positions
@@ -80,12 +80,13 @@ def cmd_sync_positions() -> int:
     log.info("Synced %s positions from %s", n, b.name)
     return 0
 
-def cmd_fetch_bars(days: int) -> int:
+def cmd_fetch_bars(days: int, universe: str, limit: int , sleep_ms: int) -> int:
     from .marketdata.alpaca_data import fetch_and_store_for_universe
-    counts = fetch_and_store_for_universe(days=days)
+    counts = fetch_and_store_for_universe(days=days, universe=universe, limit=limit, sleep_ms=sleep_ms)
     total = sum(counts.values())
-    log.info("Fetched bars: total=%s | per_symbol=%s", total, counts)
+    log.info("Fetched bars: total=%s | symbols=%s | universe=%s | limit=%s", total, len(counts), universe, limit)
     return 0
+
 
 def cmd_plan(fast: int, slow: int) -> int:
     # create a run record
@@ -356,6 +357,58 @@ def cmd_sync_orders(limit: int) -> int:
     log.info("sync-orders: executions_upserted=%s | orders_updated=%s", res["executions_upserted"], res["orders_updated"])
     return 0
 
+def cmd_load_universe(universe: str, file: str) -> int:
+    from .universe.load_universe import load_universe_csv
+    n = load_universe_csv(universe=universe, csv_path=file)
+    log.info("Loaded universe=%s symbols=%s from %s", universe, n, file)
+    return 0
+
+
+def cmd_sync_assets() -> int:
+    from .universe.sync_assets import sync_assets_cache
+    n = sync_assets_cache()
+    log.info("Synced assets_cache rows=%s", n)
+    return 0
+
+
+def cmd_build_universe(universe: str, asof: str, top: int, min_adv20: float) -> int:
+    from .universe.build_universe import build_universe_daily
+    n = build_universe_daily(universe=universe, asof=asof, top=top, min_adv20=min_adv20)
+    log.info("Built universe_daily: universe=%s asof=%s rows=%s top=%s min_adv20=%s", universe, asof, n, top, min_adv20)
+    return 0
+
+
+def cmd_show_universe(universe: str, asof: str, limit: int) -> int:
+    from .db import connect
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT symbol, score, ret60, adv20, close, include, reason
+            FROM universe_daily
+            WHERE asof_date=? AND universe=?
+            ORDER BY include DESC, score DESC
+            LIMIT ?;
+            """,
+            (asof, universe, limit),
+        ).fetchall()
+
+    if not rows:
+        log.info("No universe_daily rows for universe=%s asof=%s", universe, asof)
+        return 0
+
+    for r in rows:
+        log.info(
+            "%s %s score=%s ret60=%s adv20=%s close=%s | %s",
+            "IN " if r["include"] == 1 else "OUT",
+            r["symbol"],
+            r["score"],
+            r["ret60"],
+            r["adv20"],
+            r["close"],
+            r["reason"],
+        )
+    return 0
+
 
 def main() -> int:
     setup_logging()
@@ -364,16 +417,41 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("healthcheck", help="Verify config + initialize DB schema")
-    sub.add_parser("status", help="Show quick DB status counts")
+    sub.add_parser("brokercheck", help="Check broker connection and store account snapshot")
+
+    # load-universe
+    p_lu = sub.add_parser("load-universe", help="Load a universe membership list from CSV (expects column: symbol)")
+    p_lu.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
+    p_lu.add_argument("--file", required=True, help="Path to CSV (must contain 'symbol' column)")
+
+    # sync-assets
+    p_sa = sub.add_parser("sync-assets", help="Sync Alpaca assets metadata into assets_cache")
+
+    #sub.add_parser("status", help="Show quick DB status counts")
     #sub.add_parser("compliance-test", help="Test if complaince is working")
 
-    p_watch = sub.add_parser("load-watchlist", help="Load symbols from a watchlist CSV into the DB")
-    p_watch.add_argument("--csv", default="data/watchlist.csv", help="Path to watchlist CSV (default: data/watchlist.csv)")
+    #p_watch = sub.add_parser("load-watchlist", help="Load symbols from a watchlist CSV into the DB")
+    #p_watch.add_argument("--csv", default="data/watchlist.csv", help="Path to watchlist CSV (default: data/watchlist.csv)")
 
     p_fb = sub.add_parser("fetch-bars", help="Fetch and store daily OHLCV bars for active symbols")
     p_fb.add_argument("--days", type=int, default=365, help="Lookback days (default 365)")
+    p_fb.add_argument("--universe", type=str, default="sp500", help="Lookback universe (default sp500)")
+    p_fb.add_argument("--limit", type=int, default=500, help="Lookback limit (default 500)")
+    p_fb.add_argument("--sleep_ms", type=int, default=50, help="Lookback time (default 50ms)")
 
-    sub.add_parser("broker-check", help="Check broker connection and store account snapshot")
+    # build-universe
+    p_bu = sub.add_parser("build-universe", help="Build daily universe snapshot + select top N")
+    p_bu.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
+    p_bu.add_argument("--asof", required=True, help="Asof date (YYYY-MM-DD), must exist in bars_daily")
+    p_bu.add_argument("--top", type=int, default=200, help="Keep top N by score among included")
+    p_bu.add_argument("--min-adv20", type=float, default=20_000_000.0, help="Minimum 20-day average dollar volume")
+
+    # show-universe
+    p_su = sub.add_parser("show-universe", help="Show universe snapshot rows")
+    p_su.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
+    p_su.add_argument("--asof", required=True, help="Asof date (YYYY-MM-DD)")
+    p_su.add_argument("--limit", type=int, default=25, help="Rows to print")
+
     sub.add_parser("sync-positions", help="Sync broker positions into SQLite")
 
     p_so = sub.add_parser("sync-orders", help="Sync recent Alpaca orders into SQLite (executions + order status)")
@@ -429,14 +507,14 @@ def main() -> int:
     if args.cmd == "status":
         return cmd_status()
     
-    if args.cmd == "broker-check":
+    if args.cmd == "brokercheck":
         return cmd_broker_check()
 
     if args.cmd == "sync-positions":
         return cmd_sync_positions()
     
     if args.cmd == "fetch-bars":
-        return cmd_fetch_bars(args.days)
+        return cmd_fetch_bars(args.days, args.universe, args.limit, args.sleep_ms)
     
     if args.cmd == "plan":
         return cmd_plan(args.fast, args.slow)
@@ -461,5 +539,18 @@ def main() -> int:
     
     if args.cmd == "executions":
         return cmd_executions(args.limit)
+    
+    if args.cmd == "load-universe":
+        return cmd_load_universe(args.universe, args.file)
+
+    if args.cmd == "sync-assets":
+        return cmd_sync_assets()
+
+    if args.cmd == "build-universe":
+        return cmd_build_universe(args.universe, args.asof, args.top, args.min_adv20)
+
+    if args.cmd == "show-universe":
+        return cmd_show_universe(args.universe, args.asof, args.limit)
+
 
     return 1

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+import time
 
 from ..db import connect
 
@@ -63,20 +64,48 @@ def store_daily_bars(symbol: str, bars: list[dict]) -> int:
     
     return len(bars)
 
-def fetch_and_store_for_universe(days: int = 365) -> dict[str, int]:
+def fetch_and_store_for_universe(
+    days: int = 365,
+    universe: str = "sp500",
+    limit: int = 0,
+    sleep_ms: int = 0,
+) -> dict[str, int]:
+    """
+    Fetch daily bars for symbols in universe_membership.
+
+    - universe: which membership list to use (default sp500)
+    - limit: fetch only first N symbols (useful for batching)
+    - sleep_ms: optional small delay between symbols to reduce rate-limit risk
+    """
     md = AlpacaMarketData()
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
 
     with connect() as conn:
-        rows = conn.execute("SELECT symbol FROM symbols WHERE is_active=1 ORDER BY symbol;").fetchall()
+        rows = conn.execute(
+            "SELECT symbol FROM universe_membership WHERE universe=? ORDER BY symbol;",
+            (universe,),
+        ).fetchall()
         syms = [r["symbol"] for r in rows]
+
+    if limit and limit > 0:
+        syms = syms[:limit]
 
     counts: dict[str, int] = {}
 
     for s in syms:
-        bars = md.fetch_daily_bars(s, start=start, end=end)
-        counts[s] = store_daily_bars(s, bars=bars)
+        s = s.strip().upper()
+        try:
+            bars = md.fetch_daily_bars(s, start=start, end=end)
+            counts[s] = store_daily_bars(s, bars=bars)
+        except Exception as e:
+            # don't crash the whole batch
+            counts[s] = 0
+            # if you have log here, use it:
+            # log.warning("fetch-bars failed for %s: %s", s, e)
+        finally:
+            if sleep_ms and sleep_ms > 0:
+                time.sleep(sleep_ms / 1000.0)
 
     return counts
