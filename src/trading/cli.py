@@ -89,27 +89,45 @@ def cmd_fetch_bars(days: int, universe: str, limit: int , sleep_ms: int) -> int:
 
 
 def cmd_plan(fast: int, slow: int) -> int:
-    # create a run record
     from .runloop import start_run, finish_run
     from .strategy_sma import generate_signals_sma
     from .planner import plan_intents, save_intents
+    import os
 
     run_id = start_run(notes=f"plan sma{fast}/{slow}")
     try:
         signals = generate_signals_sma(fast=fast, slow=slow)
-        intents = plan_intents(signals)
+
+        # Optional explicit knobs (still defaults to env if not set)
+        intents = plan_intents(
+            signals,
+            max_positions=int(os.getenv("TRADING_MAX_POSITIONS", "5")),
+            per_position_notional=float(os.getenv("TRADING_PER_POSITION", "100")),
+            cash_buffer=float(os.getenv("TRADING_CASH_BUFFER", "25")),
+        )
+
         save_intents(run_id, intents)
 
-        # Print only actionable ones first
         buys = [i for i in intents if i.action == "buy"]
         sells = [i for i in intents if i.action == "sell"]
 
-        log.info("Plan run_id=%s | buys=%s | sells=%s | total=%s", run_id, len(buys), len(sells), len(intents))
+        log.info(
+            "Plan run_id=%s | buys=%s | sells=%s | total=%s | max_pos=%s | per_pos=$%s | buffer=$%s",
+            run_id, len(buys), len(sells), len(intents),
+            os.getenv("TRADING_MAX_POSITIONS", "5"),
+            os.getenv("TRADING_PER_POSITION", "100"),
+            os.getenv("TRADING_CASH_BUFFER", "25"),
+        )
 
         for i in sells:
             log.info("SELL %s | strength=%s | %s", i.symbol, i.strength, i.reason)
+
+        # show notional if present
         for i in buys:
-            log.info("BUY  %s | strength=%s | %s", i.symbol, i.strength, i.reason)
+            if getattr(i, "target_notional", None) is not None:
+                log.info("BUY  %s | strength=%s | $%s | %s", i.symbol, i.strength, i.target_notional, i.reason)
+            else:
+                log.info("BUY  %s | strength=%s | %s", i.symbol, i.strength, i.reason)
 
         finish_run(run_id, status="success")
         return 0
@@ -378,9 +396,21 @@ def cmd_build_universe(universe: str, asof: str, top: int, min_adv20: float) -> 
     return 0
 
 
-def cmd_show_universe(universe: str, asof: str, limit: int) -> int:
+def cmd_show_universe(universe: str, asof: str | None, limit: int) -> int:
     from .db import connect
+
     with connect() as conn:
+        if not asof:
+            r = conn.execute(
+                "SELECT MAX(asof_date) AS d FROM universe_daily WHERE universe=? AND include=1;",
+                (universe,),
+            ).fetchone()
+            asof = r["d"] if r and r["d"] else None
+
+        if not asof:
+            log.info("No universe_daily rows for universe=%s", universe)
+            return 0
+
         rows = conn.execute(
             """
             SELECT symbol, score, ret60, adv20, close, include, reason
@@ -392,10 +422,7 @@ def cmd_show_universe(universe: str, asof: str, limit: int) -> int:
             (asof, universe, limit),
         ).fetchall()
 
-    if not rows:
-        log.info("No universe_daily rows for universe=%s asof=%s", universe, asof)
-        return 0
-
+    log.info("Universe=%s asof=%s rows=%s", universe, asof, len(rows))
     for r in rows:
         log.info(
             "%s %s score=%s ret60=%s adv20=%s close=%s | %s",
@@ -442,14 +469,14 @@ def main() -> int:
     # build-universe
     p_bu = sub.add_parser("build-universe", help="Build daily universe snapshot + select top N")
     p_bu.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
-    p_bu.add_argument("--asof", required=True, help="Asof date (YYYY-MM-DD), must exist in bars_daily")
+    p_bu.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD), must exist in bars_daily")
     p_bu.add_argument("--top", type=int, default=200, help="Keep top N by score among included")
     p_bu.add_argument("--min-adv20", type=float, default=20_000_000.0, help="Minimum 20-day average dollar volume")
 
     # show-universe
     p_su = sub.add_parser("show-universe", help="Show universe snapshot rows")
     p_su.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
-    p_su.add_argument("--asof", required=True, help="Asof date (YYYY-MM-DD)")
+    p_su.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD)")
     p_su.add_argument("--limit", type=int, default=25, help="Rows to print")
 
     sub.add_parser("sync-positions", help="Sync broker positions into SQLite")

@@ -10,6 +10,12 @@ pip install -e .
 source .venv/bin/activate (Linux)
 .\.venv\Scripts\Activate.ps1 (Windows)
 
+trading load-universe --file data/sp500.csv
+trading sync-assets
+trading fetch-bars --days 400
+trading build-universe --top 200
+trading show-universe --limit 20
+
 
 /*************************  Git Commands:  **************************************************************/
 #All Git Commands:

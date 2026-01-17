@@ -39,7 +39,7 @@ def generate_signals_sma(
     # 1) Get selected symbols from latest universe snapshot
     with connect() as conn:
         r = conn.execute(
-            "SELECT MAX(asof_date) AS d FROM universe_daily WHERE universe=?;",
+            "SELECT MAX(asof_date) AS d FROM universe_daily WHERE universe=? AND include=1;",
             (universe,),
         ).fetchone()
         asof = r["d"] if r and r["d"] else None
@@ -57,8 +57,9 @@ def generate_signals_sma(
             (asof, universe),
         ).fetchall()
 
-    syms = [row["symbol"] for row in rows] 
+    syms = [row["symbol"] for row in rows]  # ✅ THIS WAS MISSING
 
+    # 2) Compute signals for those symbols
     signals: list[Signal] = []
     with connect() as conn:
         for sym in syms:
