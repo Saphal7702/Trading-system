@@ -14,6 +14,23 @@ def build_universe_daily(universe: str, asof: str, top: int, min_adv20: float = 
     """
     # pull symbols from membership
     with connect() as conn:
+        if not asof:
+            r = conn.execute("SELECT MAX(t) AS d FROM bars_daily;").fetchone()
+            asof = r["d"] if r and r["d"] else None
+            if not asof:
+                raise RuntimeError("bars_daily is empty; fetch-bars first.")
+        else:
+            # if user passes a date (maybe weekend), snap to last available bar date <= asof
+            r = conn.execute(
+                "SELECT MAX(t) AS d FROM bars_daily WHERE t <= ?;",
+                (asof[:10],),
+            ).fetchone()
+            asof2 = r["d"] if r and r["d"] else None
+            if not asof2:
+                raise RuntimeError(f"No bars_daily data on or before {asof}")
+            asof = asof2
+
+        asof = asof[:10]
         members = conn.execute(
             "SELECT symbol FROM universe_membership WHERE universe=?;",
             (universe,),
