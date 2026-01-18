@@ -29,23 +29,15 @@ def generate_signals_sma(
     slow: int = 50,
     lookback_min: int = 120,
     universe: str = "sp500",
+    asof: str | None = None,
 ) -> list[Signal]:
     """
-    SMA crossover:
-      - BUY when fast crosses above slow (today above, yesterday below/equal)
-      - SELL when fast crosses below slow
-      - otherwise HOLD
+    SMA crossover strategy evaluated on a specific trading day.
     """
-    # 1) Get selected symbols from latest universe snapshot
-    with connect() as conn:
-        r = conn.execute(
-            "SELECT MAX(asof_date) AS d FROM universe_daily WHERE universe=? AND include=1;",
-            (universe,),
-        ).fetchone()
-        asof = r["d"] if r and r["d"] else None
+    from .asof import resolve_asof_date
 
-        if not asof:
-            raise RuntimeError("No universe_daily snapshot found. Run build-universe first.")
+    with connect() as conn:
+        asof = resolve_asof_date(conn, asof)
 
         rows = conn.execute(
             """
@@ -57,9 +49,8 @@ def generate_signals_sma(
             (asof, universe),
         ).fetchall()
 
-    syms = [row["symbol"] for row in rows]  # ✅ THIS WAS MISSING
+    syms = [r["symbol"] for r in rows]
 
-    # 2) Compute signals for those symbols
     signals: list[Signal] = []
     with connect() as conn:
         for sym in syms:
@@ -67,7 +58,7 @@ def generate_signals_sma(
                 """
                 SELECT t, c
                 FROM bars_daily
-                WHERE symbol = ?
+                WHERE symbol=?
                 ORDER BY t ASC;
                 """,
                 (sym,),
@@ -75,7 +66,7 @@ def generate_signals_sma(
 
             closes = [float(r["c"]) for r in rows if r["c"] is not None]
             if len(closes) < max(slow + 2, lookback_min):
-                signals.append(Signal(sym, "hold", f"Not enough data ({len(closes)} closes)"))
+                signals.append(Signal(sym, "hold", "Not enough data"))
                 continue
 
             sma_fast = _sma(closes, fast)
@@ -84,17 +75,14 @@ def generate_signals_sma(
             i = len(closes) - 1
             prev = i - 1
 
-            f_now, s_now = sma_fast[i], sma_slow[i]
-            f_prev, s_prev = sma_fast[prev], sma_slow[prev]
-
-            if f_now is None or s_now is None or f_prev is None or s_prev is None:
-                signals.append(Signal(sym, "hold", "SMA not available yet"))
+            if None in (sma_fast[i], sma_slow[i], sma_fast[prev], sma_slow[prev]):
+                signals.append(Signal(sym, "hold", "SMA not available"))
                 continue
 
-            if f_prev <= s_prev and f_now > s_now:
-                signals.append(Signal(sym, "buy", f"SMA{fast} crossed above SMA{slow}", strength=abs(f_now - s_now)))
-            elif f_prev >= s_prev and f_now < s_now:
-                signals.append(Signal(sym, "sell", f"SMA{fast} crossed below SMA{slow}", strength=abs(f_now - s_now)))
+            if sma_fast[prev] <= sma_slow[prev] and sma_fast[i] > sma_slow[i]:
+                signals.append(Signal(sym, "buy", f"SMA{fast} crossed above SMA{slow}", abs(sma_fast[i] - sma_slow[i])))
+            elif sma_fast[prev] >= sma_slow[prev] and sma_fast[i] < sma_slow[i]:
+                signals.append(Signal(sym, "sell", f"SMA{fast} crossed below SMA{slow}", abs(sma_fast[i] - sma_slow[i])))
             else:
                 signals.append(Signal(sym, "hold", "No crossover"))
 

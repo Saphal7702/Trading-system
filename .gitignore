@@ -24,3 +24,7 @@ venv/
 
 # Data (if you save local market data later)
 data/
+
+TradingData/
+*.sqlite
+*.db

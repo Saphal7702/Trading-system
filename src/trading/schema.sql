@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS runs (
   started_at TEXT NOT NULL DEFAULT (datetime('now')),
   finished_at TEXT,
   status TEXT NOT NULL DEFAULT 'running',
-  notes TEXT
+  notes TEXT,
+  asof_date TEXT
 );
 
 CREATE TABLE IF NOT EXISTS broker_accounts (
