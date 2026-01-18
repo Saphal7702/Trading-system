@@ -10,7 +10,6 @@ from .base import AccountSummary, PositionSnapshot
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
 
-
 class AlpacaPaperBroker:
     name = "alpaca"
 
@@ -63,19 +62,28 @@ class AlpacaPaperBroker:
 
         return out
     
-    def place_market_order(self, symbol: str, side: str, qty: float):
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        *,
+        qty: float | None = None,
+        notional: float | None = None,
+    ):
+        """
+        Place a market order.
+        Provide exactly one of: qty OR notional.
+        notional is in USD and works for fractional orders on fractionable assets.
+        """
+        if (qty is None and notional is None) or (qty is not None and notional is not None):
+            raise ValueError("Provide exactly one of qty or notional")
+
         req = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
+            notional=notional,
             side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
         return self.client.submit_order(req)
-    
-    def list_recent_orders(self, status: str = "all", limit: int = 200):
-        req = GetOrdersRequest(
-            status=QueryOrderStatus(status),
-            limit=limit,
-            nested=True,
-        )
-        return self.client.get_orders(req)

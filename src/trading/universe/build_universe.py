@@ -1,48 +1,49 @@
 from __future__ import annotations
 from datetime import date
 from ..db import connect
+from ..asof import resolve_asof_date
 
-def build_universe_daily(universe: str, asof: str, top: int, min_adv20: float = 20_000_000.0) -> int:
+def _insert_excluded(conn, asof: str, universe: str, symbol: str, reason: str):
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO universe_daily(
+            asof_date, universe, symbol, include, reason
+        )
+        VALUES (?, ?, ?, 0, ?);
+        """,
+        (asof, universe, symbol, reason),
+    )
+
+
+def build_universe_daily(
+    universe: str,
+    asof: str | None = None,
+    top: int = 200,
+    min_adv20: float = 20_000_000.0,
+) -> int:
     """
-    asof: 'YYYY-MM-DD' close date to evaluate (must exist in bars_daily for symbols)
-    Score = ret60 (simple v1). Later we improve.
-    Filters:
-      - assets_cache.tradable=1
-      - assets_cache.fractionable=1
-      - ADV20 >= min_adv20
-      - has enough history for ret60 and adv20 window
+    Daily universe snapshot builder.
+    Safe for cron execution (asof auto-resolved).
     """
-    # pull symbols from membership
+
     with connect() as conn:
-        if not asof:
-            r = conn.execute("SELECT MAX(t) AS d FROM bars_daily;").fetchone()
-            asof = r["d"] if r and r["d"] else None
-            if not asof:
-                raise RuntimeError("bars_daily is empty; fetch-bars first.")
-        else:
-            # if user passes a date (maybe weekend), snap to last available bar date <= asof
-            r = conn.execute(
-                "SELECT MAX(t) AS d FROM bars_daily WHERE t <= ?;",
-                (asof[:10],),
-            ).fetchone()
-            asof2 = r["d"] if r and r["d"] else None
-            if not asof2:
-                raise RuntimeError(f"No bars_daily data on or before {asof}")
-            asof = asof2
+        asof = resolve_asof_date(conn, asof)
 
-        asof = asof[:10]
         members = conn.execute(
             "SELECT symbol FROM universe_membership WHERE universe=?;",
             (universe,),
         ).fetchall()
+
     symbols = [r["symbol"] for r in members]
     if not symbols:
         return 0
 
     inserted = 0
     with connect() as conn:
-        # wipe existing snapshot for that day/universe (idempotent rebuild)
-        conn.execute("DELETE FROM universe_daily WHERE asof_date=? AND universe=?;", (asof, universe))
+        conn.execute(
+            "DELETE FROM universe_daily WHERE asof_date=? AND universe=?;",
+            (asof, universe),
+        )
 
         for sym in symbols:
             # asset gate
@@ -50,53 +51,36 @@ def build_universe_daily(universe: str, asof: str, top: int, min_adv20: float = 
                 "SELECT tradable, fractionable FROM assets_cache WHERE symbol=?;",
                 (sym,),
             ).fetchone()
+
             if not asset or asset["tradable"] != 1 or asset["fractionable"] != 1:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO universe_daily(asof_date, universe, symbol, include, reason)
-                    VALUES (?, ?, ?, 0, ?);
-                    """,
-                    (asof, universe, sym, "not tradable/fractionable"),
-                )
+                _insert_excluded(conn, asof, universe, sym, "not tradable/fractionable")
                 continue
 
-            # latest close on asof
-            row_close = conn.execute(
-                """
-                SELECT c
-                FROM bars_daily
-                WHERE symbol=? AND t=?
-                """,
+            close_row = conn.execute(
+                "SELECT c FROM bars_daily WHERE symbol=? AND t=?;",
                 (sym, asof),
             ).fetchone()
-            if not row_close:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO universe_daily(asof_date, universe, symbol, include, reason)
-                    VALUES (?, ?, ?, 0, ?);
-                    """,
-                    (asof, universe, sym, "no close on asof"),
-                )
-                continue
-            close = float(row_close["c"])
 
-            # ADV20: mean(close*volume) over 20 bars ending asof
-            adv = conn.execute(
+            if not close_row:
+                _insert_excluded(conn, asof, universe, sym, "no close on asof")
+                continue
+
+            close = float(close_row["c"])
+
+            adv20 = conn.execute(
                 """
-                SELECT AVG(c * v) AS adv20
+                SELECT AVG(c * v)
                 FROM (
-                  SELECT c, v
-                  FROM bars_daily
-                  WHERE symbol=? AND t<=?
-                  ORDER BY t DESC
-                  LIMIT 20
+                    SELECT c, v
+                    FROM bars_daily
+                    WHERE symbol=? AND t<=?
+                    ORDER BY t DESC
+                    LIMIT 20
                 );
                 """,
                 (sym, asof),
-            ).fetchone()
-            adv20 = float(adv["adv20"]) if adv and adv["adv20"] is not None else 0.0
+            ).fetchone()[0] or 0.0
 
-            # ret60: (close / close_60d_ago - 1)
             prev = conn.execute(
                 """
                 SELECT c
@@ -107,59 +91,38 @@ def build_universe_daily(universe: str, asof: str, top: int, min_adv20: float = 
                 """,
                 (sym, asof),
             ).fetchone()
+
             if not prev:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO universe_daily(asof_date, universe, symbol, close, adv20, include, reason)
-                    VALUES (?, ?, ?, ?, ?, 0, ?);
-                    """,
-                    (asof, universe, sym, close, adv20, "insufficient history"),
-                )
+                _insert_excluded(conn, asof, universe, sym, "insufficient history", close, adv20)
                 continue
 
-            prev_close = float(prev["c"])
-            ret60 = (close / prev_close) - 1.0 if prev_close > 0 else None
-
-            include = 1
-            reason = "ok"
-            if adv20 < min_adv20:
-                include = 0
-                reason = f"adv20<{min_adv20}"
-
-            score = ret60 if ret60 is not None else None
+            ret60 = (close / float(prev["c"])) - 1.0
+            include = 1 if adv20 >= min_adv20 else 0
+            reason = "ok" if include else f"adv20<{min_adv20}"
 
             conn.execute(
                 """
-                INSERT OR REPLACE INTO universe_daily(asof_date, universe, symbol, close, adv20, ret60, include, reason, score)
+                INSERT OR REPLACE INTO universe_daily
+                (asof_date, universe, symbol, close, adv20, ret60, score, include, reason)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                (asof, universe, sym, close, adv20, ret60, include, reason, score),
+                (asof, universe, sym, close, adv20, ret60, ret60, include, reason),
             )
+
             inserted += 1
 
-        # optional: keep only top N includes by score (set others include=0)
-        if top and top > 0:
-            keep = conn.execute(
-                """
-                SELECT symbol
-                FROM universe_daily
-                WHERE asof_date=? AND universe=? AND include=1 AND score IS NOT NULL
-                ORDER BY score DESC
-                LIMIT ?;
-                """,
-                (asof, universe, top),
-            ).fetchall()
-            keep_set = {r["symbol"] for r in keep}
-
+        if top > 0:
             conn.execute(
                 """
                 UPDATE universe_daily
                 SET include=0, reason='below topN'
-                WHERE asof_date=? AND universe=? AND include=1 AND symbol NOT IN (
-                  SELECT symbol FROM universe_daily
-                  WHERE asof_date=? AND universe=? AND include=1 AND score IS NOT NULL
-                  ORDER BY score DESC
-                  LIMIT ?
+                WHERE asof_date=? AND universe=? AND include=1
+                AND symbol NOT IN (
+                    SELECT symbol
+                    FROM universe_daily
+                    WHERE asof_date=? AND universe=? AND include=1
+                    ORDER BY score DESC
+                    LIMIT ?
                 );
                 """,
                 (asof, universe, asof, universe, top),

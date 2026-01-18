@@ -88,52 +88,68 @@ def cmd_fetch_bars(days: int, universe: str, limit: int , sleep_ms: int) -> int:
     return 0
 
 
-def cmd_plan(fast: int, slow: int) -> int:
+def cmd_plan(fast: int, slow: int, universe: str = "sp500") -> int:
     from .runloop import start_run, finish_run
+    from .asof import resolve_asof_date
+    from .db import connect
     from .strategy_sma import generate_signals_sma
     from .planner import plan_intents, save_intents
-    import os
 
-    run_id = start_run(notes=f"plan sma{fast}/{slow}")
+    run_id = start_run(notes=f"plan sma{fast}/{slow} universe={universe}")
     try:
-        signals = generate_signals_sma(fast=fast, slow=slow)
+        # 1) Resolve asof from DB (needs a connection)
+        with connect() as conn:
+            asof = resolve_asof_date(conn, None)
 
-        # Optional explicit knobs (still defaults to env if not set)
-        intents = plan_intents(
-            signals,
-            max_positions=int(os.getenv("TRADING_MAX_POSITIONS", "5")),
-            per_position_notional=float(os.getenv("TRADING_PER_POSITION", "100")),
-            cash_buffer=float(os.getenv("TRADING_CASH_BUFFER", "25")),
-        )
+            # If your runs table has asof_date, store it
+            # (If it doesn't, comment this out or add the column.)
+            try:
+                conn.execute("UPDATE runs SET asof_date=? WHERE id=?;", (asof, run_id))
+            except Exception:
+                pass
 
+        # 2) Generate signals using that asof snapshot
+        signals = generate_signals_sma(
+                    fast=fast,
+                    slow=slow,
+                    universe=universe,
+                    asof=asof,
+                )
+
+        # 3) Plan + save intents
+        intents = plan_intents(signals)
         save_intents(run_id, intents)
 
         buys = [i for i in intents if i.action == "buy"]
         sells = [i for i in intents if i.action == "sell"]
 
         log.info(
-            "Plan run_id=%s | buys=%s | sells=%s | total=%s | max_pos=%s | per_pos=$%s | buffer=$%s",
-            run_id, len(buys), len(sells), len(intents),
-            os.getenv("TRADING_MAX_POSITIONS", "5"),
-            os.getenv("TRADING_PER_POSITION", "100"),
-            os.getenv("TRADING_CASH_BUFFER", "25"),
+            "Plan run_id=%s asof=%s | buys=%s | sells=%s | total=%s",
+            run_id,
+            asof,
+            len(buys),
+            len(sells),
+            len(intents),
         )
 
+        # Optional: print actionable first
         for i in sells:
             log.info("SELL %s | strength=%s | %s", i.symbol, i.strength, i.reason)
-
-        # show notional if present
         for i in buys:
-            if getattr(i, "target_notional", None) is not None:
-                log.info("BUY  %s | strength=%s | $%s | %s", i.symbol, i.strength, i.target_notional, i.reason)
+            # if you added target_notional, include it
+            tn = getattr(i, "target_notional", None)
+            if tn is not None:
+                log.info("BUY  %s | strength=%s | $%s | %s", i.symbol, i.strength, tn, i.reason)
             else:
                 log.info("BUY  %s | strength=%s | %s", i.symbol, i.strength, i.reason)
 
         finish_run(run_id, status="success")
         return 0
+
     except Exception:
         finish_run(run_id, status="failed")
         raise
+
 
 def cmd_show_intents(run_id: int) -> int:
     from .db import connect
@@ -175,28 +191,83 @@ def cmd_explain(symbol: str, fast: int, slow: int) -> int:
     return 0
 
 def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> int:
+    """
+    Execute orders for a planned run.
+
+    Key behavior:
+      - DB is source of truth (we submit only orders rows for this run_id)
+      - Idempotent insert (build_orders_from_intents + persist_orders)
+      - Concurrency-safe: claim rows by flipping status -> 'submitting'
+      - retry_failed=True allows resubmitting rows with status='failed'
+      - BUY sizing: uses small-account notional sizing via last close:
+            qty_to_send = floor((per_position_notional * haircut) / close, 6 decimals)
+        then submits BUY as qty (consistent with DB.qty)
+      - SELL sizing: sells full current position qty from positions table
+    """
     from .execution import build_orders_from_intents, persist_orders, is_paper_submit_allowed
     from .broker.alpaca_broker import AlpacaPaperBroker
     from .db import connect
     import json
+    import math
+    import os
 
-    # 1) Build + persist (idempotent) from intents
+    def _env_float(name: str, default: float) -> float:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _last_close(conn, symbol: str) -> float | None:
+        r = conn.execute(
+            """
+            SELECT c
+            FROM bars_daily
+            WHERE symbol = ?
+            ORDER BY t DESC
+            LIMIT 1;
+            """,
+            (symbol,),
+        ).fetchone()
+        if not r:
+            return None
+        c = r[0]
+        return float(c) if c is not None else None
+
+    def _position_qty(conn, symbol: str) -> float:
+        r = conn.execute(
+            "SELECT qty FROM positions WHERE symbol = ?;",
+            (symbol,),
+        ).fetchone()
+        if not r or r[0] is None:
+            return 0.0
+        return float(r[0])
+
+    # ------- sizing knobs (env controlled) -------
+    per_position_notional = _env_float("TRADING_PER_POSITION", 100.0)         # e.g. $100 per position
+    notional_haircut = _env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)           # e.g. 0.98 to avoid insufficient BP
+    frac_decimals = int(_env_float("TRADING_FRACTIONAL_DECIMALS", 6.0))       # keep as int-like env
+
+    # 1) Build + persist (idempotent) from intents (qty here is just a placeholder; we’ll overwrite on submit)
     proposed = build_orders_from_intents(run_id=run_id, default_qty=qty)
     inserted = persist_orders(run_id=run_id, orders=proposed)
 
     log.info(
-        "Execute(run_id=%s): proposed=%s | inserted_into_db=%s | retry_failed=%s",
+        "Execute(run_id=%s): proposed=%s | inserted_into_db=%s | retry_failed=%s | per_pos=$%.2f | haircut=%.4f",
         run_id,
         len(proposed),
         inserted,
         retry_failed,
+        per_position_notional,
+        notional_haircut,
     )
 
     if not proposed:
         log.info("No actionable intents (buy/sell). Nothing to do.")
         return 0
 
-    # Print what the strategy/intents want to do (informational)
     for o in proposed:
         log.info("PROPOSED %s %s qty=%s | %s", o.side.upper(), o.symbol, o.qty, o.reason)
 
@@ -209,7 +280,6 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
         return 0
 
     eligible_statuses = ("created", "failed") if retry_failed else ("created",)
-    #placeholders = ",".join(["?"] * len(eligible_statuses))
     placeholders = ",".join("?" for _ in eligible_statuses)
 
     broker = AlpacaPaperBroker()
@@ -222,7 +292,7 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
             SELECT id, symbol, side, qty, reason, idempotency_key, status
             FROM orders
             WHERE run_id = ?
-            AND status IN ({placeholders})
+              AND status IN ({placeholders})
             ORDER BY id ASC;
             """,
             (run_id, *eligible_statuses),
@@ -235,13 +305,14 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
 
         for r in db_orders:
             order_id = r["id"]
-            symbol = (r["symbol"] or "").upper()
-            side = (r["side"] or "").lower()
-            db_qty = float(r["qty"])
-            status = (r["status"] or "").lower()
+            symbol = (r["symbol"] or "").upper().strip()
+            side = (r["side"] or "").lower().strip()
+            status = (r["status"] or "").lower().strip()
             reason = r["reason"]
 
-            log.info("ORDER %s %s qty=%s | %s", side.upper(), symbol, db_qty, reason)
+            if not symbol or side not in ("buy", "sell"):
+                log.info("Skip order id=%s: invalid symbol/side (symbol=%r side=%r)", order_id, symbol, side)
+                continue
 
             # Atomically claim this DB order (prevents concurrent submits)
             cur = conn.execute(
@@ -253,10 +324,56 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
                 continue
 
             try:
-                # Convert whole-number qty to int (often safer with broker APIs)
-                qty_to_send = int(db_qty) if float(db_qty).is_integer() else db_qty
+                qty_to_send: float
 
-                bo = broker.place_market_order(symbol, side, qty_to_send)
+                if side == "buy":
+                    close = _last_close(conn, symbol)
+                    if close is None or close <= 0:
+                        raise RuntimeError(f"No close price available to size BUY for {symbol}")
+
+                    target = float(per_position_notional) * float(notional_haircut)
+                    raw_qty = target / close
+
+                    scale = 10 ** frac_decimals
+                    qty_to_send = math.floor(raw_qty * scale) / scale
+
+                    if qty_to_send <= 0:
+                        raise RuntimeError(
+                            f"Computed BUY qty too small for {symbol}: close={close} target={target} raw_qty={raw_qty}"
+                        )
+
+                    # Update the order qty in DB to reflect what we’re actually sending
+                    conn.execute("UPDATE orders SET qty=? WHERE id=?;", (float(qty_to_send), order_id))
+
+                    log.info(
+                        "ORDER BUY %s target_notional=$%.2f close=%.4f -> qty=%.6f | %s",
+                        symbol,
+                        target,
+                        close,
+                        qty_to_send,
+                        reason,
+                    )
+
+                    bo = broker.place_market_order(symbol, "buy", qty=float(qty_to_send))
+
+                elif side == "sell":
+                    # Sell full position qty
+                    pos_qty = _position_qty(conn, symbol)
+                    if pos_qty <= 0:
+                        raise RuntimeError(f"No position qty to SELL for {symbol} (pos_qty={pos_qty})")
+
+                    qty_to_send = float(pos_qty)
+
+                    # Update DB qty to what we’re actually selling
+                    conn.execute("UPDATE orders SET qty=? WHERE id=?;", (qty_to_send, order_id))
+
+                    log.info("ORDER SELL %s qty=%.6f | %s", symbol, qty_to_send, reason)
+
+                    bo = broker.place_market_order(symbol, "sell", qty=float(qty_to_send))
+
+                else:
+                    raise RuntimeError(f"Unknown side={side} for order_id={order_id}")
+
                 broker_order_id = str(getattr(bo, "id", None))
 
                 # Save broker order id on orders row if column exists
@@ -268,10 +385,10 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
                 except Exception:
                     conn.execute("UPDATE orders SET status='submitted' WHERE id=?;", (order_id,))
 
-                # Save execution snapshot (idempotent if you have a unique index on (broker, broker_order_id))
+                # Save execution snapshot (use OR IGNORE if you have unique(broker, broker_order_id))
                 conn.execute(
                     """
-                    INSERT INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
+                    INSERT OR IGNORE INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
                     VALUES (?, ?, ?, ?, ?, ?);
                     """,
                     (
@@ -293,7 +410,6 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
 
     log.info("Submitted total=%s", submitted)
     return 0
-
 
 def cmd_orders(limit: int) -> int:
     from .db import connect
@@ -389,7 +505,7 @@ def cmd_sync_assets() -> int:
     return 0
 
 
-def cmd_build_universe(universe: str, asof: str, top: int, min_adv20: float) -> int:
+def cmd_build_universe(universe: str, asof: str | None, top: int, min_adv20: float) -> int:
     from .universe.build_universe import build_universe_daily
     n = build_universe_daily(universe=universe, asof=asof, top=top, min_adv20=min_adv20)
     log.info("Built universe_daily: universe=%s asof=%s rows=%s top=%s min_adv20=%s", universe, asof, n, top, min_adv20)
