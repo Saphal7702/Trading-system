@@ -199,10 +199,8 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
       - Idempotent insert (build_orders_from_intents + persist_orders)
       - Concurrency-safe: claim rows by flipping status -> 'submitting'
       - retry_failed=True allows resubmitting rows with status='failed'
-      - BUY sizing: uses small-account notional sizing via last close:
-            qty_to_send = floor((per_position_notional * haircut) / close, 6 decimals)
-        then submits BUY as qty (consistent with DB.qty)
-      - SELL sizing: sells full current position qty from positions table
+      - BUY sizing: submit as NOTIONAL (fractional shares handled by broker)
+      - SELL sizing: sell full current position qty from positions table
     """
     from .execution import build_orders_from_intents, persist_orders, is_paper_submit_allowed
     from .broker.alpaca_broker import AlpacaPaperBroker
@@ -237,20 +235,18 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
         return float(c) if c is not None else None
 
     def _position_qty(conn, symbol: str) -> float:
-        r = conn.execute(
-            "SELECT qty FROM positions WHERE symbol = ?;",
-            (symbol,),
-        ).fetchone()
+        r = conn.execute("SELECT qty FROM positions WHERE symbol = ?;", (symbol,)).fetchone()
         if not r or r[0] is None:
             return 0.0
         return float(r[0])
 
     # ------- sizing knobs (env controlled) -------
-    per_position_notional = _env_float("TRADING_PER_POSITION", 100.0)         # e.g. $100 per position
-    notional_haircut = _env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)           # e.g. 0.98 to avoid insufficient BP
-    frac_decimals = int(_env_float("TRADING_FRACTIONAL_DECIMALS", 6.0))       # keep as int-like env
+    per_position_notional = _env_float("TRADING_PER_POSITION", 100.0)
+    notional_haircut = _env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)
+    frac_decimals = int(_env_float("TRADING_FRACTIONAL_DECIMALS", 6.0))
 
-    # 1) Build + persist (idempotent) from intents (qty here is just a placeholder; we’ll overwrite on submit)
+    # 1) Build + persist (idempotent) from intents
+    # qty here is placeholder; for BUY we submit NOTIONAL anyway
     proposed = build_orders_from_intents(run_id=run_id, default_qty=qty)
     inserted = persist_orders(run_id=run_id, orders=proposed)
 
@@ -283,8 +279,8 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
     placeholders = ",".join("?" for _ in eligible_statuses)
 
     broker = AlpacaPaperBroker()
-
     submitted = 0
+
     with connect() as conn:
         # 2) Submit ONLY DB-eligible orders (DB is source of truth)
         db_orders = conn.execute(
@@ -307,7 +303,6 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
             order_id = r["id"]
             symbol = (r["symbol"] or "").upper().strip()
             side = (r["side"] or "").lower().strip()
-            status = (r["status"] or "").lower().strip()
             reason = r["reason"]
 
             if not symbol or side not in ("buy", "sell"):
@@ -324,7 +319,7 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
                 continue
 
             try:
-                qty_to_send: float
+                qty_for_execution_row: float = 0.0  # for executions.qty (schema requires it)
 
                 if side == "buy":
                     close = _last_close(conn, symbol)
@@ -332,47 +327,49 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
                         raise RuntimeError(f"No close price available to size BUY for {symbol}")
 
                     target = float(per_position_notional) * float(notional_haircut)
+
+                    # Estimate qty for logging + executions table (broker will calculate actual fill qty)
                     raw_qty = target / close
-
                     scale = 10 ** frac_decimals
-                    qty_to_send = math.floor(raw_qty * scale) / scale
-
-                    if qty_to_send <= 0:
+                    est_qty = math.floor(raw_qty * scale) / scale
+                    if est_qty <= 0:
                         raise RuntimeError(
                             f"Computed BUY qty too small for {symbol}: close={close} target={target} raw_qty={raw_qty}"
                         )
 
-                    # Update the order qty in DB to reflect what we’re actually sending
-                    conn.execute("UPDATE orders SET qty=? WHERE id=?;", (float(qty_to_send), order_id))
+                    qty_for_execution_row = float(est_qty)
 
                     log.info(
-                        "ORDER BUY %s target_notional=$%.2f close=%.4f -> qty=%.6f | %s",
+                        "ORDER BUY %s target_notional=$%.2f close=%.4f -> est_qty=%.6f | %s",
                         symbol,
                         target,
                         close,
-                        qty_to_send,
+                        est_qty,
                         reason,
                     )
 
-                    bo = broker.place_market_order(symbol, "buy", qty=float(qty_to_send))
+                    # Submit as NOTIONAL
+                    bo = broker.place_market_order(symbol, "buy", notional=float(target))
 
-                elif side == "sell":
-                    # Sell full position qty
+                    # Optional: keep orders.qty as original placeholder OR store est_qty for visibility.
+                    # Storing est_qty is fine, but remember it's only an estimate.
+                    try:
+                        conn.execute("UPDATE orders SET qty=? WHERE id=?;", (float(est_qty), order_id))
+                    except Exception:
+                        pass
+
+                else:  # sell
                     pos_qty = _position_qty(conn, symbol)
                     if pos_qty <= 0:
                         raise RuntimeError(f"No position qty to SELL for {symbol} (pos_qty={pos_qty})")
 
                     qty_to_send = float(pos_qty)
+                    qty_for_execution_row = qty_to_send
 
-                    # Update DB qty to what we’re actually selling
                     conn.execute("UPDATE orders SET qty=? WHERE id=?;", (qty_to_send, order_id))
-
                     log.info("ORDER SELL %s qty=%.6f | %s", symbol, qty_to_send, reason)
 
                     bo = broker.place_market_order(symbol, "sell", qty=float(qty_to_send))
-
-                else:
-                    raise RuntimeError(f"Unknown side={side} for order_id={order_id}")
 
                 broker_order_id = str(getattr(bo, "id", None))
 
@@ -385,7 +382,7 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
                 except Exception:
                     conn.execute("UPDATE orders SET status='submitted' WHERE id=?;", (order_id,))
 
-                # Save execution snapshot (use OR IGNORE if you have unique(broker, broker_order_id))
+                # Save execution snapshot (idempotent if you later add unique(broker, broker_order_id))
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
@@ -396,7 +393,7 @@ def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> in
                         broker_order_id,
                         symbol,
                         side,
-                        float(qty_to_send),
+                        float(qty_for_execution_row),
                         json.dumps(bo.model_dump(), default=str),
                     ),
                 )
@@ -488,7 +485,7 @@ def cmd_seed_intent(run_id: int, symbol: str, action: str, reason: str) -> int:
 def cmd_sync_orders(limit: int) -> int:
     from .broker.orders_sync import sync_orders
     res = sync_orders(limit=limit)
-    log.info("sync-orders: executions_upserted=%s | orders_updated=%s", res["executions_upserted"], res["orders_updated"])
+    log.info("Synced orders: scanned=%s matched=%s updated=%s", res.scanned, res.matched, res.updated)
     return 0
 
 def cmd_load_universe(universe: str, file: str) -> int:
@@ -507,8 +504,11 @@ def cmd_sync_assets() -> int:
 
 def cmd_build_universe(universe: str, asof: str | None, top: int, min_adv20: float) -> int:
     from .universe.build_universe import build_universe_daily
-    n = build_universe_daily(universe=universe, asof=asof, top=top, min_adv20=min_adv20)
-    log.info("Built universe_daily: universe=%s asof=%s rows=%s top=%s min_adv20=%s", universe, asof, n, top, min_adv20)
+    resolved_asof, n = build_universe_daily(universe=universe, asof=asof, top=top, min_adv20=min_adv20)
+    log.info(
+        "Built universe_daily: universe=%s asof=%s rows=%s top=%s min_adv20=%s",
+        universe, resolved_asof, n, top, min_adv20
+    )
     return 0
 
 

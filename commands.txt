@@ -15,16 +15,11 @@ trading sync-assets
 trading fetch-bars --days 400
 trading build-universe --top 200
 trading show-universe --limit 20
-
-trading fetch-bars --days 400
-trading build-universe --top 200
-trading show-universe --limit 20
 trading plan
-tradind show-intents --run-id X
+trading show-intents --run-id X
 trading execute --run-id X --submit
 trading sync-orders
 trading sync-positions
-
 
 
 /*************************  Git Commands:  **************************************************************/
