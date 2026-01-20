@@ -4,6 +4,7 @@ import os
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from .base import AccountSummary, PositionSnapshot
 
 class AlpacaPaperBroker:
     """
@@ -18,6 +19,28 @@ class AlpacaPaperBroker:
 
         # Paper by default (your project assumes paper in early phases)
         self.client = TradingClient(key, secret, paper=True)
+
+    def get_account(self) -> AccountSummary:
+        acct = self.client.get_account()
+
+        def f(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        acct_id = getattr(acct, "id", None)
+        acct_id = str(acct_id) if acct_id is not None else None  # UUID-safe for SQLite
+
+        return AccountSummary(
+            broker=self.name,
+            account_id=acct_id,
+            status=getattr(acct, "status", None),
+            currency=getattr(acct, "currency", None),
+            buying_power=f(getattr(acct, "buying_power", None)),
+            equity=f(getattr(acct, "equity", None)),
+        )
+
 
     def place_market_order(self, symbol: str, side: str, *, qty: float | None = None, notional: float | None = None):
         side = (side or "").lower().strip()

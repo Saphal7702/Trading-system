@@ -2,6 +2,34 @@ from __future__ import annotations
 from .base import Broker
 from ..db import connect
 
+def upsert_account(broker: Broker) -> None:
+    """
+    Snapshot broker account into broker_accounts (1 row per broker).
+    """
+    a = broker.get_account()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO broker_accounts (broker, account_id, status, currency, buying_power, equity, last_synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(broker) DO UPDATE SET
+                account_id=excluded.account_id,
+                status=excluded.status,
+                currency=excluded.currency,
+                buying_power=excluded.buying_power,
+                equity=excluded.equity,
+                last_synced_at=datetime('now');
+            """,
+            (
+                a.broker,
+                str(a.account_id) if a.account_id is not None else None,
+                a.status,
+                a.currency,
+                float(a.buying_power) if a.buying_power is not None else None,
+                float(a.equity) if a.equity is not None else None,
+            ),
+        )
+
 def sync_positions(broker: Broker) -> int:
     positions = broker.list_positions()
     seen = {p.symbol.strip().upper() for p in positions}
