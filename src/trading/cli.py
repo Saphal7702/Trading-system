@@ -413,7 +413,8 @@ def cmd_orders(limit: int) -> int:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, symbol, side, qty, status, requested_at, broker_order_id, reason
+            SELECT id, symbol, side, qty, status, requested_at, broker_order_id, reason,
+                   filled_qty, filled_avg_price, filled_at
             FROM orders
             ORDER BY id DESC
             LIMIT ?;
@@ -426,9 +427,14 @@ def cmd_orders(limit: int) -> int:
         return 0
 
     for r in rows:
-        msg = f"#{r['id']} {r['side'].upper()} {r['symbol']} qty={r['qty']} status={r['status']} at={r['requested_at']}"
+        msg = (
+            f"#{r['id']} {r['side'].upper()} {r['symbol']} "
+            f"qty={r['qty']} status={r['status']} at={r['requested_at']}"
+        )
         if r["broker_order_id"]:
             msg += f" broker_order_id={r['broker_order_id']}"
+        if r["filled_qty"] is not None or r["filled_avg_price"] is not None or r["filled_at"] is not None:
+            msg += f" | fill_qty={r['filled_qty']} fill_avg={r['filled_avg_price']} filled_at={r['filled_at']}"
         if r["reason"]:
             msg += f" | reason={r['reason']}"
         log.info(msg)

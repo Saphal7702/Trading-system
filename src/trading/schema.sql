@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS orders (
   reason TEXT,
   idempotency_key TEXT,
   broker_order_id TEXT,
-  run_id INTEGER
+  run_id INTEGER,
+  filled_qty REAL,
+  filled_avg_price REAL,
+  filled_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -123,3 +126,12 @@ CREATE TABLE IF NOT EXISTS universe_daily (
 
 CREATE INDEX IF NOT EXISTS ix_universe_daily_lookup
 ON universe_daily(asof_date, universe, include, score DESC);
+
+-- Prevent duplicate logical orders (idempotency)
+CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency
+ON orders(idempotency_key)
+WHERE idempotency_key IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_exec_broker_order
+ON executions(broker, broker_order_id)
+WHERE broker_order_id IS NOT NULL;

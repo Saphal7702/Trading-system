@@ -19,12 +19,38 @@ class Intent:
     target_notional: float | None = None
 
 
+def _norm_sym(sym: str | None) -> str:
+    return (sym or "").strip().upper()
+
+
 def _current_positions() -> dict[str, dict]:
+    """
+    Returns:
+      { "AAPL": {"qty": 1.0, "opened_at": "2026-01-20T15:09:30+00:00"} , ... }
+
+    Conservative behaviors:
+      - symbols are normalized to uppercase
+      - missing qty -> 0
+      - opened_at can be None (planner will block sells if missing)
+    """
     with connect() as conn:
         rows = conn.execute("SELECT symbol, qty, opened_at FROM positions;").fetchall()
+
     pos: dict[str, dict] = {}
     for r in rows:
-        pos[r["symbol"]] = {"qty": float(r["qty"]), "opened_at": r["opened_at"]}
+        sym = _norm_sym(r["symbol"])
+        if not sym:
+            continue
+
+        qty_val = r["qty"]
+        try:
+            qty = float(qty_val) if qty_val is not None else 0.0
+        except Exception:
+            qty = 0.0
+
+        opened_at = r["opened_at"]  # can be None; handled downstream
+        pos[sym] = {"qty": qty, "opened_at": opened_at}
+
     return pos
 
 
@@ -42,8 +68,10 @@ def _get_buying_power_fallback(default: float = 0.0) -> float:
             LIMIT 1;
             """
         ).fetchone()
+
     if not r or r["buying_power"] is None:
         return float(default)
+
     try:
         return float(r["buying_power"])
     except Exception:
@@ -93,79 +121,92 @@ def plan_intents(
     now = datetime.now(timezone.utc)
 
     max_positions = max_positions if max_positions is not None else _env_int("TRADING_MAX_POSITIONS", 5)
-    per_position_notional = per_position_notional if per_position_notional is not None else _env_float("TRADING_PER_POSITION", 100.0)
+    per_position_notional = (
+        per_position_notional if per_position_notional is not None else _env_float("TRADING_PER_POSITION", 100.0)
+    )
     cash_buffer = cash_buffer if cash_buffer is not None else _env_float("TRADING_CASH_BUFFER", 25.0)
 
     assumed_bp = _env_float("TRADING_ASSUMED_BP", 0.0)
     buying_power = _get_buying_power_fallback(default=assumed_bp)
 
     # Count currently held positions (>0 qty)
-    held_symbols = [s for s, p in pos.items() if p.get("qty", 0.0) > 0.0]
+    held_symbols = [s for s, p in pos.items() if float(p.get("qty", 0.0) or 0.0) > 0.0]
     held_count = len(held_symbols)
 
     intents: list[Intent] = []
-
-    # 1) First, process SELL/HOLD decisions (so we know what might free slots later)
-    # (Simple version: just create intents; we won't assume sells will fill instantly.)
-    # We'll still keep the buy cap conservative.
     buy_candidates: list[Signal] = []
 
-    for s in signals:
-        holding = s.symbol in pos and pos[s.symbol]["qty"] > 0
+    # 1) Process SELL/HOLD decisions; collect BUY candidates
+    for sig in signals:
+        sym = _norm_sym(sig.symbol)
+        if not sym:
+            continue
 
-        if s.action == "sell":
+        holding = sym in pos and float(pos[sym].get("qty", 0.0) or 0.0) > 0.0
+
+        if sig.action == "sell":
             if not holding:
-                intents.append(Intent(s.symbol, "hold", "Not holding; skip sell", s.strength))
-            else:
-                opened_at = pos[s.symbol]["opened_at"]
-                d = can_sell(opened_at, now=now)
-                if not d.allowed:
-                    intents.append(Intent(s.symbol, "hold", f"Sell blocked: {d.reason}", s.strength))
-                else:
-                    intents.append(Intent(s.symbol, "sell", s.reason, s.strength))
+                intents.append(Intent(sym, "hold", "Not holding; skip sell", sig.strength))
+                continue
 
-        elif s.action == "buy":
-            if holding:
-                intents.append(Intent(s.symbol, "hold", "Already holding; skip buy", s.strength))
+            opened_at = pos[sym].get("opened_at")
+            if not opened_at:
+                # Conservative: if we don't know when the position opened, we do NOT allow a sell
+                intents.append(Intent(sym, "hold", "Sell blocked: missing opened_at (sync fills/positions first)", sig.strength))
+                continue
+
+            d = can_sell(opened_at, now=now)
+            if not d.allowed:
+                intents.append(Intent(sym, "hold", f"Sell blocked: {d.reason}", sig.strength))
             else:
-                buy_candidates.append(s)
+                intents.append(Intent(sym, "sell", sig.reason, sig.strength))
+
+        elif sig.action == "buy":
+            if holding:
+                intents.append(Intent(sym, "hold", "Already holding; skip buy", sig.strength))
+            else:
+                # Keep original Signal (we'll use sym from it but it's fine)
+                buy_candidates.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
 
         else:
-            intents.append(Intent(s.symbol, "hold", s.reason, s.strength))
+            intents.append(Intent(sym, "hold", sig.reason, sig.strength))
 
     # 2) Budget-aware BUY selection
-    # Sort strongest first (None treated as 0)
     buy_candidates.sort(key=lambda x: float(x.strength or 0.0), reverse=True)
 
     slots_left = max(0, max_positions - held_count)
 
-    # How many buys can we afford?
-    # We require: buying_power - cash_buffer >= per_position_notional * n
-    # n_afford = floor((buying_power - cash_buffer) / per_position_notional)
     spendable = max(0.0, buying_power - cash_buffer)
     n_afford = int(spendable // per_position_notional) if per_position_notional > 0 else 0
-
     n_buys_allowed = max(0, min(slots_left, n_afford))
 
-    for idx, s in enumerate(buy_candidates):
+    for idx, sig in enumerate(buy_candidates):
+        sym = _norm_sym(sig.symbol)
+
         if idx < n_buys_allowed:
             intents.append(
                 Intent(
-                    s.symbol,
+                    sym,
                     "buy",
-                    s.reason,
-                    s.strength,
+                    sig.reason,
+                    sig.strength,
                     target_notional=per_position_notional,
                 )
             )
         else:
-            # Explain why it was skipped
             if slots_left <= 0:
-                intents.append(Intent(s.symbol, "hold", f"Max positions reached ({max_positions}); skip buy", s.strength))
+                intents.append(Intent(sym, "hold", f"Max positions reached ({max_positions}); skip buy", sig.strength))
             elif n_afford <= 0:
-                intents.append(Intent(s.symbol, "hold", f"Insufficient buying power for ${per_position_notional:.2f} (buffer ${cash_buffer:.2f}); skip buy", s.strength))
+                intents.append(
+                    Intent(
+                        sym,
+                        "hold",
+                        f"Insufficient buying power for ${per_position_notional:.2f} (buffer ${cash_buffer:.2f}); skip buy",
+                        sig.strength,
+                    )
+                )
             else:
-                intents.append(Intent(s.symbol, "hold", f"Budget/slots limited; skip buy", s.strength))
+                intents.append(Intent(sym, "hold", "Budget/slots limited; skip buy", sig.strength))
 
     return intents
 
@@ -177,6 +218,6 @@ def save_intents(run_id: int, intents: list[Intent]) -> int:
             INSERT INTO intents(run_id, symbol, action, strength, reason)
             VALUES (?, ?, ?, ?, ?);
             """,
-            [(run_id, i.symbol, i.action, i.strength, i.reason) for i in intents],
+            [(run_id, _norm_sym(i.symbol), i.action, i.strength, i.reason) for i in intents],
         )
     return len(intents)
