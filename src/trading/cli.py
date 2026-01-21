@@ -191,221 +191,24 @@ def cmd_explain(symbol: str, fast: int, slow: int) -> int:
     return 0
 
 def cmd_execute(run_id: int, qty: float, submit: bool, retry_failed: bool) -> int:
-    """
-    Execute orders for a planned run.
+    from .execution import execute_run
 
-    Key behavior:
-      - DB is source of truth (we submit only orders rows for this run_id)
-      - Idempotent insert (build_orders_from_intents + persist_orders)
-      - Concurrency-safe: claim rows by flipping status -> 'submitting'
-      - retry_failed=True allows resubmitting rows with status='failed'
-      - BUY sizing: submit as NOTIONAL (fractional shares handled by broker)
-      - SELL sizing: sell full current position qty from positions table
-    """
-    from .execution import build_orders_from_intents, persist_orders, is_paper_submit_allowed
-    from .broker.alpaca_broker import AlpacaPaperBroker
-    from .db import connect
-    import json
-    import math
-    import os
-
-    def _env_float(name: str, default: float) -> float:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return float(default)
-        try:
-            return float(v)
-        except Exception:
-            return float(default)
-
-    def _last_close(conn, symbol: str) -> float | None:
-        r = conn.execute(
-            """
-            SELECT c
-            FROM bars_daily
-            WHERE symbol = ?
-            ORDER BY t DESC
-            LIMIT 1;
-            """,
-            (symbol,),
-        ).fetchone()
-        if not r:
-            return None
-        c = r[0]
-        return float(c) if c is not None else None
-
-    def _position_qty(conn, symbol: str) -> float:
-        r = conn.execute("SELECT qty FROM positions WHERE symbol = ?;", (symbol,)).fetchone()
-        if not r or r[0] is None:
-            return 0.0
-        return float(r[0])
-
-    # ------- sizing knobs (env controlled) -------
-    per_position_notional = _env_float("TRADING_PER_POSITION", 100.0)
-    notional_haircut = _env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)
-    frac_decimals = int(_env_float("TRADING_FRACTIONAL_DECIMALS", 6.0))
-
-    # 1) Build + persist (idempotent) from intents
-    # qty here is placeholder; for BUY we submit NOTIONAL anyway
-    proposed = build_orders_from_intents(run_id=run_id, default_qty=qty)
-    inserted = persist_orders(run_id=run_id, orders=proposed)
-
-    log.info(
-        "Execute(run_id=%s): proposed=%s | inserted_into_db=%s | retry_failed=%s | per_pos=$%.2f | haircut=%.4f",
-        run_id,
-        len(proposed),
-        inserted,
-        retry_failed,
-        per_position_notional,
-        notional_haircut,
+    out = execute_run(
+        run_id=run_id,
+        qty_default=qty,
+        submit=submit,
+        retry_failed=retry_failed,
     )
 
-    if not proposed:
-        log.info("No actionable intents (buy/sell). Nothing to do.")
-        return 0
-
-    for o in proposed:
-        log.info("PROPOSED %s %s qty=%s | %s", o.side.upper(), o.symbol, o.qty, o.reason)
-
-    if not submit:
-        log.info("Dry-run only. Use --submit to send orders (paper-gated).")
-        return 0
-
-    if not is_paper_submit_allowed():
-        log.info("Submission blocked: set TRADING_ALLOW_PAPER_ORDERS=true in .env to allow paper submissions.")
-        return 0
-
-    eligible_statuses = ("created", "failed") if retry_failed else ("created",)
-    placeholders = ",".join("?" for _ in eligible_statuses)
-
-    broker = AlpacaPaperBroker()
-    submitted = 0
-
-    with connect() as conn:
-        # 2) Submit ONLY DB-eligible orders (DB is source of truth)
-        db_orders = conn.execute(
-            f"""
-            SELECT id, symbol, side, qty, reason, idempotency_key, status
-            FROM orders
-            WHERE run_id = ?
-              AND status IN ({placeholders})
-            ORDER BY id ASC;
-            """,
-            (run_id, *eligible_statuses),
-        ).fetchall()
-
-        if not db_orders:
-            log.info("No DB-eligible orders to submit (statuses=%s).", eligible_statuses)
-            log.info("Submitted total=0")
-            return 0
-
-        for r in db_orders:
-            order_id = r["id"]
-            symbol = (r["symbol"] or "").upper().strip()
-            side = (r["side"] or "").lower().strip()
-            reason = r["reason"]
-
-            if not symbol or side not in ("buy", "sell"):
-                log.info("Skip order id=%s: invalid symbol/side (symbol=%r side=%r)", order_id, symbol, side)
-                continue
-
-            # Atomically claim this DB order (prevents concurrent submits)
-            cur = conn.execute(
-                f"UPDATE orders SET status='submitting' WHERE id=? AND status IN ({placeholders});",
-                (order_id, *eligible_statuses),
-            )
-            if cur.rowcount != 1:
-                log.info("Skip %s %s: could not claim order (already handled)", side.upper(), symbol)
-                continue
-
-            try:
-                qty_for_execution_row: float = 0.0  # for executions.qty (schema requires it)
-
-                if side == "buy":
-                    close = _last_close(conn, symbol)
-                    if close is None or close <= 0:
-                        raise RuntimeError(f"No close price available to size BUY for {symbol}")
-
-                    target = float(per_position_notional) * float(notional_haircut)
-
-                    # Estimate qty for logging + executions table (broker will calculate actual fill qty)
-                    raw_qty = target / close
-                    scale = 10 ** frac_decimals
-                    est_qty = math.floor(raw_qty * scale) / scale
-                    if est_qty <= 0:
-                        raise RuntimeError(
-                            f"Computed BUY qty too small for {symbol}: close={close} target={target} raw_qty={raw_qty}"
-                        )
-
-                    qty_for_execution_row = float(est_qty)
-
-                    log.info(
-                        "ORDER BUY %s target_notional=$%.2f close=%.4f -> est_qty=%.6f | %s",
-                        symbol,
-                        target,
-                        close,
-                        est_qty,
-                        reason,
-                    )
-
-                    # Submit as NOTIONAL
-                    bo = broker.place_market_order(symbol, "buy", notional=float(target))
-
-                    # Optional: keep orders.qty as original placeholder OR store est_qty for visibility.
-                    # Storing est_qty is fine, but remember it's only an estimate.
-                    try:
-                        conn.execute("UPDATE orders SET qty=? WHERE id=?;", (float(est_qty), order_id))
-                    except Exception:
-                        pass
-
-                else:  # sell
-                    pos_qty = _position_qty(conn, symbol)
-                    if pos_qty <= 0:
-                        raise RuntimeError(f"No position qty to SELL for {symbol} (pos_qty={pos_qty})")
-
-                    qty_to_send = float(pos_qty)
-                    qty_for_execution_row = qty_to_send
-
-                    conn.execute("UPDATE orders SET qty=? WHERE id=?;", (qty_to_send, order_id))
-                    log.info("ORDER SELL %s qty=%.6f | %s", symbol, qty_to_send, reason)
-
-                    bo = broker.place_market_order(symbol, "sell", qty=float(qty_to_send))
-
-                broker_order_id = str(getattr(bo, "id", None))
-
-                # Save broker order id on orders row if column exists
-                try:
-                    conn.execute(
-                        "UPDATE orders SET status='submitted', broker_order_id=? WHERE id=?;",
-                        (broker_order_id, order_id),
-                    )
-                except Exception:
-                    conn.execute("UPDATE orders SET status='submitted' WHERE id=?;", (order_id,))
-
-                # Save execution snapshot (idempotent if you later add unique(broker, broker_order_id))
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        "alpaca",
-                        broker_order_id,
-                        symbol,
-                        side,
-                        float(qty_for_execution_row),
-                        json.dumps(bo.model_dump(), default=str),
-                    ),
-                )
-
-                submitted += 1
-                log.info("Submitted %s %s -> broker_order_id=%s", side.upper(), symbol, broker_order_id)
-
-            except Exception as e:
-                conn.execute("UPDATE orders SET status='failed', reason=? WHERE id=?;", (str(e), order_id))
-                log.info("FAILED submitting %s %s: %s", side.upper(), symbol, e)
-
-    log.info("Submitted total=%s", submitted)
+    # Keep your current logging style
+    log.info(
+        "Execute done(run_id=%s): proposed=%s inserted=%s submitted=%s skipped_reason=%s",
+        run_id,
+        out.get("proposed"),
+        out.get("inserted"),
+        out.get("submitted"),
+        out.get("skipped_reason"),
+    )
     return 0
 
 def cmd_orders(limit: int) -> int:
@@ -615,6 +418,15 @@ def main() -> int:
     p_run = sub.add_parser("run", help="Execute one trading cycle (Phase 1 skeleton)")
     p_run.add_argument("--notes", default="", help="Optional notes to store in runs table")
 
+    p_ro = sub.add_parser("run-once", help="Orchestrated daily run (Phase 2): sync, universe, plan, execute, final sync")
+    p_ro.add_argument("--notes", default="", help="Optional notes to store in runs table")
+    p_ro.add_argument("--universe", default="sp500")
+    p_ro.add_argument("--top", type=int, default=200)
+    p_ro.add_argument("--min-adv20", type=float, default=20_000_000.0)
+    p_ro.add_argument("--fast", type=int, default=20)
+    p_ro.add_argument("--slow", type=int, default=50)
+    p_ro.add_argument("--execute", action="store_true", help="Attempt execution (still paper-gated)")
+
     p_plan = sub.add_parser("plan", help="Generate today's trade plan (signals + intents). No orders placed.")
     p_plan.add_argument("--fast", type=int, default=20)
     p_plan.add_argument("--slow", type=int, default=50)
@@ -652,6 +464,19 @@ def main() -> int:
         
     if args.cmd == "run":
         return cmd_run(args.notes)
+    
+    if args.cmd == "run-once":
+        res = run_once(
+            notes=args.notes or None,
+            universe=args.universe,
+            top=args.top,
+            min_adv20=args.min_adv20,
+            fast=args.fast,
+            slow=args.slow,
+            execute_requested=args.execute,
+        )
+        log.info("run-once completed. status=%s run_id=%s asof=%s reason=%s", res.status, res.run_id, res.asof, res.reason)
+        return 0 if res.status in ("success", "skipped") else 2
     
     if args.cmd == "status":
         return cmd_status()
