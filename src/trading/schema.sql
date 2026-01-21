@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS runs (
   finished_at TEXT,
   status TEXT NOT NULL DEFAULT 'running',
   notes TEXT,
-  asof_date TEXT
+  asof_date TEXT,
+  reason TEXT,
+  summary_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS broker_accounts (
@@ -124,10 +126,17 @@ CREATE TABLE IF NOT EXISTS universe_daily (
   PRIMARY KEY (asof_date, universe, symbol)
 );
 
+CREATE TABLE IF NOT EXISTS symbol_cooldowns (
+  symbol TEXT PRIMARY KEY,
+  cooldown_until TEXT NOT NULL,
+  reason TEXT,
+  set_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+
 CREATE INDEX IF NOT EXISTS ix_universe_daily_lookup
 ON universe_daily(asof_date, universe, include, score DESC);
 
--- Prevent duplicate logical orders (idempotency)
 CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency
 ON orders(idempotency_key)
 WHERE idempotency_key IS NOT NULL;
