@@ -4,11 +4,18 @@ import json
 import os
 import socket
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 
 from .db import connect, init_db
 from .cooldown import is_in_cooldown
+from .lock import acquire_lock, release_lock, read_lock_info
+
 import logging
+
+from .market_calendar import today_ny_str, is_trading_day
+
+NY = ZoneInfo("America/New_York")
 
 log = logging.getLogger("trading")
 
@@ -122,19 +129,21 @@ def run_once(
     init_db()
 
     got_lock, lock_path = acquire_lock()
+    info = read_lock_info(lock_path)
     if not got_lock:
-        log.info("run_once skipped: lock already taken (%s)", lock_path)
+        log.info("run_once skipped: lock already taken (%s) pid=%s age=%s", info.path, info.owner_pid, info.age_seconds)
         return RunResult(run_id=-1, status="skipped", reason="lock_taken", summary={"lock": lock_path})
 
     run_id = start_run(notes=notes)
     asof: str | None = None
     summary: dict = {"steps": {}, "params": {"universe": universe, "top": top, "min_adv20": min_adv20, "fast": fast, "slow": slow}}
 
-    def step(name: str, fn):
+    def step(name, fn):
         log.info("step=%s start run_id=%s", name, run_id)
-        out = fn() or {}
-        summary["steps"][name] = out
-        log.info("step=%s done run_id=%s", name, run_id)
+        res = fn()
+        summary["steps"][name] = res
+        log.info("step=%s done run_id=%s res=%s", name, run_id, res)
+        return res
 
     try:
         # 1) Resolve asof_date once (DB-based, you already have this)
@@ -142,6 +151,40 @@ def run_once(
 
         with connect() as conn:
             asof = resolve_asof_date(conn, None)
+
+            max_stale = int(os.getenv("TRADING_MAX_BAR_STALENESS_DAYS", "2"))
+            require_latest = os.getenv("TRADING_REQUIRE_TODAY_OR_LAST_TRADING_DAY", "false").lower() in ("1", "true", "yes")
+
+            asof_date = date.fromisoformat(asof)
+            today_ny = datetime.now(tz=NY).date()
+
+            staleness = (today_ny - asof_date).days
+
+            if staleness > max_stale:
+                log.warning(
+                    "Bars data stale: asof=%s today=%s staleness_days=%s max_allowed=%s",
+                    asof, today_ny, staleness, max_stale
+                )
+                finish_run(run_id, status="skipped")
+                return RunResult(
+                    run_id=run_id,
+                    status="skipped",
+                    asof=asof,
+                    reason="stale_bars",
+                )
+
+            if require_latest and staleness > 0:
+                log.warning(
+                    "Latest bars not available: asof=%s today=%s",
+                    asof, today_ny
+                )
+                finish_run(run_id, status="skipped")
+                return RunResult(
+                    run_id=run_id,
+                    status="skipped",
+                    asof=asof,
+                    reason="bars_not_latest",
+                )
 
             # weekend gating MVP (holidays later via Alpaca calendar)
             if _is_weekend(asof):
@@ -168,6 +211,54 @@ def run_once(
             return {"broker": a.broker, "status": a.status, "buying_power": a.buying_power, "equity": a.equity}
 
         step("brokercheck", _brokercheck)
+
+        def _env_bool(name: str, default: bool = False) -> bool:
+            v = os.getenv(name)
+            if v is None:
+                return default
+            return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+        def _calendar_gate() -> dict:
+            ignore = _env_bool("TRADING_IGNORE_MARKET_CALENDAR", False)
+            require_after_close = _env_bool("TRADING_REQUIRE_AFTER_CLOSE", False)
+            grace = int(os.getenv("TRADING_AFTER_CLOSE_GRACE_MINUTES", "5"))
+            trade_day = today_ny_str()
+
+            if ignore:
+                return {"skipped": False, "trade_day": trade_day, "reason": "ignored"}
+
+            ok, md = is_trading_day(broker, trade_day)
+            if not ok:
+                return {"skipped": True, "trade_day": trade_day, "reason": "market_closed"}
+
+            if require_after_close and md and md.close:
+                now_ny = datetime.now(tz=NY)
+
+                parts = str(md.close).split(":")
+                hh = int(parts[0])
+                mm = int(parts[1])
+
+                close_dt = now_ny.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                cutoff_dt = close_dt + timedelta(minutes=grace)
+
+                if now_ny < cutoff_dt:
+                    return {"skipped": True, "trade_day": trade_day, "reason": "before_close"}
+
+            return {
+                "skipped": False,
+                "trade_day": trade_day,
+                "open": md.open if md else None,
+                "close": md.close if md else None,
+            }
+
+        cal = step("calendar_check", _calendar_gate)
+        if cal.get("skipped"):
+            # mark run as skipped (or success with reason)
+            with connect() as conn:
+                conn.execute("UPDATE runs SET asof_date=? WHERE id=?;", (cal["trade_day"], run_id))
+            finish_run(run_id, status="skipped")
+            log.info("RUN SKIPPED run_id=%s reason=%s trade_day=%s", run_id, cal["reason"], cal["trade_day"])
+            return RunResult(run_id=run_id, reason=cal["reason"], asof=cal["trade_day"])
 
         # 3) Pre-sync orders/positions
         step("sync_orders_pre", lambda: vars(sync_orders(limit=200)))
@@ -249,14 +340,16 @@ def run_once(
         #log.info(one_line)
 
         exec_out = summary["steps"].get("execute", {})
+        exec_skipped = exec_out.get("skipped_reason") or exec_out.get("reason")
         log.info(
-            "RUN OK run_id=%s asof=%s universe=%s top=%s intents=%s buys=%s sells=%s exec_submitted=%s exec_skipped=%s",
+            "RUN OK run_id=%s asof=%s universe=%s top=%s intents=%s buys=%s sells=%s holds=%s exec_submitted=%s exec_skipped=%s",
             run_id, asof, universe, top,
             summary["steps"].get("plan", {}).get("intents"),
             summary["steps"].get("plan", {}).get("buys"),
             summary["steps"].get("plan", {}).get("sells"),
-            exec_out.get("submitted"),
-            exec_out.get("skipped_reason"),
+            summary["steps"].get("plan", {}).get("holds"),
+            exec_out.get("submitted", 0),
+            exec_skipped,
         )
         return RunResult(run_id=run_id, status="success", asof=asof, summary=summary)
 

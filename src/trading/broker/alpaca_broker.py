@@ -5,6 +5,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from .base import AccountSummary, PositionSnapshot
+from alpaca.trading.requests import GetCalendarRequest
 
 class AlpacaPaperBroker:
     """
@@ -70,3 +71,7 @@ class AlpacaPaperBroker:
     def list_positions(self):
         # Returns list of Position objects
         return self.client.get_all_positions()
+    
+    def get_calendar(self, start: str, end: str):
+        req = GetCalendarRequest(start=start, end=end)
+        return self.client.get_calendar(req)
