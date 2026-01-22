@@ -21,9 +21,10 @@ trading execute --run-id X --submit
 trading sync-orders
 trading sync-positions
 
+trading preflight
+trading fetch-bars --days 400
 trading run-once
 trading run-once --execute
-trading execute --run-id 20 --submit
 
 
 /*************************  Git Commands:  **************************************************************/

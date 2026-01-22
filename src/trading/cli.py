@@ -415,6 +415,9 @@ def main() -> int:
     p_e = sub.add_parser("executions", help="Show recent broker executions snapshots")
     p_e.add_argument("--limit", type=int, default=20)
 
+    p_pf = sub.add_parser("preflight", help="Sanity checks before running (calendar, bars freshness, account, open orders)")
+    p_pf.add_argument("--universe", default="sp500")
+
     p_run = sub.add_parser("run", help="Execute one trading cycle (Phase 1 skeleton)")
     p_run.add_argument("--notes", default="", help="Optional notes to store in runs table")
 
@@ -526,5 +529,16 @@ def main() -> int:
     if args.cmd == "show-universe":
         return cmd_show_universe(args.universe, args.asof, args.limit)
 
+    if args.cmd == "preflight":
+        from .preflight import run_preflight
+        r = run_preflight(universe=args.universe)
+        log.info(
+            "PREFLIGHT ok=%s exec_safe=%s asof=%s stale_days=%s market_open=%s reason=%s "
+            "buying_power=%s equity=%s open_orders=%s cooldown_active=%s cap_remaining=%s min_bp_required=%.2f blockers=%s",
+            r.ok, r.exec_safe, r.asof, r.staleness_days, r.market_open_day, r.market_reason,
+            r.buying_power, r.equity, r.open_internal_orders, r.cooldown_active,
+            r.cap_remaining, r.min_bp_required, r.exec_blockers
+        )
+        return 0 if r.ok else 2
 
     return 1
