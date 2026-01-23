@@ -40,8 +40,9 @@ class AlpacaPaperBroker:
             currency=getattr(acct, "currency", None),
             buying_power=f(getattr(acct, "buying_power", None)),
             equity=f(getattr(acct, "equity", None)),
+            cash=f(getattr(acct, "cash", None)),
+            long_market_value=f(getattr(acct, "long_market_value", None)),
         )
-
 
     def place_market_order(self, symbol: str, side: str, *, qty: float | None = None, notional: float | None = None):
         side = (side or "").lower().strip()

@@ -144,3 +144,59 @@ WHERE idempotency_key IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_exec_broker_order
 ON executions(broker, broker_order_id)
 WHERE broker_order_id IS NOT NULL;
+
+-- ---- Phase 3: P&L / lots ----
+
+CREATE TABLE IF NOT EXISTS position_lots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol TEXT NOT NULL,
+  qty_open REAL NOT NULL,
+  entry_price REAL NOT NULL,
+  entry_filled_at TEXT NOT NULL,
+  entry_execution_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(entry_execution_id) REFERENCES executions(id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_position_lots_symbol
+ON position_lots(symbol);
+
+CREATE INDEX IF NOT EXISTS ix_position_lots_symbol_entry_time
+ON position_lots(symbol, entry_filled_at);
+
+
+CREATE TABLE IF NOT EXISTS lot_closings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol TEXT NOT NULL,
+  lot_id INTEGER NOT NULL,
+  qty_closed REAL NOT NULL,
+  entry_price REAL NOT NULL,
+  exit_price REAL NOT NULL,
+  realized_pnl REAL NOT NULL,
+  entry_filled_at TEXT NOT NULL,
+  exit_filled_at TEXT NOT NULL,
+  entry_execution_id INTEGER NOT NULL,
+  exit_execution_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(lot_id) REFERENCES position_lots(id),
+  FOREIGN KEY(entry_execution_id) REFERENCES executions(id),
+  FOREIGN KEY(exit_execution_id) REFERENCES executions(id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_lot_closings_symbol_exit_time
+ON lot_closings(symbol, exit_filled_at);
+
+CREATE INDEX IF NOT EXISTS ix_lot_closings_exit_execution
+ON lot_closings(exit_execution_id);
+
+
+CREATE TABLE IF NOT EXISTS account_snapshots_daily (
+  asof_date TEXT PRIMARY KEY,  -- YYYY-MM-DD
+  cash REAL NOT NULL,
+  equity REAL NOT NULL,
+  buying_power REAL,
+  long_market_value REAL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  run_id INTEGER,
+  FOREIGN KEY(run_id) REFERENCES runs(id)
+);
