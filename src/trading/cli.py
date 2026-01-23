@@ -275,6 +275,97 @@ def cmd_executions(limit: int) -> int:
         )
     return 0
 
+def cmd_lots_rebuild() -> int:
+    from .pnl.lots import rebuild_lots
+    res = rebuild_lots()
+    log.info(
+        "Lots rebuild done | buys=%s sells=%s lots=%s closings=%s warnings=%s",
+        res.buys_processed, res.sells_processed, res.lots_created, res.closings_created, res.warnings
+    )
+    return 0
+
+
+def cmd_positions(asof: str | None) -> int:
+    from .db import connect
+    from .asof import resolve_asof_date
+    from .pnl.lots import get_open_lots_by_symbol
+    from .pnl.mark import get_close
+
+    # Resolve asof date if not provided
+    with connect() as conn:
+        resolved = resolve_asof_date(conn, asof)
+
+    lots_by_sym = get_open_lots_by_symbol()
+    if not lots_by_sym:
+        log.info("No open lots.")
+        return 0
+
+    total_unrl = 0.0
+    log.info("OPEN POSITIONS (lots-based) asof=%s symbols=%s", resolved, len(lots_by_sym))
+
+    for sym in sorted(lots_by_sym.keys()):
+        lots = lots_by_sym[sym]
+
+        qty = 0.0
+        cost = 0.0
+        for L in lots:
+            q = float(L["qty_open"])
+            p = float(L["entry_price"])
+            qty += q
+            cost += q * p
+
+        if qty <= 0:
+            continue
+
+        avg_cost = cost / qty
+        last = get_close(sym, resolved)
+        if last is None:
+            log.info("%s qty=%s avg_cost=%.4f last=? (no bars)", sym, qty, avg_cost)
+            continue
+
+        unrl = qty * (float(last) - avg_cost)
+        total_unrl += unrl
+        pct = (unrl / (qty * avg_cost)) * 100.0 if avg_cost > 0 else 0.0
+
+        log.info(
+            "%s qty=%.6f avg_cost=%.4f last=%.4f uPnL=%+.2f (%+.2f%%) lots=%s",
+            sym, qty, avg_cost, float(last), unrl, pct, len(lots)
+        )
+
+    log.info("TOTAL unrealized (asof close) = %+.2f", total_unrl)
+    return 0
+
+
+def cmd_pnl(asof: str | None) -> int:
+    from .db import connect
+    from .asof import resolve_asof_date
+    from .pnl.lots import get_open_lots_by_symbol, get_realized_pnl_for_date
+    from .pnl.mark import get_close
+
+    # Resolve asof date if not provided
+    with connect() as conn:
+        resolved = resolve_asof_date(conn, asof)
+
+    realized = float(get_realized_pnl_for_date(resolved))
+
+    # Compute unrealized from open lots marked to asof close
+    lots_by_sym = get_open_lots_by_symbol()
+    unrealized = 0.0
+
+    for sym, lots in lots_by_sym.items():
+        last = get_close(sym, resolved)
+        if last is None:
+            continue
+        for L in lots:
+            q = float(L["qty_open"])
+            entry = float(L["entry_price"])
+            unrealized += q * (float(last) - entry)
+
+    total = realized + unrealized
+
+    log.info("PNL asof=%s | realized=%+.2f | unrealized=%+.2f | total=%+.2f", resolved, realized, unrealized, total)
+    return 0
+
 def cmd_seed_intent(run_id: int, symbol: str, action: str, reason: str) -> int:
     from .db import connect
     sym = symbol.strip().upper()
@@ -362,6 +453,8 @@ def cmd_show_universe(universe: str, asof: str | None, limit: int) -> int:
     return 0
 
 
+
+
 def main() -> int:
     setup_logging()
 
@@ -414,6 +507,15 @@ def main() -> int:
 
     p_e = sub.add_parser("executions", help="Show recent broker executions snapshots")
     p_e.add_argument("--limit", type=int, default=20)
+
+    sub.add_parser("lots-rebuild", help="Rebuild FIFO lots + closings from executions (Phase 3)")
+    p_pos = sub.add_parser("positions", help="Show open positions (lots-based) + unrealized P&L")
+    p_pos.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD). Default: resolve_asof_date()")
+
+    p_pnl = sub.add_parser("pnl", help="Show realized/unrealized P&L at asof close (Phase 3)")
+    p_pnl.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD). Default: resolve_asof_date()")
+
+    sub.add_parser("performance", help="Equity curve performance metrics (Phase 3)")
 
     p_pf = sub.add_parser("preflight", help="Sanity checks before running (calendar, bars freshness, account, open orders)")
     p_pf.add_argument("--universe", default="sp500")
@@ -528,6 +630,43 @@ def main() -> int:
 
     if args.cmd == "show-universe":
         return cmd_show_universe(args.universe, args.asof, args.limit)
+    
+    if args.cmd == "lots-rebuild":
+        return cmd_lots_rebuild()
+
+    if args.cmd == "positions":
+        return cmd_positions(args.asof)
+
+    if args.cmd == "pnl":
+        return cmd_pnl(args.asof)
+    
+    if args.cmd == "performance":
+        from .pnl.performance import compute_performance
+
+        res = compute_performance()
+        if not res.ok:
+            log.info("PERFORMANCE unavailable: %s", res.reason)
+            if res.reason == "need_at_least_2_snapshots":
+                log.info("Tip: run 'trading run-once' on at least two different trading days.")
+            return 0
+
+        log.info(
+            "PERFORMANCE %s→%s | days=%s | start=%.2f end=%.2f | cum=%+.2f%% | maxDD=%+.2f%% | avgDaily=%+.4f%%",
+            res.start_date, res.end_date, res.days,
+            res.start_equity, res.end_equity,
+            (res.cumulative_return or 0.0) * 100.0,
+            (res.max_drawdown or 0.0) * 100.0,
+            (res.avg_daily_return or 0.0) * 100.0,
+        )
+
+        if res.best_day:
+            d, r = res.best_day
+            log.info("Best day:  %s  %+.2f%%", d, r * 100.0)
+        if res.worst_day:
+            d, r = res.worst_day
+            log.info("Worst day: %s  %+.2f%%", d, r * 100.0)
+
+        return 0
 
     if args.cmd == "preflight":
         from .preflight import run_preflight

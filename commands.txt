@@ -21,8 +21,8 @@ trading execute --run-id X --submit
 trading sync-orders
 trading sync-positions
 
-trading preflight
 trading fetch-bars --days 400
+trading preflight
 trading run-once
 trading run-once --execute
 

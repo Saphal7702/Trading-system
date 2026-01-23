@@ -14,6 +14,7 @@ from .lock import acquire_lock, release_lock, read_lock_info
 import logging
 
 from .market_calendar import today_ny_str, is_trading_day
+from .pnl.snapshots import upsert_account_snapshot
 
 NY = ZoneInfo("America/New_York")
 
@@ -326,6 +327,63 @@ def run_once(
         # 7) Final sync
         step("sync_orders_post", lambda: vars(sync_orders(limit=200)))
         step("sync_positions_post", lambda: {"positions_synced": sync_positions(broker)})
+
+        # 7.5) Phase 3: Apply lots from executions (idempotent)
+        def _apply_lots():
+            from .pnl.lots import apply_new_executions
+            r = apply_new_executions(run_id=run_id)
+            return {
+                "buys": r.buys_processed,
+                "sells": r.sells_processed,
+                "lots": r.lots_created,
+                "closings": r.closings_created,
+                "warnings": r.warnings,
+            }
+
+        step("lots_apply", _apply_lots)
+
+        # 7.6) Phase 3: Daily account snapshot (equity curve)
+                # 7.6) Phase 3: Daily account snapshot (equity curve)
+        def _snapshot_account():
+            a = broker.get_account()
+
+            def _f(x):
+                try:
+                    return None if x is None else float(x)
+                except Exception:
+                    return None
+
+            cash = _f(getattr(a, "cash", None))
+            equity = _f(getattr(a, "equity", None))
+            buying_power = _f(getattr(a, "buying_power", None))
+            long_mv = _f(getattr(a, "long_market_value", None))
+
+            if equity is None:
+                return {"skipped": True, "reason": "account_missing_equity"}
+
+            if cash is None:
+                # should not happen now, but keep DB constraint safe
+                cash = 0.0
+
+            with connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO account_snapshots_daily(asof_date, cash, equity, buying_power, long_market_value, run_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(asof_date) DO UPDATE SET
+                      cash=excluded.cash,
+                      equity=excluded.equity,
+                      buying_power=excluded.buying_power,
+                      long_market_value=excluded.long_market_value,
+                      run_id=excluded.run_id,
+                      created_at=datetime('now');
+                    """,
+                    (asof, cash, equity, buying_power, long_mv, run_id),
+                )
+
+            return {"asof": asof, "cash": cash, "equity": equity, "buying_power": buying_power, "long_mv": long_mv}
+        
+        step("account_snapshot", _snapshot_account)
 
         # 8) Finish + one-line report
         finish_run(run_id, status="success", asof=asof, summary=summary)

@@ -5,11 +5,16 @@ from typing import Protocol
 @dataclass(frozen=True)
 class AccountSummary:
     broker: str
-    account_id: str | None
-    status: str | None
-    currency: str | None
-    buying_power: float | None
-    equity: float | None
+    account_id: str
+    status: str | None = None
+    currency: str | None = None
+    buying_power: float | None = None
+    equity: float | None = None
+
+    # Phase 3 additions (additive)
+    cash: float | None = None
+    long_market_value: float | None = None
+
 
 @dataclass(frozen=True)
 class PositionSnapshot:
