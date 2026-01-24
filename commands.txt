@@ -1,18 +1,39 @@
-/*********************************** General Commands ****************************************************/
-#Pyproject Info
-Database: Sqlite
-Broker: Alpaca
 
-#Install requirements
-pip install -e .
-
+/*********************************** Project Commands ****************************************************/
 #Activate venv
-source .venv/bin/activate (Linux)
+source .venv/bin/activate (Linux/Mac)
 .\.venv\Scripts\Activate.ps1 (Windows)
 
+/*Load Universe Current SP:500*/
 trading load-universe --file data/sp500.csv
-trading sync-assets
+
+/*Pre executions*/
 trading fetch-bars --days 400
+trading preflight
+
+/*Automated executions*/
+trading run-once
+trading run-once --execute
+
+/*Performance and Feedbacks*/
+trading performance
+trading performance --last 20
+trading performance --monthly
+trading performance --monthly --since 2026-01-01
+trading exposure
+
+trading realized
+trading realized --daily --last 20
+trading realized --monthly
+trading realized --monthly --since 2026-01-01
+trading realized --symbol ANET
+
+trading trades
+trading trades --open
+trading trades --closed --last 50
+
+/*Manual executions*/
+trading sync-assets
 trading build-universe --top 200
 trading show-universe --limit 20
 trading plan
@@ -21,13 +42,19 @@ trading execute --run-id X --submit
 trading sync-orders
 trading sync-positions
 
-trading fetch-bars --days 400
-trading preflight
-trading run-once
-trading run-once --execute
+/**************************************************************************************************************/
+
+/*********************************** Project Requirements ****************************************************/
+#Pyproject Info
+Database: Sqlite
+Broker: Alpaca
+
+#Install requirements
+pip install -e .
+/**************************************************************************************************************/
 
 
-/*************************  Git Commands:  **************************************************************/
+/***********************************  Git Commands:  **********************************************************/
 #All Git Commands:
 git init	                -> Creates a new Git repository in the current directory.
 git status	                -> Shows the state of your working directory and staging area (which files are modified, staged, or untracked).
@@ -53,3 +80,4 @@ git pull origin main        -> Pull from Main
 git merge branchName        -> Merge the Branch
 git push origin main        -> Push to the Main
 git branch -d branchName    -> Delete the branch
+/**************************************************************************************************************/

@@ -452,8 +452,88 @@ def cmd_show_universe(universe: str, asof: str | None, limit: int) -> int:
         )
     return 0
 
+def cmd_exposure(asof: str | None, top: int = 20) -> int:
+    from .db import connect
+    from .asof import resolve_asof_date
+    from .pnl.exposure import compute_exposure
 
+    with connect() as conn:
+        resolved = resolve_asof_date(conn, asof)
 
+    out = compute_exposure(resolved)
+    rows = out["rows"]
+    equity = out["equity"]
+    totals = out["totals"]
+
+    if not rows:
+        log.info("No exposure (no open lots).")
+        return 0
+
+    log.info("EXPOSURE asof=%s | equity=%s | symbols=%s", resolved, f"{equity:.2f}" if equity is not None else "?", len(rows))
+
+    shown = rows[: max(0, int(top))]
+    for r in shown:
+        mv = r["mkt_value"]
+        pct = r["pct_equity"]
+        if mv is None:
+            log.info(
+                "%s qty=%.6f last=? mv=? | cost=%.2f lots=%s",
+                r["symbol"], r["qty"], r["cost_basis"], r["lots"]
+            )
+        else:
+            log.info(
+                "%s mv=%.2f (%s) | qty=%.6f last=%.4f | cost=%.2f uPnL=%+.2f | lots=%s",
+                r["symbol"],
+                mv,
+                (f"{pct*100:.2f}%" if pct is not None else "?"),
+                r["qty"],
+                r["last"],
+                r["cost_basis"],
+                r["u_pnl"],
+                r["lots"],
+            )
+
+    log.info(
+        "TOTAL mv=%.2f | cost=%.2f | uPnL=%+.2f",
+        totals["market_value"],
+        totals["cost_basis"],
+        totals["u_pnl"],
+    )
+    return 0
+
+def cmd_lots_reconcile(asof: str | None, dry_run: bool, apply: bool, tolerance: float) -> int:
+    from .pnl.reconcile import lots_reconcile
+
+    # default is dry-run unless --apply specified
+    do_dry = True
+    if apply:
+        do_dry = False
+    elif dry_run:
+        do_dry = True
+
+    res = lots_reconcile(asof, tolerance=tolerance, dry_run=do_dry)
+
+    log.info(
+        "LOTS RECONCILE asof=%s dry_run=%s tol=%s reduce=%s missing=%s",
+        res["asof"], res["dry_run"], res["tolerance"], res["reduce_count"], res["missing_count"]
+    )
+
+    for r in res["reductions"]:
+        if r.get("skipped"):
+            log.info("%s reduce=%.6f skipped (%s)", r["symbol"], r["reduce"], r["reason"])
+        else:
+            log.info(
+                "%s lots=%.6f pos=%.6f reduce=%.6f @ %.4f",
+                r["symbol"], r["lots_qty"], r["pos_qty"], r["reduce"], r["price"]
+            )
+
+    for m in res["missing"]:
+        log.info(
+            "%s lots=%.6f pos=%.6f missing_lots=%.6f (needs history)",
+            m["symbol"], m["lots_qty"], m["pos_qty"], m["missing_lots_qty"]
+        )
+
+    return 0
 
 def main() -> int:
     setup_logging()
@@ -515,8 +595,6 @@ def main() -> int:
     p_pnl = sub.add_parser("pnl", help="Show realized/unrealized P&L at asof close (Phase 3)")
     p_pnl.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD). Default: resolve_asof_date()")
 
-    sub.add_parser("performance", help="Equity curve performance metrics (Phase 3)")
-
     p_pf = sub.add_parser("preflight", help="Sanity checks before running (calendar, bars freshness, account, open orders)")
     p_pf.add_argument("--universe", default="sp500")
 
@@ -531,6 +609,39 @@ def main() -> int:
     p_ro.add_argument("--fast", type=int, default=20)
     p_ro.add_argument("--slow", type=int, default=50)
     p_ro.add_argument("--execute", action="store_true", help="Attempt execution (still paper-gated)")
+
+    p_perf = sub.add_parser("performance", help="Equity curve performance metrics (Phase 3)")
+    p_perf.add_argument("--monthly", action="store_true", help="Show month-by-month returns")
+    p_perf.add_argument("--since", required=False, help="Filter snapshots from YYYY-MM-DD")
+    p_perf.add_argument("--last", type=int, required=False, help="Use only last N snapshot days (non-monthly)")
+
+    p_r = sub.add_parser("realized", help="Realized P&L reports (Phase 3)")
+    p_r.add_argument("--daily", action="store_true", help="Group realized P&L by day")
+    p_r.add_argument("--monthly", action="store_true", help="Group realized P&L by month")
+    p_r.add_argument("--since", required=False, help="Filter events from YYYY-MM-DD (uses closed_at/created_at)")
+    p_r.add_argument("--last", type=int, required=False, help="Last N rows (daily only)")
+    p_r.add_argument("--symbol", required=False, help="Filter to symbol (e.g., AAPL)")
+
+    p_t = sub.add_parser("trades", help="Trade ledger: open lots + closed trades (Phase 3)")
+    p_t.add_argument("--open", action="store_true", help="Show open lots")
+    p_t.add_argument("--closed", action="store_true", help="Show closed trades (lot closings)")
+    p_t.add_argument("--asof", required=False, help="Asof date for open trades (default: resolve_asof_date())")
+    p_t.add_argument("--since", required=False, help="Filter closed trades from YYYY-MM-DD")
+    p_t.add_argument("--last", type=int, required=False, default=20, help="Last N closed trade rows")
+    p_t.add_argument("--symbol", required=False, help="Filter to one symbol")
+    p_t.add_argument("--sort", required=False, default="symbol",help="Sort open trades by: symbol, pnl, return, age, mv, cost")
+    p_t.add_argument("--desc", action="store_true", help="Sort descending")
+
+
+    p_exp = sub.add_parser("exposure", help="Exposure by symbol (market value + % of equity) (Phase 3)")
+    p_exp.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD). Default: resolve_asof_date()")
+    p_exp.add_argument("--top", type=int, required=False, default=20, help="Show top N symbols by market value")
+
+    p_lr = sub.add_parser("lots-reconcile", help="Reconcile open lots to broker positions (Phase 3)")
+    p_lr.add_argument("--asof", required=False, help="YYYY-MM-DD (default: resolve_asof_date())")
+    p_lr.add_argument("--dry-run", action="store_true", help="Show what would change (default: True)")
+    p_lr.add_argument("--apply", action="store_true", help="Actually write synthetic executions and close lots")
+    p_lr.add_argument("--tolerance", type=float, default=0.001, help="Qty tolerance before reconciling")
 
     p_plan = sub.add_parser("plan", help="Generate today's trade plan (signals + intents). No orders placed.")
     p_plan.add_argument("--fast", type=int, default=20)
@@ -640,10 +751,40 @@ def main() -> int:
     if args.cmd == "pnl":
         return cmd_pnl(args.asof)
     
-    if args.cmd == "performance":
-        from .pnl.performance import compute_performance
+    if args.cmd == "exposure":
+        return cmd_exposure(args.asof, args.top)
+    
+    if args.cmd == "lots-reconcile":
+        return cmd_lots_reconcile(args.asof, args.dry_run, args.apply, args.tolerance)
 
-        res = compute_performance()
+    if args.cmd == "performance":
+        from .pnl.performance import compute_performance, compute_monthly_performance
+
+        if getattr(args, "monthly", False):
+            rows = compute_monthly_performance(since=getattr(args, "since", None))
+            if not rows:
+                log.info("MONTHLY PERFORMANCE unavailable: no_snapshots")
+                return 0
+
+            log.info("MONTHLY PERFORMANCE rows=%s", len(rows))
+            for r in rows:
+                running = r.get("running_return")
+                running_pct = (float(running) * 100.0) if running is not None else 0.0
+
+                log.info(
+                    "%s | %s→%s | start=%.2f end=%.2f | pnl=%+.2f | return=%+.2f%% | cum=%+.2f%%",
+                    r["month"],
+                    r["start_date"],
+                    r["end_date"],
+                    r["start_equity"],
+                    r["end_equity"],
+                    float(r["pnl_dollars"]),
+                    float(r["return"]) * 100.0,
+                    running_pct,
+                )
+            return 0
+
+        res = compute_performance(since=getattr(args, "since", None), last=getattr(args, "last", None))
         if not res.ok:
             log.info("PERFORMANCE unavailable: %s", res.reason)
             if res.reason == "need_at_least_2_snapshots":
@@ -679,5 +820,110 @@ def main() -> int:
             r.cap_remaining, r.min_bp_required, r.exec_blockers
         )
         return 0 if r.ok else 2
+    
+    if args.cmd == "realized":
+        from .pnl.realized import realized_summary, realized_by_day, realized_by_month
+
+        if args.daily:
+            rows = realized_by_day(since=args.since, last=args.last, symbol=args.symbol)
+            if not rows:
+                log.info("REALIZED (daily) unavailable: no_realized_trades")
+                return 0
+            log.info("REALIZED (daily) rows=%s", len(rows))
+            for r in rows:
+                log.info(
+                    "%s | trades=%s | pnl=%+.2f | win_rate=%.1f%% (%sW/%sL)",
+                    r["day"], r["trades"], r["pnl"], r["win_rate"] * 100.0, r["wins"], r["losses"]
+                )
+            return 0
+
+        if args.monthly:
+            rows = realized_by_month(since=args.since, symbol=args.symbol)
+            if not rows:
+                log.info("REALIZED (monthly) unavailable: no_realized_trades")
+                return 0
+            log.info("REALIZED (monthly) rows=%s", len(rows))
+            for r in rows:
+                log.info(
+                    "%s | trades=%s | pnl=%+.2f | win_rate=%.1f%% (%sW/%sL)",
+                    r["month"], r["trades"], r["pnl"], r["win_rate"] * 100.0, r["wins"], r["losses"]
+                )
+            return 0
+
+        s = realized_summary(since=args.since, symbol=args.symbol)
+        if not s.ok:
+            log.info("REALIZED unavailable: %s", s.reason)
+            return 0
+
+        log.info(
+            "REALIZED since=%s rows=%s | pnl=%+.2f | win_rate=%.1f%% (%sW/%sL) | avg_win=%.2f avg_loss=%.2f | max_win=%.2f max_loss=%.2f",
+            args.since or "-", s.rows, s.pnl, s.win_rate * 100.0, s.wins, s.losses,
+            s.avg_win, s.avg_loss, s.max_win, s.max_loss
+        )
+        return 0
+    
+    if args.cmd == "trades":
+        from .db import connect
+        from .asof import resolve_asof_date
+        from .pnl.trades import compute_open_trade_lines, fetch_closed_trades,sort_open_rows
+
+        # default: show both
+        show_open = args.open or (not args.open and not args.closed)
+        show_closed = args.closed or (not args.open and not args.closed)
+
+        if show_open:
+            with connect() as conn:
+                asof = resolve_asof_date(conn, args.asof)
+
+            rows = compute_open_trade_lines(asof=asof, symbol=args.symbol)
+            if not rows:
+                log.info("TRADES (open) asof=%s: none", asof)
+            else:
+                rows = sort_open_rows(rows, args.sort, args.desc)
+
+                # totals
+                tot_cost = sum(r["cost_basis"] for r in rows if r.get("cost_basis") is not None)
+                tot_mv = sum(r["mkt_value"] for r in rows if r.get("mkt_value") is not None)
+                tot_upnl = sum(r["u_pnl"] for r in rows if r.get("u_pnl") is not None)
+
+                tot_ret_pct = ((tot_mv / tot_cost) - 1.0) * 100.0 if tot_cost > 0 else 0.0
+
+                log.info(
+                    "TRADES (open) asof=%s rows=%s | total_cost=%.2f total_mv=%.2f uPnL=%+.2f total_ret=%+.2f%% | sort=%s %s",
+                    asof, len(rows), tot_cost, tot_mv, tot_upnl, tot_ret_pct, args.sort, ("desc" if args.desc else "asc")
+                )
+
+                for r in rows:
+                    if r["last"] is None:
+                        log.info(
+                            "%s lot=%s qty=%.6f entry=%.4f last=? mv=? uPnL=? ret=? age=%s",
+                            r["symbol"], r["lot_id"], r["qty"], r["entry"], r["age_days"]
+                        )
+                    else:
+                        log.info(
+                            "%s lot=%s mv=%.2f | qty=%.6f entry=%.4f last=%.4f uPnL=%+.2f ret=%+.2f%% age=%s",
+                            r["symbol"], r["lot_id"], r["mkt_value"],
+                            r["qty"], r["entry"], r["last"], r["u_pnl"], r["ret_pct"], r["age_days"]
+                        )
+
+        if show_closed:
+            rows = fetch_closed_trades(since=args.since, last=args.last, symbol=args.symbol)
+            if not rows:
+                log.info("TRADES (closed): none")
+            else:
+                log.info("TRADES (closed) rows=%s (showing last=%s)", len(rows), args.last)
+                for r in rows:
+                    log.info(
+                        "%s qty=%.6f entry=%.4f exit=%.4f pnl=%+.2f hold_days=%s close_ts=%s",
+                        r["symbol"],
+                        float(r["qty_closed"]),
+                        float(r["entry_price"]),
+                        float(r["exit_price"]),
+                        float(r["realized_pnl"]),
+                        r.get("hold_days"),
+                        r.get("close_ts"),
+                    )
+
+        return 0
 
     return 1
