@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS orders (
   run_id INTEGER,
   filled_qty REAL,
   filled_avg_price REAL,
-  filled_at TEXT
+  filled_at TEXT,
+  COLUMN intent_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -60,7 +61,8 @@ CREATE TABLE IF NOT EXISTS executions (
   qty REAL NOT NULL,
   filled_avg_price REAL,
   filled_at TEXT,
-  raw_json TEXT
+  raw_json TEXT,
+  COLUMN order_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS bars_daily (
@@ -81,7 +83,8 @@ CREATE TABLE IF NOT EXISTS intents (
   action TEXT NOT NULL CHECK(action IN ('buy','sell','hold')),
   strength REAL,
   reason TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  COLUMN signal_key TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency
@@ -200,3 +203,7 @@ CREATE TABLE IF NOT EXISTS account_snapshots_daily (
   run_id INTEGER,
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );
+
+CREATE INDEX IF NOT EXISTS ix_orders_intent_id ON orders(intent_id);
+CREATE INDEX IF NOT EXISTS ix_exec_order_id ON executions(order_id);
+CREATE INDEX IF NOT EXISTS ix_intents_signal_key ON intents(signal_key);

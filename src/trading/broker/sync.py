@@ -2,6 +2,7 @@ from __future__ import annotations
 from .base import Broker
 from ..db import connect
 
+
 def upsert_account(broker: Broker) -> None:
     """
     Snapshot broker account into broker_accounts (1 row per broker).
@@ -30,6 +31,7 @@ def upsert_account(broker: Broker) -> None:
             ),
         )
 
+
 def sync_positions(broker: Broker) -> int:
     positions = broker.list_positions()
     seen = {p.symbol.strip().upper() for p in positions}
@@ -54,7 +56,6 @@ def sync_positions(broker: Broker) -> int:
             )
 
         # Mark any previously-known positions that are no longer returned as closed (qty=0)
-        # (This prevents stale positions lingering forever.)
         if seen:
             placeholders = ",".join("?" for _ in seen)
             conn.execute(
@@ -66,12 +67,10 @@ def sync_positions(broker: Broker) -> int:
                 tuple(seen),
             )
         else:
-            # Broker returned no positions: mark everything as qty=0
-            conn.execute(
-                "UPDATE positions SET qty=0, last_updated_at=datetime('now');"
-            )
+            conn.execute("UPDATE positions SET qty=0, last_updated_at=datetime('now');")
 
     updated = backfill_opened_at_from_fills()
+    linked = link_executions_to_orders()
     return len(positions)
 
 
@@ -100,6 +99,36 @@ def backfill_opened_at_from_fills() -> int:
                 WHERE e.symbol = positions.symbol
                   AND e.side = 'buy'
                   AND e.filled_at IS NOT NULL
+              );
+            """
+        )
+        return cur.rowcount
+
+
+def link_executions_to_orders() -> int:
+    """
+    Phase 4 attribution backfill:
+      executions.order_id := orders.id by matching broker_order_id.
+
+    Safe to run repeatedly; only fills NULL order_id rows.
+    Works even if executions are inserted as snapshots first and enriched later.
+    """
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE executions
+            SET order_id = (
+                SELECT o.id
+                FROM orders o
+                WHERE o.broker_order_id = executions.broker_order_id
+                LIMIT 1
+            )
+            WHERE order_id IS NULL
+              AND broker_order_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM orders o
+                WHERE o.broker_order_id = executions.broker_order_id
               );
             """
         )
