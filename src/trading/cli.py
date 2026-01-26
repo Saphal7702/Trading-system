@@ -9,6 +9,8 @@ from .universe_watchlist import load_watchlist_csv
 from .runloop import run_once
 from trading.broker.alpaca_broker import AlpacaPaperBroker
 from trading.broker.sync import upsert_account, sync_positions
+from .exits_advisor import evaluate_exit_advice, ExitRuleConfig, emit_sell_intents
+
 
 log = logging.getLogger("trading")
 
@@ -610,6 +612,23 @@ def main() -> int:
     p_ro.add_argument("--slow", type=int, default=50)
     p_ro.add_argument("--execute", action="store_true", help="Attempt execution (still paper-gated)")
 
+    # exits (advisor mode)
+    p_ex = sub.add_parser("exits", help="Exit advisor: ranked SELL/WATCH/HOLD recommendations (no orders placed)")
+    p_ex.add_argument("--asof", default=None, help="As-of date (YYYY-MM-DD). Default: latest bars_daily date")
+
+    p_ex.add_argument("--stop-loss", type=float, default=5.0, help="Hard stop loss percent (default 5)")
+    p_ex.add_argument("--early-fail-days", type=int, default=5, help="Early failure days (default 5)")
+    p_ex.add_argument("--early-fail-max-ret", type=float, default=0.0, help="Early failure max ret%% (default 0.0)")
+    p_ex.add_argument("--trail-peak", type=float, default=8.0, help="Trailing activates after peak gain%% (default 8)")
+    p_ex.add_argument("--trail-dd", type=float, default=4.0, help="Trailing drawdown%% from peak (default 4)")
+    p_ex.add_argument("--take-profit", type=float, default=15.0, help="Take profit%% (default 15)")
+    p_ex.add_argument("--time-stop-days", type=int, default=30, help="Time stop days (default 30)")
+    p_ex.add_argument("--time-stop-min-ret", type=float, default=2.0, help="Time stop min ret%% (default 2)")
+    p_ex.add_argument("--emit-intents", action="store_true",
+                  help="Write SELL intents for advisor SELL rows (no orders placed)")
+
+    p_ex.add_argument("--no-sma", action="store_true", help="Disable SMA20/50 reversal rule")
+
     p_perf = sub.add_parser("performance", help="Equity curve performance metrics (Phase 3)")
     p_perf.add_argument("--monthly", action="store_true", help="Show month-by-month returns")
     p_perf.add_argument("--since", required=False, help="Filter snapshots from YYYY-MM-DD")
@@ -820,6 +839,54 @@ def main() -> int:
             r.cap_remaining, r.min_bp_required, r.exec_blockers
         )
         return 0 if r.ok else 2
+    
+    if args.cmd == "exits":
+        cfg = ExitRuleConfig(
+            stop_loss_pct=float(args.stop_loss),
+            early_fail_days=int(args.early_fail_days),
+            early_fail_max_ret_pct=float(args.early_fail_max_ret),
+            trail_activate_peak_gain_pct=float(args.trail_peak),
+            trail_drawdown_pct=float(args.trail_dd),
+            take_profit_pct=float(args.take_profit),
+            time_stop_days=int(args.time_stop_days),
+            time_stop_min_ret_pct=float(args.time_stop_min_ret),
+            enable_sma_reversal=(not args.no_sma),
+        )
+
+        rows = evaluate_exit_advice(asof=args.asof, cfg=cfg)
+        if not rows:
+            log.info("EXITS: none (no open lots)")
+            return 0
+
+        log.info("EXITS (advisor) asof=%s rows=%s | stop_loss=%.2f%% trail=(peak>=%.2f%% dd<=-%.2f%%) early_fail=%sd time_stop=%sd",
+                 args.asof or "latest", len(rows),
+                 cfg.stop_loss_pct, cfg.trail_activate_peak_gain_pct, cfg.trail_drawdown_pct,
+                 cfg.early_fail_days, cfg.time_stop_days)
+
+        for r in rows:
+            log.info(
+                "%-5s entry=%-22s action=%-5s prio=%3s ret=%+6.2f%% pnl=%+7.2f days=%2s peak=%+6.2f%% dd=%+6.2f%% | %s | %s",
+                r["symbol"],
+                r.get("entry_signal_key", "unknown"),
+                r["action"],
+                r["priority"],
+                r["unrealized_ret_pct"],
+                (r["unrealized_pnl"] or 0.0),
+                r["holding_days"],
+                r["peak_gain_pct"],
+                r["drawdown_from_peak_pct"],
+                r["exit_signal_key"],
+                r["rationale"],
+            )
+
+        if args.emit_intents:
+                s = emit_sell_intents(asof=args.asof, cfg=cfg)
+                log.info(
+                    "EXITS emit-intents: run_id=%s asof=%s | advisor_rows=%s sell_rows=%s | inserted=%s skipped_existing=%s",
+                    s["run_id"], s["asof"], s["advisor_rows"], s["sell_rows"], s["inserted"], s["skipped_existing"]
+                )
+        return 0
+
     
     if args.cmd == "realized":
         from .pnl.realized import realized_summary, realized_by_day, realized_by_month

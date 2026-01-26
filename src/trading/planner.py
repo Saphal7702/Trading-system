@@ -17,10 +17,30 @@ class Intent:
     strength: float | None = None
     # Optional: carry sizing hint forward (execute can use later)
     target_notional: float | None = None
+    # Phase 4: stable machine-friendly key for attribution/grouping
+    signal_key: str | None = None
 
 
 def _norm_sym(sym: str | None) -> str:
     return (sym or "").strip().upper()
+
+
+def _signal_key_for(action: str, reason: str) -> str | None:
+    """
+    Map free-text reason -> stable signal key.
+    Keep keys stable forever once introduced.
+    """
+    a = (action or "").strip().lower()
+    r = (reason or "").strip()
+
+    # SMA strategy mappings
+    if a == "buy" and "SMA20 crossed above SMA50" in r:
+        return "sma20_cross_up_sma50"
+    if a == "sell" and "SMA20 crossed below SMA50" in r:
+        return "sma20_cross_down_sma50"
+
+    # Unknown/unmapped signal (safe)
+    return None
 
 
 def _current_positions() -> dict[str, dict]:
@@ -151,21 +171,34 @@ def plan_intents(
 
             opened_at = pos[sym].get("opened_at")
             if not opened_at:
-                # Conservative: if we don't know when the position opened, we do NOT allow a sell
-                intents.append(Intent(sym, "hold", "Sell blocked: missing opened_at (sync fills/positions first)", sig.strength))
+                intents.append(
+                    Intent(
+                        sym,
+                        "hold",
+                        "Sell blocked: missing opened_at (sync fills/positions first)",
+                        sig.strength,
+                    )
+                )
                 continue
 
             d = can_sell(opened_at, now=now)
             if not d.allowed:
                 intents.append(Intent(sym, "hold", f"Sell blocked: {d.reason}", sig.strength))
             else:
-                intents.append(Intent(sym, "sell", sig.reason, sig.strength))
+                intents.append(
+                    Intent(
+                        sym,
+                        "sell",
+                        sig.reason,
+                        sig.strength,
+                        signal_key=_signal_key_for("sell", sig.reason),
+                    )
+                )
 
         elif sig.action == "buy":
             if holding:
                 intents.append(Intent(sym, "hold", "Already holding; skip buy", sig.strength))
             else:
-                # Keep original Signal (we'll use sym from it but it's fine)
                 buy_candidates.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
 
         else:
@@ -191,6 +224,7 @@ def plan_intents(
                     sig.reason,
                     sig.strength,
                     target_notional=per_position_notional,
+                    signal_key=_signal_key_for("buy", sig.reason),
                 )
             )
         else:
@@ -215,9 +249,12 @@ def save_intents(run_id: int, intents: list[Intent]) -> int:
     with connect() as conn:
         conn.executemany(
             """
-            INSERT INTO intents(run_id, symbol, action, strength, reason)
-            VALUES (?, ?, ?, ?, ?);
+            INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
+            VALUES (?, ?, ?, ?, ?, ?);
             """,
-            [(run_id, _norm_sym(i.symbol), i.action, i.strength, i.reason) for i in intents],
+            [
+                (run_id, _norm_sym(i.symbol), i.action, i.strength, i.reason, i.signal_key)
+                for i in intents
+            ],
         )
     return len(intents)

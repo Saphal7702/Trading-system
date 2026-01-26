@@ -33,11 +33,6 @@ def execute_run(
       - paper-gated via is_paper_submit_allowed()
       - safety rails: daily trade cap, open-order protection, cooldown (planner + execution backup)
     """
-    # NOTE: assumes these are defined in THIS module (execution.py)
-    # - build_orders_from_intents
-    # - persist_orders
-    # - is_paper_submit_allowed
-
     from .cooldown import is_in_cooldown, set_cooldown  # local import ok
 
     def _env_float(name: str, default: float) -> float:
@@ -337,14 +332,11 @@ def execute_run(
 
                 broker_order_id = str(getattr(bo, "id", None))
 
-                # Save broker order id on orders row if column exists
-                try:
-                    conn.execute(
-                        "UPDATE orders SET status='submitted', broker_order_id=? WHERE id=?;",
-                        (broker_order_id, order_id),
-                    )
-                except Exception:
-                    conn.execute("UPDATE orders SET status='submitted' WHERE id=?;", (order_id,))
+                # Save broker order id on orders row
+                conn.execute(
+                    "UPDATE orders SET status='submitted', broker_order_id=? WHERE id=?;",
+                    (broker_order_id, order_id),
+                )
 
                 # Set cooldown only for BUY, only if broker_order_id is present, and only if asof is known
                 if side == "buy" and broker_order_id and cooldown_days > 0 and asof:
@@ -357,7 +349,7 @@ def execute_run(
                     summary["cooldown_set"] += 1
                     log.info("Cooldown set: %s until=%s (days=%s)", symbol, until, cooldown_days)
 
-                # Save execution snapshot
+                # Save execution snapshot (raw_json keeps broker response)
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
@@ -385,6 +377,7 @@ def execute_run(
     log.info("Submitted total=%s", summary["submitted"])
     return summary
 
+
 @dataclass(frozen=True)
 class ProposedOrder:
     symbol: str
@@ -392,13 +385,18 @@ class ProposedOrder:
     qty: float
     reason: str
     idempotency_key: str
+    # Phase 4: link back to the intent that produced this order
+    intent_id: int | None = None
+
 
 def _today_key() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
+
 def _make_idempotency_key(symbol: str, side: str, day: str) -> str:
     raw = f"{day}|{symbol}|{side}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
 
 def build_orders_from_intents(run_id: int, default_qty: float = 1.0) -> list[ProposedOrder]:
     """
@@ -410,7 +408,7 @@ def build_orders_from_intents(run_id: int, default_qty: float = 1.0) -> list[Pro
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT symbol, action, reason, created_at
+            SELECT id, symbol, action, reason, created_at
             FROM intents
             WHERE run_id = ?
               AND action IN ('buy','sell')
@@ -423,6 +421,7 @@ def build_orders_from_intents(run_id: int, default_qty: float = 1.0) -> list[Pro
     chosen: dict[tuple[str, str], ProposedOrder] = {}
 
     for r in rows:
+        intent_id = int(r["id"]) if r["id"] is not None else None
         symbol = str(r["symbol"]).strip().upper()
         side = str(r["action"]).strip().lower()
         reason = r["reason"]
@@ -434,6 +433,7 @@ def build_orders_from_intents(run_id: int, default_qty: float = 1.0) -> list[Pro
             qty=default_qty,
             reason=reason,
             idempotency_key=idem,
+            intent_id=intent_id,
         )
 
     return list(chosen.values())
@@ -442,6 +442,7 @@ def build_orders_from_intents(run_id: int, default_qty: float = 1.0) -> list[Pro
 def persist_orders(run_id: int, orders: list[ProposedOrder]) -> int:
     """
     Insert into DB with idempotency. If already exists, skip.
+    Phase 4: store orders.intent_id for attribution.
     """
     if not orders:
         return 0
@@ -451,14 +452,30 @@ def persist_orders(run_id: int, orders: list[ProposedOrder]) -> int:
         for o in orders:
             cur = conn.execute(
                 """
-                INSERT OR IGNORE INTO orders(run_id,symbol, side, qty, status, reason, idempotency_key, requested_at)
-                VALUES (?,?, ?, ?, 'created', ?, ?, datetime('now'));
+                INSERT OR IGNORE INTO orders(
+                    run_id, symbol, side, qty, status, reason, idempotency_key, requested_at, intent_id
+                )
+                VALUES (?,?, ?, ?, 'created', ?, ?, datetime('now'), ?);
                 """,
-                (run_id,o.symbol, o.side, o.qty, o.reason, o.idempotency_key),
+                (run_id, o.symbol, o.side, o.qty, o.reason, o.idempotency_key, o.intent_id),
             )
             if cur.rowcount == 1:
                 inserted += 1
+            else:
+                # Order already exists (idempotency). Backfill intent_id if missing.
+                if o.intent_id is not None:
+                    conn.execute(
+                        """
+                        UPDATE orders
+                        SET intent_id = ?
+                        WHERE run_id = ?
+                          AND idempotency_key = ?
+                          AND (intent_id IS NULL OR intent_id = 0);
+                        """,
+                        (o.intent_id, run_id, o.idempotency_key),
+                    )
     return inserted
+
 
 def is_paper_submit_allowed() -> bool:
     return os.getenv("TRADING_ALLOW_PAPER_ORDERS", "false").strip().lower() in ("1", "true", "yes", "y")
