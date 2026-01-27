@@ -12,12 +12,13 @@ trading fetch-bars --days 400
 trading preflight
 
 /*Automated executions*/
+trading exits --emit-intents
 trading run-once
 trading run-once --execute
 
 /*Performance and Feedbacks*/
 trading exits
-trading exits --emit-intents
+trading exits --emit-intents --dry-run
 trading exits --trail-peak 8 --trail-dd 3
 
 trading performance

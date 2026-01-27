@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import os
 
 from .db import connect
-
 
 @dataclass(frozen=True)
 class ExitRuleConfig:
@@ -29,6 +29,54 @@ class ExitRuleConfig:
     # Trend reversal (SMA)
     enable_sma_reversal: bool = True
 
+    break_even_peak_gain_pct: float = 10.0
+    break_even_floor_ret_pct: float = 2.0
+
+
+_ENV_PREFIX = "TRADING_EXIT_"
+
+def _env_get(name: str) -> str | None:
+    return os.getenv(_ENV_PREFIX + name)
+
+def _parse_bool(v: str) -> bool:
+    return v.strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
+def exit_rule_config_from_env(base: ExitRuleConfig | None = None) -> ExitRuleConfig:
+    """Return an ExitRuleConfig using env vars as defaults (falls back to dataclass defaults)."""
+    base = base or ExitRuleConfig()
+    # floats
+    stop_loss_pct = float(_env_get("STOP_LOSS_PCT")) if _env_get("STOP_LOSS_PCT") else base.stop_loss_pct
+    early_fail_max_ret_pct = float(_env_get("EARLY_FAIL_MAX_RET_PCT")) if _env_get("EARLY_FAIL_MAX_RET_PCT") else base.early_fail_max_ret_pct
+    trail_activate_peak_gain_pct = float(_env_get("TRAIL_PEAK_PCT")) if _env_get("TRAIL_PEAK_PCT") else base.trail_activate_peak_gain_pct
+    trail_drawdown_pct = float(_env_get("TRAIL_DD_PCT")) if _env_get("TRAIL_DD_PCT") else base.trail_drawdown_pct
+    break_even_peak_gain_pct = float(_env_get("BREAKEVEN_PEAK_PCT")) if _env_get("BREAKEVEN_PEAK_PCT") else base.break_even_peak_gain_pct
+    break_even_floor_ret_pct = float(_env_get("BREAKEVEN_FLOOR_PCT")) if _env_get("BREAKEVEN_FLOOR_PCT") else base.break_even_floor_ret_pct
+    take_profit_pct = float(_env_get("TAKE_PROFIT_PCT")) if _env_get("TAKE_PROFIT_PCT") else base.take_profit_pct
+    time_stop_min_ret_pct = float(_env_get("TIME_STOP_MIN_RET_PCT")) if _env_get("TIME_STOP_MIN_RET_PCT") else base.time_stop_min_ret_pct
+
+    # ints
+    early_fail_days = int(_env_get("EARLY_FAIL_DAYS")) if _env_get("EARLY_FAIL_DAYS") else base.early_fail_days
+    time_stop_days = int(_env_get("TIME_STOP_DAYS")) if _env_get("TIME_STOP_DAYS") else base.time_stop_days
+
+    # bool
+    if _env_get("ENABLE_SMA_REVERSAL") is None:
+        enable_sma_reversal = base.enable_sma_reversal
+    else:
+        enable_sma_reversal = _parse_bool(_env_get("ENABLE_SMA_REVERSAL") or "0")
+
+    return ExitRuleConfig(
+        stop_loss_pct=stop_loss_pct,
+        early_fail_days=early_fail_days,
+        early_fail_max_ret_pct=early_fail_max_ret_pct,
+        trail_activate_peak_gain_pct=trail_activate_peak_gain_pct,
+        trail_drawdown_pct=trail_drawdown_pct,
+        break_even_peak_gain_pct=break_even_peak_gain_pct,
+        break_even_floor_ret_pct=break_even_floor_ret_pct,
+        take_profit_pct=take_profit_pct,
+        time_stop_days=time_stop_days,
+        time_stop_min_ret_pct=time_stop_min_ret_pct,
+        enable_sma_reversal=enable_sma_reversal,
+    )
 
 def _resolve_asof_date(conn) -> str:
     r = conn.execute("SELECT MAX(t) AS asof_date FROM bars_daily;").fetchone()
@@ -194,7 +242,7 @@ def evaluate_exit_advice(
       exit_signal_key, action (SELL/WATCH/HOLD), priority, rationale,
       sma20, sma50
     """
-    cfg = cfg or ExitRuleConfig()
+    cfg = cfg or exit_rule_config_from_env()
 
     with connect() as conn:
         metrics = _fetch_open_position_metrics(conn, asof)
@@ -317,9 +365,13 @@ def _pick_run_id_for_asof(conn, asof: str | None) -> int | None:
     r2 = conn.execute("SELECT MAX(id) AS id FROM runs;").fetchone()
     return int(r2["id"]) if r2 and r2["id"] is not None else None
 
-
-def emit_sell_intents(*, asof: str | None = None, cfg: ExitRuleConfig | None = None) -> dict[str, Any]:
-    cfg = cfg or ExitRuleConfig()
+def emit_sell_intents(
+    *,
+    asof: str | None = None,
+    cfg: ExitRuleConfig | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    cfg = cfg or exit_rule_config_from_env()
     rows = evaluate_exit_advice(asof=asof, cfg=cfg)
     sell_rows = [r for r in rows if r["action"] == "SELL"]
 
@@ -329,6 +381,7 @@ def emit_sell_intents(*, asof: str | None = None, cfg: ExitRuleConfig | None = N
         "sell_rows": len(sell_rows),
         "run_id": None,
         "inserted": 0,
+        "would_insert": 0,
         "skipped_existing": 0,
     }
 
@@ -344,6 +397,7 @@ def emit_sell_intents(*, asof: str | None = None, cfg: ExitRuleConfig | None = N
             raise RuntimeError("Cannot emit sell intents: runs table is empty (no run_id available).")
 
         inserted = 0
+        would_insert = 0
         skipped = 0
 
         for r in sell_rows:
@@ -369,6 +423,11 @@ def emit_sell_intents(*, asof: str | None = None, cfg: ExitRuleConfig | None = N
                 skipped += 1
                 continue
 
+            would_insert += 1
+
+            if dry_run:
+                continue
+
             conn.execute(
                 """
                 INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
@@ -379,6 +438,11 @@ def emit_sell_intents(*, asof: str | None = None, cfg: ExitRuleConfig | None = N
             inserted += 1
 
         summary["inserted"] = inserted
+        summary["would_insert"] = would_insert
         summary["skipped_existing"] = skipped
+
+        # Explicit commit when writing (nice for clarity)
+        if not dry_run:
+            conn.commit()
 
     return summary
