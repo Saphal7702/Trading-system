@@ -537,6 +537,56 @@ def cmd_lots_reconcile(asof: str | None, dry_run: bool, apply: bool, tolerance: 
 
     return 0
 
+def _print_attrib_table(title: str, stats: dict[str, dict[str, object]], *, top: int = 25) -> None:
+    print(title)
+    print("-" * len(title))
+    print(f"{'key':50s}  {'trades':>6s}  {'win%':>6s}  {'total_pnl':>12s}  {'avg_ret%':>8s}  {'avg_hold':>8s}")
+    i = 0
+    for k, m in stats.items():
+        i += 1
+        if i > top:
+            break
+        win_rate = m["win_rate"]
+        avg_ret = m["avg_ret"]
+        print(
+            f"{k[:50]:50s}  "
+            f"{m['trades']:6d}  "
+            f"{(win_rate*100 if win_rate is not None else 0):6.1f}  "
+            f"{m['total_pnl']:12.2f}  "
+            f"{(avg_ret*100 if avg_ret is not None else 0):8.2f}  "
+            f"{(m['avg_hold_days'] if m['avg_hold_days'] is not None else 0):8.1f}"
+        )
+
+
+def cmd_attrib_entry(since: str | None, limit: int | None, top: int) -> int:
+    from trading.db import connect  # adjust to your actual import
+    from trading.analytics.journal import fetch_trade_journal, attrib_by_entry
+    with connect() as conn:
+        rows = fetch_trade_journal(conn, since=since, limit=limit)
+    stats = attrib_by_entry(rows)
+    _print_attrib_table("ENTRY SIGNAL ATTRIBUTION", stats, top=top)
+    return 0
+
+
+def cmd_attrib_exit(since: str | None, limit: int | None, top: int) -> int:
+    from trading.db import connect
+    from trading.analytics.journal import fetch_trade_journal, attrib_by_exit
+    with connect() as conn:
+        rows = fetch_trade_journal(conn, since=since, limit=limit)
+    stats = attrib_by_exit(rows)
+    _print_attrib_table("EXIT RULE ATTRIBUTION", stats, top=top)
+    return 0
+
+
+def cmd_attrib_combo(since: str | None, limit: int | None, top: int) -> int:
+    from trading.db import connect
+    from trading.analytics.journal import fetch_trade_journal, attrib_by_combo
+    with connect() as conn:
+        rows = fetch_trade_journal(conn, since=since, limit=limit)
+    stats = attrib_by_combo(rows)
+    _print_attrib_table("ENTRY × EXIT COMBO ATTRIBUTION", stats, top=top)
+    return 0
+
 def main() -> int:
     setup_logging()
 
@@ -638,6 +688,24 @@ def main() -> int:
     p_perf.add_argument("--monthly", action="store_true", help="Show month-by-month returns")
     p_perf.add_argument("--since", required=False, help="Filter snapshots from YYYY-MM-DD")
     p_perf.add_argument("--last", type=int, required=False, help="Use only last N snapshot days (non-monthly)")
+
+    pae = sub.add_parser("attrib-entry", help="Entry signal attribution (realized trades)")
+    pae.add_argument("--since", default=None, help="YYYY-MM-DD")
+    pae.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
+    pae.add_argument("--top", type=int, default=25, help="Show top N keys")
+
+    paex = sub.add_parser("attrib-exit", help="Entry signal attribution (realized trades)")
+    paex.add_argument("--since", default=None, help="YYYY-MM-DD")
+    paex.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
+    paex.add_argument("--top", type=int, default=25, help="Show top N keys")
+
+    pacb = sub.add_parser("attrib-combo", help="Entry signal attribution (realized trades)")
+    pacb.add_argument("--since", default=None, help="YYYY-MM-DD")
+    pacb.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
+    pacb.add_argument("--top", type=int, default=25, help="Show top N keys")
+
+# same for attrib-exit, attrib-combo
+
 
     p_r = sub.add_parser("realized", help="Realized P&L reports (Phase 3)")
     p_r.add_argument("--daily", action="store_true", help="Group realized P&L by day")
@@ -783,6 +851,7 @@ def main() -> int:
 
     if args.cmd == "performance":
         from .pnl.performance import compute_performance, compute_monthly_performance
+        from .db import connect
 
         if getattr(args, "monthly", False):
             rows = compute_monthly_performance(since=getattr(args, "since", None))
@@ -831,7 +900,44 @@ def main() -> int:
             d, r = res.worst_day
             log.info("Worst day: %s  %+.2f%%", d, r * 100.0)
 
+        sql = """
+                SELECT
+                COALESCE(i.signal_key, 'unknown') AS exit_signal_key,
+                COUNT(*) AS trades,
+                ROUND(SUM(lc.realized_pnl), 2) AS pnl
+                FROM lot_closings lc
+                LEFT JOIN executions e ON e.id = lc.exit_execution_id
+                LEFT JOIN orders o     ON o.id = e.order_id
+                LEFT JOIN intents i    ON i.id = o.intent_id
+                WHERE substr(lc.exit_filled_at, 1, 10) BETWEEN ? AND ?
+                GROUP BY COALESCE(i.signal_key, 'unknown')
+                ORDER BY SUM(lc.realized_pnl) DESC;
+                """
+
+        with connect() as conn:
+            rows = conn.execute(sql, (res.start_date, res.end_date)).fetchall()
+
+        if rows:
+            total_trades = sum(int(r["trades"]) for r in rows)
+            log.info("EXIT ATTRIBUTION (realized) %s→%s | trades=%s", res.start_date, res.end_date, total_trades)
+            for r in rows:
+                log.info(
+                    "  %-32s trades=%-3s pnl=%+8.2f",
+                    r["exit_signal_key"],
+                    int(r["trades"]),
+                    float(r["pnl"] or 0.0),
+                )
+
         return 0
+    
+    if args.cmd == "attrib-entry":
+        return cmd_attrib_entry(args.since, args.limit, args.top)
+    
+    if args.cmd == "attrib-exit":
+        return cmd_attrib_exit(args.since, args.limit, args.top)
+    
+    if args.cmd == "attrib-combo":
+        return cmd_attrib_combo(args.since, args.limit, args.top)
 
     if args.cmd == "preflight":
         from .preflight import run_preflight

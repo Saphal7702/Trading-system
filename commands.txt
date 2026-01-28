@@ -12,9 +12,15 @@ trading fetch-bars --days 400
 trading preflight
 
 /*Automated executions*/
-trading exits --emit-intents
 trading run-once
+trading show-intents --run-id X
 trading run-once --execute
+
+/*Manual Selling for now*/
+trading exits
+trading exits --emit-intents
+trading execute --run-id X --submit
+trading run-once
 
 /*Performance and Feedbacks*/
 trading exits
@@ -26,6 +32,10 @@ trading performance --last 20
 trading performance --monthly
 trading performance --monthly --since 2026-01-01
 trading exposure
+
+trading attrib-entry
+trading attrib-exit
+trading attrib-combo
 
 trading realized
 trading realized --daily --last 20
