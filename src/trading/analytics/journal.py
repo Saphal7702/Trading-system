@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 import sqlite3
+import statistics
 from datetime import date
 
 JOURNAL_SQL = """
@@ -108,6 +109,17 @@ def _agg(rows: Iterable[JournalRow], key_fn):
         rets = safe([r.realized_ret for r in rs])
         holds = safe([r.holding_days for r in rs])
 
+        # distribution stats (returns)
+        med_ret = statistics.median(rets) if rets else None
+        std_ret = statistics.pstdev(rets) if len(rets) > 1 else (0.0 if len(rets) == 1 else None)
+        best_ret = max(rets) if rets else None
+        worst_ret = min(rets) if rets else None
+
+        # profit factor (sum wins / abs sum losses) using realized_pnl
+        sum_wins = sum(v for v in pnls if v > 0)
+        sum_losses = -sum(v for v in pnls if v < 0)
+        profit_factor = (sum_wins / sum_losses) if sum_losses > 0 else (float("inf") if sum_wins > 0 else None)
+
         wins = sum(1 for r in rs if (r.realized_pnl or 0.0) > 0)
         n = len(rs)
 
@@ -119,6 +131,11 @@ def _agg(rows: Iterable[JournalRow], key_fn):
             "avg_pnl": (sum(pnls) / len(pnls)) if pnls else None,
             "avg_ret": (sum(rets) / len(rets)) if rets else None,
             "avg_hold_days": (sum(holds) / len(holds)) if holds else None,
+            "median_ret": med_ret,
+            "std_ret": std_ret,
+            "best_ret": best_ret,
+            "worst_ret": worst_ret,
+            "profit_factor": profit_factor,
         }
 
     # sort by total_pnl desc, then trades desc

@@ -1,5 +1,6 @@
 import argparse
 import logging
+import re
 from .logging_setup import setup_logging
 from .config import get_settings
 from .db import init_db, connect
@@ -10,7 +11,8 @@ from .runloop import run_once
 from trading.broker.alpaca_broker import AlpacaPaperBroker
 from trading.broker.sync import upsert_account, sync_positions
 from .exits_advisor import evaluate_exit_advice, ExitRuleConfig, emit_sell_intents, exit_rule_config_from_env
-
+from trading.analytics.mfe_mae import compute_excursions_for_closings
+from collections import defaultdict
 
 log = logging.getLogger("trading")
 
@@ -537,54 +539,484 @@ def cmd_lots_reconcile(asof: str | None, dry_run: bool, apply: bool, tolerance: 
 
     return 0
 
+def _safe_mean(vals: list[float]) -> float | None:
+    vals = [v for v in vals if v is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+def _attach_mfe_stats(
+    *,
+    stats: dict[str, dict[str, object]],
+    filtered_rows,
+    mode: str,
+    conn,
+) -> dict[str, dict[str, object]]:
+    """
+    Mutates stats in-place by adding:
+      avg_mfe_pct, avg_mae_pct, avg_capture_pct
+
+    Note: capture% is only meaningful for winners (realized_ret > 0), so we
+    aggregate capture_pct using winning trades only.
+    """
+    # Build dict-like closings for mfe_mae
+    closings = [r.__dict__ if hasattr(r, "__dict__") else r for r in filtered_rows]
+    exc_map = compute_excursions_for_closings(conn, closings=closings)
+
+    buckets_mfe: dict[str, list[float]] = defaultdict(list)
+    buckets_mae: dict[str, list[float]] = defaultdict(list)
+    buckets_cap: dict[str, list[float]] = defaultdict(list)
+
+    for r in filtered_rows:
+        # bucket key must match how your attrib_* groups
+        if mode == "exit":
+            k = (r.exit_signal_key if hasattr(r, "exit_signal_key") else r.get("exit_signal_key")) or "UNKNOWN"
+        elif mode == "entry":
+            k = (r.entry_signal_key if hasattr(r, "entry_signal_key") else r.get("entry_signal_key")) or "UNKNOWN"
+        elif mode == "combo":
+            ek = (r.entry_signal_key if hasattr(r, "entry_signal_key") else r.get("entry_signal_key")) or "UNKNOWN"
+            xk = (r.exit_signal_key if hasattr(r, "exit_signal_key") else r.get("exit_signal_key")) or "UNKNOWN"
+            k = f"{ek} × {xk}"
+        else:
+            k = "UNKNOWN"
+
+        closing_id = int(r.closing_id if hasattr(r, "closing_id") else r["closing_id"])
+        ex = exc_map.get(closing_id)
+        if not ex:
+            continue
+
+        # MFE/MAE always aggregate if present
+        if ex.mfe_pct is not None:
+            buckets_mfe[k].append(ex.mfe_pct)
+        if ex.mae_pct is not None:
+            buckets_mae[k].append(ex.mae_pct)
+
+        # Capture%: winners-only (realized_ret is a fraction, e.g. 0.1655)
+        realized_ret = (r.realized_ret if hasattr(r, "realized_ret") else r.get("realized_ret"))
+        if ex.capture_pct is not None and realized_ret is not None and realized_ret > 0:
+            buckets_cap[k].append(ex.capture_pct)
+
+    # Merge into stats
+    for k, m in stats.items():
+        m["avg_mfe_pct"] = _safe_mean(buckets_mfe.get(k, []))
+        m["avg_mae_pct"] = _safe_mean(buckets_mae.get(k, []))
+        m["avg_capture_pct"] = _safe_mean(buckets_cap.get(k, []))
+
+    return stats
+
 def _print_attrib_table(title: str, stats: dict[str, dict[str, object]], *, top: int = 25) -> None:
+    show_mfe_cols = any(("avg_mfe_pct" in m) for m in stats.values())
+
+    def fmt_pf(x):
+        # Handles inf nicely
+        if x is None:
+            return "  0.00"
+        try:
+            if x == float("inf"):
+                return "   inf"
+        except Exception:
+            pass
+        return f"{float(x):6.2f}"
+
+    def fmt7(x):
+        return "   n/a" if x is None else f"{float(x):7.2f}"
+
     print(title)
     print("-" * len(title))
-    print(f"{'key':50s}  {'trades':>6s}  {'win%':>6s}  {'total_pnl':>12s}  {'avg_ret%':>8s}  {'avg_hold':>8s}")
+
+    hdr = (
+        f"{'key':50s}  {'trades':>6s}  {'win%':>6s}  {'total_pnl':>12s}  "
+        f"{'avg%':>7s}  {'med%':>7s}  {'std%':>7s}  {'best%':>7s}  {'worst%':>7s}  {'pf':>6s}  {'hold':>5s}"
+    )
+    if show_mfe_cols:
+        hdr += f"  {'mfe%':>7s}  {'mae%':>7s}  {'cap%':>7s}"
+    print(hdr)
+
     i = 0
     for k, m in stats.items():
         i += 1
         if i > top:
             break
-        win_rate = m["win_rate"]
-        avg_ret = m["avg_ret"]
-        print(
+
+        win_rate = m.get("win_rate")
+        line = (
             f"{k[:50]:50s}  "
-            f"{m['trades']:6d}  "
-            f"{(win_rate*100 if win_rate is not None else 0):6.1f}  "
-            f"{m['total_pnl']:12.2f}  "
-            f"{(avg_ret*100 if avg_ret is not None else 0):8.2f}  "
-            f"{(m['avg_hold_days'] if m['avg_hold_days'] is not None else 0):8.1f}"
+            f"{int(m.get('trades') or 0):6d}  "
+            f"{((win_rate * 100) if win_rate is not None else 0):6.1f}  "
+            f"{float(m.get('total_pnl') or 0.0):12.2f}  "
+            f"{((m.get('avg_ret') or 0.0) * 100):7.2f}  "
+            f"{((m.get('median_ret') or 0.0) * 100):7.2f}  "
+            f"{((m.get('std_ret') or 0.0) * 100):7.2f}  "
+            f"{((m.get('best_ret') or 0.0) * 100):7.2f}  "
+            f"{((m.get('worst_ret') or 0.0) * 100):7.2f}  "
+            f"{fmt_pf(m.get('profit_factor'))}  "
+            f"{(float(m.get('avg_hold_days') or 0.0)):5.1f}"
         )
 
+        if show_mfe_cols:
+            line += (
+                f"  {fmt7(m.get('avg_mfe_pct'))}"
+                f"  {fmt7(m.get('avg_mae_pct'))}"
+                f"  {fmt7(m.get('avg_capture_pct'))}"
+            )
 
-def cmd_attrib_entry(since: str | None, limit: int | None, top: int) -> int:
-    from trading.db import connect  # adjust to your actual import
+        print(line)
+
+def _row_key_entry(r) -> str:
+    return r.entry_signal_key or "UNKNOWN"
+
+def _row_key_exit(r) -> str:
+    return r.exit_signal_key or "UNKNOWN"
+
+def _row_key_combo(r) -> str:
+    return f"{_row_key_entry(r)} × {_row_key_exit(r)}"
+
+def _parse_combo_key(key: str) -> tuple[str, str] | None:
+    """Parse a combo key into (entry_key, exit_key).
+
+    Accepts:
+      - "ENTRY × EXIT" (preferred)
+      - "ENTRY x EXIT" / "ENTRY X EXIT"
+      - "ENTRY | EXIT"
+      - "ENTRY  EXIT" (2+ spaces)
+    """
+    if not key:
+        return None
+    s = key.strip()
+
+    # Split on: ×, x/X with surrounding whitespace, |, or 2+ spaces.
+    parts = re.split(r"\s*[×|]\s*|\s+[xX]\s+|\s{2,}", s, maxsplit=1)
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
+
+def _filter_journal_rows(rows, *, mode: str, key: str | None):
+    if not key:
+        return rows
+    key = key.strip()
+    if mode == "entry":
+        return [r for r in rows if _row_key_entry(r) == key]
+    if mode == "exit":
+        return [r for r in rows if _row_key_exit(r) == key]
+    if mode == "combo":
+        # allow exact combo key string, or parse into entry/exit pieces
+        parsed = _parse_combo_key(key)
+        if parsed:
+            ek, xk = parsed
+            return [r for r in rows if _row_key_entry(r) == ek and _row_key_exit(r) == xk]
+        return [r for r in rows if _row_key_combo(r) == key]
+    raise ValueError(f"unknown mode: {mode}")
+
+def _fmt_pct(x: float | None) -> str:
+    return "   n/a" if x is None else f"{x:7.2f}"
+
+def _print_closings(rows, *, show: int, excursions: dict[int, object] | None = None) -> None:
+    excursions = excursions or {}
+
+    print("\nCLOSINGS (drill-down)")
+    print("---------------------")
+    print("exit_date   symbol         qty            entry->exit         pnl      ret%  hold  closing_id   mfe%    mae%    cap%")
+
+    for r in rows[:show]:
+        # adapt these field names if your row is dataclass vs dict
+        closing_id = r.closing_id if hasattr(r, "closing_id") else r["closing_id"]
+        symbol = r.symbol if hasattr(r, "symbol") else r["symbol"]
+        qty = r.qty_closed if hasattr(r, "qty_closed") else r["qty_closed"]
+        entry_price = r.entry_price if hasattr(r, "entry_price") else r["entry_price"]
+        exit_price = r.exit_price if hasattr(r, "exit_price") else r["exit_price"]
+        pnl = r.realized_pnl if hasattr(r, "realized_pnl") else r["realized_pnl"]
+        ret = r.realized_ret if hasattr(r, "realized_ret") else r["realized_ret"]
+        hold = r.holding_days if hasattr(r, "holding_days") else r["holding_days"]
+        exit_dt = r.exit_filled_at if hasattr(r, "exit_filled_at") else r["exit_filled_at"]
+        exit_date = (exit_dt[:10] if exit_dt else "")
+
+        ex = excursions.get(int(closing_id))
+        mfe = getattr(ex, "mfe_pct", None) if ex else None
+        mae = getattr(ex, "mae_pct", None) if ex else None
+        cap = getattr(ex, "capture_pct", None) if ex else None
+
+        ret_pct = None if ret is None else ret * 100.0
+
+        print(
+            f"{exit_date:10s}  {symbol:6s}  {qty:10.6f}  "
+            f"{entry_price:8.2f}-> {exit_price:8.2f}  "
+            f"{pnl:8.2f}  {ret_pct:7.2f}  {hold:4d}  {closing_id:10d}  "
+            f"{_fmt_pct(mfe)}  {_fmt_pct(mae)}  {_fmt_pct(cap)}"
+        )
+
+def cmd_attrib_entry(since: str | None, limit: int | None, top: int, key: str | None, show: int) -> int:
+    from trading.db import connect
     from trading.analytics.journal import fetch_trade_journal, attrib_by_entry
+
     with connect() as conn:
         rows = fetch_trade_journal(conn, since=since, limit=limit)
-    stats = attrib_by_entry(rows)
-    _print_attrib_table("ENTRY SIGNAL ATTRIBUTION", stats, top=top)
+        filtered = _filter_journal_rows(rows, mode="entry", key=key)
+
+        stats = attrib_by_entry(filtered)
+        _print_attrib_table("ENTRY SIGNAL ATTRIBUTION", stats, top=top)
+
+        if show and filtered:
+            closings = [r.__dict__ if hasattr(r, "__dict__") else r for r in filtered]
+            exc_map = compute_excursions_for_closings(conn, closings=closings)
+
+            _print_closings(filtered, show=show, excursions=exc_map)
+        elif show:
+            _print_closings([], show=show, excursions={})
+
     return 0
 
-
-def cmd_attrib_exit(since: str | None, limit: int | None, top: int) -> int:
+def cmd_attrib_exit(since: str | None, limit: int | None, top: int, key: str | None, show: int, mfe: bool) -> int:
     from trading.db import connect
     from trading.analytics.journal import fetch_trade_journal, attrib_by_exit
+
     with connect() as conn:
         rows = fetch_trade_journal(conn, since=since, limit=limit)
-    stats = attrib_by_exit(rows)
-    _print_attrib_table("EXIT RULE ATTRIBUTION", stats, top=top)
+        filtered = _filter_journal_rows(rows, mode="exit", key=key)
+
+        stats = attrib_by_exit(filtered)
+
+        if mfe and filtered:
+            stats = _attach_mfe_stats(stats=stats, filtered_rows=filtered, mode="exit", conn=conn)
+
+        _print_attrib_table("EXIT RULE ATTRIBUTION", stats, top=top)
+
+        if show and filtered:
+            closings = [r.__dict__ if hasattr(r, "__dict__") else r for r in filtered]
+            exc_map = compute_excursions_for_closings(conn, closings=closings)
+            _print_closings(filtered, show=show, excursions=exc_map)
+        elif show:
+            _print_closings([], show=show, excursions={})
+
     return 0
 
-
-def cmd_attrib_combo(since: str | None, limit: int | None, top: int) -> int:
+def cmd_attrib_combo(since: str | None, limit: int | None, top: int, key: str | None, show: int, mfe: bool) -> int:
     from trading.db import connect
     from trading.analytics.journal import fetch_trade_journal, attrib_by_combo
+
     with connect() as conn:
         rows = fetch_trade_journal(conn, since=since, limit=limit)
-    stats = attrib_by_combo(rows)
-    _print_attrib_table("ENTRY × EXIT COMBO ATTRIBUTION", stats, top=top)
+        filtered = _filter_journal_rows(rows, mode="combo", key=key)
+
+        stats = attrib_by_combo(filtered)
+
+        if mfe and filtered:
+            stats = _attach_mfe_stats(stats=stats, filtered_rows=filtered, mode="combo", conn=conn)
+
+        _print_attrib_table("ENTRY × EXIT COMBO ATTRIBUTION", stats, top=top)
+
+        if show and filtered:
+            closings = [r.__dict__ if hasattr(r, "__dict__") else r for r in filtered]
+            exc_map = compute_excursions_for_closings(conn, closings=closings)
+            _print_closings(filtered, show=show, excursions=exc_map)
+        elif show:
+            _print_closings([], show=show, excursions={})
+
+    return 0
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+def _since_from_lookback(days: int) -> str:
+    d = datetime.now(timezone.utc).date() - timedelta(days=days)
+    return d.isoformat()
+
+def _score_bucket(avg_ret_pct: float, avg_mae_pct: float | None, avg_capture_pct: float | None) -> float:
+    """
+    Simple v1 scoring:
+      + reward returns
+      + reward capture a bit
+      - penalize downside (MAE magnitude)
+    """
+    mae_pen = 0.0 if avg_mae_pct is None else 0.25 * abs(avg_mae_pct)
+    cap_bonus = 0.0 if avg_capture_pct is None else 0.02 * avg_capture_pct
+    return avg_ret_pct + cap_bonus - mae_pen
+
+def _recommend_label(*, trades: int, avg_ret_pct: float, profit_factor: float | None) -> str:
+    pf = profit_factor if profit_factor is not None else 0.0
+
+    # v1 rules (keep it simple and explainable)
+    if trades < 1:
+        return "N/A"
+    if avg_ret_pct >= 0.50 and pf >= 1.30:
+        return "BOOST"
+    if avg_ret_pct > 0.00 and pf >= 1.00:
+        return "KEEP"
+    if avg_ret_pct <= -0.50 and pf < 1.00:
+        return "REDUCE"
+    if avg_ret_pct <= -1.00 and pf < 0.80:
+        return "DISABLE"
+    return "WATCH"
+
+def _print_policy_table(title: str, rows: list[dict], *, top: int) -> None:
+    print()
+    print(title)
+    print("-" * len(title))
+    print(f"{'key':50s}  {'tr':>4s}  {'avg%':>7s}  {'pf':>6s}  {'mfe%':>7s}  {'mae%':>7s}  {'cap%':>7s}  {'score':>8s}  {'rec':>7s}")
+    for r in rows[:top]:
+        pf = r.get("pf")
+        pf_s = "inf" if pf == float("inf") else f"{(pf if pf is not None else 0.0):.2f}"
+        print(
+            f"{r['key'][:50]:50s}  "
+            f"{int(r.get('trades') or 0):4d}  "
+            f"{float(r.get('avg_ret_pct') or 0.0):7.2f}  "
+            f"{pf_s:>6s}  "
+            f"{float(r.get('avg_mfe_pct') or 0.0):7.2f}  "
+            f"{float(r.get('avg_mae_pct') or 0.0):7.2f}  "
+            f"{float(r.get('avg_capture_pct') or 0.0):7.2f}  "
+            f"{float(r.get('score') or 0.0):8.2f}  "
+            f"{r.get('rec', ''):>7s}"
+        )
+
+def cmd_policy_recommend(
+    *,
+    since: str | None,
+    lookback: int,
+    limit: int | None,
+    min_trades: int,
+    top: int,
+    mfe: bool,
+    top_exits_per_entry: int,
+) -> int:
+    from trading.db import connect
+    from trading.analytics.journal import fetch_trade_journal, attrib_by_entry, attrib_by_exit, attrib_by_combo
+
+    if since is None:
+        since = _since_from_lookback(lookback)
+
+    with connect() as conn:
+        journal_rows = fetch_trade_journal(conn, since=since, limit=limit)
+
+        if not journal_rows:
+            print(f"POLICY RECOMMENDATIONS: no realized trades since {since}")
+            return 0
+
+        entry_stats = attrib_by_entry(journal_rows)
+        exit_stats = attrib_by_exit(journal_rows)
+        combo_stats = attrib_by_combo(journal_rows)
+
+        # Optional: attach MFE/MAE/Capture into stats dicts (avg_mfe_pct/avg_mae_pct/avg_capture_pct)
+        if mfe:
+            # These helpers must exist (you used them for attrib-exit/combo)
+            entry_stats = _attach_mfe_stats(stats=entry_stats, filtered_rows=journal_rows, mode="entry", conn=conn)
+            exit_stats  = _attach_mfe_stats(stats=exit_stats,  filtered_rows=journal_rows, mode="exit",  conn=conn)
+            combo_stats = _attach_mfe_stats(stats=combo_stats, filtered_rows=journal_rows, mode="combo", conn=conn)
+
+    print()
+    print(f"POLICY RECOMMENDATIONS (advisory) since={since} asof={_today_utc()} | min_trades={min_trades} | mfe={mfe}")
+
+    # ---- Entry recommendations ----
+    entry_rows: list[dict] = []
+    for k, m in entry_stats.items():
+        trades = int(m.get("trades") or 0)
+        if trades < min_trades:
+            continue
+
+        avg_ret_pct = float((m.get("avg_ret") or 0.0) * 100.0)
+        pf = m.get("profit_factor")
+        avg_mae = m.get("avg_mae_pct")
+        avg_mfe = m.get("avg_mfe_pct")
+        avg_cap = m.get("avg_capture_pct")
+
+        score = _score_bucket(avg_ret_pct, avg_mae, avg_cap)
+        rec = _recommend_label(trades=trades, avg_ret_pct=avg_ret_pct, profit_factor=pf)
+
+        entry_rows.append({
+            "key": k,
+            "trades": trades,
+            "avg_ret_pct": avg_ret_pct,
+            "pf": pf,
+            "avg_mfe_pct": avg_mfe,
+            "avg_mae_pct": avg_mae,
+            "avg_capture_pct": avg_cap,
+            "score": score,
+            "rec": rec,
+        })
+
+    entry_rows.sort(key=lambda r: (r["rec"] != "BOOST", -(r["score"] or 0.0)))
+    _print_policy_table("ENTRY SIGNAL POLICY", entry_rows, top=top)
+
+    # ---- Exit recommendations ----
+    exit_rows: list[dict] = []
+    for k, m in exit_stats.items():
+        trades = int(m.get("trades") or 0)
+        if trades < min_trades:
+            continue
+
+        avg_ret_pct = float((m.get("avg_ret") or 0.0) * 100.0)
+        pf = m.get("profit_factor")
+        avg_mae = m.get("avg_mae_pct")
+        avg_mfe = m.get("avg_mfe_pct")
+        avg_cap = m.get("avg_capture_pct")
+
+        score = _score_bucket(avg_ret_pct, avg_mae, avg_cap)
+        rec = _recommend_label(trades=trades, avg_ret_pct=avg_ret_pct, profit_factor=pf)
+
+        exit_rows.append({
+            "key": k,
+            "trades": trades,
+            "avg_ret_pct": avg_ret_pct,
+            "pf": pf,
+            "avg_mfe_pct": avg_mfe,
+            "avg_mae_pct": avg_mae,
+            "avg_capture_pct": avg_cap,
+            "score": score,
+            "rec": rec,
+        })
+
+    exit_rows.sort(key=lambda r: (r["rec"] != "BOOST", -(r["score"] or 0.0)))
+    _print_policy_table("EXIT RULE POLICY", exit_rows, top=top)
+
+    # ---- Best exits per entry (combo intelligence) ----
+    print()
+    print("BEST EXITS PER ENTRY (from combos)")
+    print("---------------------------------")
+
+    # Build entry -> list of exit candidates
+    per_entry: dict[str, list[dict]] = defaultdict(list)
+    for combo_key, m in combo_stats.items():
+        trades = int(m.get("trades") or 0)
+        if trades < min_trades:
+            continue
+
+        # combo key format: "ENTRY × EXIT"
+        if "×" in combo_key:
+            entry_key, exit_key = [x.strip() for x in combo_key.split("×", 1)]
+        else:
+            # fallback: skip weird keys
+            continue
+
+        avg_ret_pct = float((m.get("avg_ret") or 0.0) * 100.0)
+        avg_mae = m.get("avg_mae_pct")
+        avg_cap = m.get("avg_capture_pct")
+        score = _score_bucket(avg_ret_pct, avg_mae, avg_cap)
+
+        per_entry[entry_key].append({
+            "exit_key": exit_key,
+            "trades": trades,
+            "avg_ret_pct": avg_ret_pct,
+            "avg_mae_pct": avg_mae,
+            "avg_capture_pct": avg_cap,
+            "score": score,
+        })
+
+    # print top N exits for each entry (only for entries we recommended on)
+    entry_keys_ranked = [r["key"] for r in entry_rows[:top]]
+    for ek in entry_keys_ranked:
+        xs = per_entry.get(ek, [])
+        if not xs:
+            continue
+        xs.sort(key=lambda r: -(r["score"] or 0.0))
+        print(f"\n{ek}")
+        for r in xs[:top_exits_per_entry]:
+            print(
+                f"  - {r['exit_key']} | trades={r['trades']} "
+                f"| avg%={r['avg_ret_pct']:+.2f} "
+                f"| mae%={(r.get('avg_mae_pct') if r.get('avg_mae_pct') is not None else 0.0):+.2f} "
+                f"| cap%={(r.get('avg_capture_pct') if r.get('avg_capture_pct') is not None else 0.0):.2f} "
+                f"| score={r['score']:+.2f}"
+            )
+
+    print()
+    print("NOTE: This command is advisory only. No trading behavior is changed.")
     return 0
 
 def main() -> int:
@@ -693,19 +1125,33 @@ def main() -> int:
     pae.add_argument("--since", default=None, help="YYYY-MM-DD")
     pae.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
     pae.add_argument("--top", type=int, default=25, help="Show top N keys")
+    pae.add_argument("--key", default=None, help="Filter to a specific key (exact match)")
+    pae.add_argument("--show", type=int, default=0, help="Show N underlying closings (drill-down)")
 
     paex = sub.add_parser("attrib-exit", help="Entry signal attribution (realized trades)")
     paex.add_argument("--since", default=None, help="YYYY-MM-DD")
     paex.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
     paex.add_argument("--top", type=int, default=25, help="Show top N keys")
+    paex.add_argument("--key", default=None, help="Filter to a specific key (exact match)")
+    paex.add_argument("--show", type=int, default=0, help="Show N underlying closings (drill-down)")
+    paex.add_argument("--mfe", action="store_true", help="Compute MFE/MAE/Capture bucket metrics (uses bars_daily)")
 
     pacb = sub.add_parser("attrib-combo", help="Entry signal attribution (realized trades)")
     pacb.add_argument("--since", default=None, help="YYYY-MM-DD")
     pacb.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
     pacb.add_argument("--top", type=int, default=25, help="Show top N keys")
+    pacb.add_argument("--key", default=None, help="Filter to a specific key (exact match)")
+    pacb.add_argument("--show", type=int, default=0, help="Show N underlying closings (drill-down)")
+    pacb.add_argument("--mfe", action="store_true", help="Compute MFE/MAE/Capture bucket metrics (uses bars_daily)")
 
-# same for attrib-exit, attrib-combo
-
+    pp = sub.add_parser("policy-recommend", help="Phase 5: advisory policy recommendations from realized stats")
+    pp.add_argument("--since", default=None, help="YYYY-MM-DD (optional). If omitted, uses --lookback days.")
+    pp.add_argument("--lookback", type=int, default=180, help="Lookback days if --since not provided (default 180)")
+    pp.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
+    pp.add_argument("--min-trades", type=int, default=10, help="Minimum trades per bucket to recommend (default 10)")
+    pp.add_argument("--top", type=int, default=25, help="Show top N rows in each section (default 25)")
+    pp.add_argument("--mfe", action="store_true", help="Include MFE/MAE/Capture in recommendations (uses bars_daily)")
+    pp.add_argument("--top-exits-per-entry", type=int, default=3, help="Show top N exits per entry (default 3)")
 
     p_r = sub.add_parser("realized", help="Realized P&L reports (Phase 3)")
     p_r.add_argument("--daily", action="store_true", help="Group realized P&L by day")
@@ -931,13 +1377,16 @@ def main() -> int:
         return 0
     
     if args.cmd == "attrib-entry":
-        return cmd_attrib_entry(args.since, args.limit, args.top)
+        return cmd_attrib_entry(args.since, args.limit, args.top, getattr(args, 'key', None), getattr(args, 'show', 0))
     
     if args.cmd == "attrib-exit":
-        return cmd_attrib_exit(args.since, args.limit, args.top)
+        return cmd_attrib_exit(args.since, args.limit, args.top, getattr(args, "key", None), getattr(args, "show", 0), getattr(args, "mfe", False))
     
     if args.cmd == "attrib-combo":
-        return cmd_attrib_combo(args.since, args.limit, args.top)
+        return cmd_attrib_combo(args.since, args.limit, args.top, getattr(args, 'key', None), getattr(args, 'show', 0),getattr(args, "mfe", False))
+
+    if args.cmd == "policy-recommend":
+        return cmd_policy_recommend(since=args.since, lookback=args.lookback, limit=args.limit, min_trades=args.min_trades, top=args.top, mfe=args.mfe, top_exits_per_entry=args.top_exits_per_entry)
 
     if args.cmd == "preflight":
         from .preflight import run_preflight

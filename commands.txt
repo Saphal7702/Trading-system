@@ -11,18 +11,18 @@ trading load-universe --file data/sp500.csv
 trading fetch-bars --days 400
 trading preflight
 
-/*Automated executions*/
+/*Automated executions (Planning and Buying)*/
 trading run-once
 trading show-intents --run-id X
 trading run-once --execute
 
-/*Manual Selling for now*/
+/*Manual Selling for now (Selling and Exit strategy)*/
 trading exits
 trading exits --emit-intents
 trading execute --run-id X --submit
 trading run-once
 
-/*Performance and Feedbacks*/
+/*Performance, Analysis and Feedbacks*/
 trading exits
 trading exits --emit-intents --dry-run
 trading exits --trail-peak 8 --trail-dd 3
@@ -36,6 +36,18 @@ trading exposure
 trading attrib-entry
 trading attrib-exit
 trading attrib-combo
+
+trading attrib-entry --key sma20_cross_up_sma50
+trading attrib-exit  --key exit_early_failure_5d
+trading attrib-combo --key "sma20_cross_up_sma50 × exit_take_profit_14pct"
+trading attrib-entry --key sma20_cross_up_sma50 --show 50
+trading attrib-exit  --key exit_take_profit_14pct --show 50
+trading attrib-combo --key "sma20_cross_up_sma50 × exit_early_failure_5d" --show 50
+
+trading attrib-exit --mfe
+trading attrib-combo --mfe
+trading attrib-exit --key exit_take_profit_14pct --mfe --show 50
+
 
 trading realized
 trading realized --daily --last 20
@@ -56,6 +68,7 @@ trading show-intents --run-id X
 trading execute --run-id X --submit
 trading sync-orders
 trading sync-positions
+/**********************/
 
 /**************************************************************************************************************/
 
