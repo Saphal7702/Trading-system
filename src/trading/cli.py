@@ -847,10 +847,13 @@ def _recommend_label(*, trades: int, avg_ret_pct: float, profit_factor: float | 
     return "WATCH"
 
 def _print_policy_table(title: str, rows: list[dict], *, top: int) -> None:
+    def fmt7(x: object | None) -> str:
+        return "   n/a" if x is None else f"{float(x):7.2f}"
     print()
     print(title)
     print("-" * len(title))
     print(f"{'key':50s}  {'tr':>4s}  {'avg%':>7s}  {'pf':>6s}  {'mfe%':>7s}  {'mae%':>7s}  {'cap%':>7s}  {'score':>8s}  {'rec':>7s}")
+
     for r in rows[:top]:
         pf = r.get("pf")
         pf_s = "inf" if pf == float("inf") else f"{(pf if pf is not None else 0.0):.2f}"
@@ -859,25 +862,58 @@ def _print_policy_table(title: str, rows: list[dict], *, top: int) -> None:
             f"{int(r.get('trades') or 0):4d}  "
             f"{float(r.get('avg_ret_pct') or 0.0):7.2f}  "
             f"{pf_s:>6s}  "
-            f"{float(r.get('avg_mfe_pct') or 0.0):7.2f}  "
-            f"{float(r.get('avg_mae_pct') or 0.0):7.2f}  "
-            f"{float(r.get('avg_capture_pct') or 0.0):7.2f}  "
+            f"{fmt7(r.get('avg_mfe_pct'))}  "
+            f"{fmt7(r.get('avg_mae_pct'))}  "
+            f"{fmt7(r.get('avg_capture_pct'))}  "
             f"{float(r.get('score') or 0.0):8.2f}  "
             f"{r.get('rec', ''):>7s}"
         )
+
 
 def cmd_policy_recommend(
     *,
     since: str | None,
     lookback: int,
     limit: int | None,
-    min_trades: int,
+    min_entry_trades: int,
+    min_exit_trades: int,
+    min_combo_trades: int,
     top: int,
     mfe: bool,
     top_exits_per_entry: int,
+    emit_json: str | None,
 ) -> int:
+    import json
+    from pathlib import Path
+
     from trading.db import connect
     from trading.analytics.journal import fetch_trade_journal, attrib_by_entry, attrib_by_exit, attrib_by_combo
+
+    def _policy_payload(
+        *,
+        since: str,
+        asof: str,
+        mfe: bool,
+        min_entry_trades: int,
+        min_exit_trades: int,
+        min_combo_trades: int,
+        entry_rows: list[dict],
+        exit_rows: list[dict],
+        per_entry: dict[str, list[dict]],
+    ) -> dict:
+        return {
+            "meta": {
+                "since": since,
+                "asof": asof,
+                "mfe": mfe,
+                "min_entry_trades": min_entry_trades,
+                "min_exit_trades": min_exit_trades,
+                "min_combo_trades": min_combo_trades,
+            },
+            "entry_policy": entry_rows,
+            "exit_policy": exit_rows,
+            "best_exits_per_entry": per_entry,
+        }
 
     if since is None:
         since = _since_from_lookback(lookback)
@@ -893,21 +929,25 @@ def cmd_policy_recommend(
         exit_stats = attrib_by_exit(journal_rows)
         combo_stats = attrib_by_combo(journal_rows)
 
-        # Optional: attach MFE/MAE/Capture into stats dicts (avg_mfe_pct/avg_mae_pct/avg_capture_pct)
         if mfe:
-            # These helpers must exist (you used them for attrib-exit/combo)
             entry_stats = _attach_mfe_stats(stats=entry_stats, filtered_rows=journal_rows, mode="entry", conn=conn)
             exit_stats  = _attach_mfe_stats(stats=exit_stats,  filtered_rows=journal_rows, mode="exit",  conn=conn)
             combo_stats = _attach_mfe_stats(stats=combo_stats, filtered_rows=journal_rows, mode="combo", conn=conn)
 
+    asof = _today_utc()
+
     print()
-    print(f"POLICY RECOMMENDATIONS (advisory) since={since} asof={_today_utc()} | min_trades={min_trades} | mfe={mfe}")
+    print(
+        f"POLICY RECOMMENDATIONS (advisory) since={since} asof={asof} "
+        f"| min_entry={min_entry_trades} min_exit={min_exit_trades} min_combo={min_combo_trades} "
+        f"| mfe={mfe}"
+    )
 
     # ---- Entry recommendations ----
     entry_rows: list[dict] = []
     for k, m in entry_stats.items():
         trades = int(m.get("trades") or 0)
-        if trades < min_trades:
+        if trades < min_entry_trades:
             continue
 
         avg_ret_pct = float((m.get("avg_ret") or 0.0) * 100.0)
@@ -938,7 +978,7 @@ def cmd_policy_recommend(
     exit_rows: list[dict] = []
     for k, m in exit_stats.items():
         trades = int(m.get("trades") or 0)
-        if trades < min_trades:
+        if trades < min_exit_trades:
             continue
 
         avg_ret_pct = float((m.get("avg_ret") or 0.0) * 100.0)
@@ -970,18 +1010,15 @@ def cmd_policy_recommend(
     print("BEST EXITS PER ENTRY (from combos)")
     print("---------------------------------")
 
-    # Build entry -> list of exit candidates
     per_entry: dict[str, list[dict]] = defaultdict(list)
     for combo_key, m in combo_stats.items():
         trades = int(m.get("trades") or 0)
-        if trades < min_trades:
+        if trades < min_combo_trades:
             continue
 
-        # combo key format: "ENTRY × EXIT"
         if "×" in combo_key:
             entry_key, exit_key = [x.strip() for x in combo_key.split("×", 1)]
         else:
-            # fallback: skip weird keys
             continue
 
         avg_ret_pct = float((m.get("avg_ret") or 0.0) * 100.0)
@@ -998,7 +1035,6 @@ def cmd_policy_recommend(
             "score": score,
         })
 
-    # print top N exits for each entry (only for entries we recommended on)
     entry_keys_ranked = [r["key"] for r in entry_rows[:top]]
     for ek in entry_keys_ranked:
         xs = per_entry.get(ek, [])
@@ -1007,17 +1043,45 @@ def cmd_policy_recommend(
         xs.sort(key=lambda r: -(r["score"] or 0.0))
         print(f"\n{ek}")
         for r in xs[:top_exits_per_entry]:
+            mae = r.get("avg_mae_pct")
+            cap = r.get("avg_capture_pct")
+            cap_s = "n/a" if cap is None else f"{cap:.2f}"
             print(
                 f"  - {r['exit_key']} | trades={r['trades']} "
                 f"| avg%={r['avg_ret_pct']:+.2f} "
-                f"| mae%={(r.get('avg_mae_pct') if r.get('avg_mae_pct') is not None else 0.0):+.2f} "
-                f"| cap%={(r.get('avg_capture_pct') if r.get('avg_capture_pct') is not None else 0.0):.2f} "
+                f"| mae%={(mae if mae is not None else 0.0):+.2f} "
+                f"| cap%={cap_s} "
                 f"| score={r['score']:+.2f}"
             )
 
     print()
+
+    if emit_json:
+        # Save all policy snapshots under ./policies (project-relative)
+        base_dir = Path("policies")
+        out_path = base_dir / Path(emit_json)
+
+        # Allow nested paths like "weekly/policy_....json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = _policy_payload(
+            since=since,
+            asof=asof,
+            mfe=mfe,
+            min_entry_trades=min_entry_trades,
+            min_exit_trades=min_exit_trades,
+            min_combo_trades=min_combo_trades,
+            entry_rows=entry_rows,
+            exit_rows=exit_rows,
+            per_entry=per_entry,
+        )
+
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Wrote policy snapshot: {out_path.as_posix()}")
+
     print("NOTE: This command is advisory only. No trading behavior is changed.")
     return 0
+
 
 def main() -> int:
     setup_logging()
@@ -1148,10 +1212,14 @@ def main() -> int:
     pp.add_argument("--since", default=None, help="YYYY-MM-DD (optional). If omitted, uses --lookback days.")
     pp.add_argument("--lookback", type=int, default=180, help="Lookback days if --since not provided (default 180)")
     pp.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
-    pp.add_argument("--min-trades", type=int, default=10, help="Minimum trades per bucket to recommend (default 10)")
+    pp.add_argument("--min-trades", type=int, default=None, help="Shortcut: sets entry/exit/combo mins")
+    pp.add_argument("--min-entry-trades", type=int, default=10)
+    pp.add_argument("--min-exit-trades", type=int, default=10)
+    pp.add_argument("--min-combo-trades", type=int, default=10)
     pp.add_argument("--top", type=int, default=25, help="Show top N rows in each section (default 25)")
     pp.add_argument("--mfe", action="store_true", help="Include MFE/MAE/Capture in recommendations (uses bars_daily)")
     pp.add_argument("--top-exits-per-entry", type=int, default=3, help="Show top N exits per entry (default 3)")
+    pp.add_argument("--emit-json", default=None, help="Write recommendations to a JSON file")
 
     p_r = sub.add_parser("realized", help="Realized P&L reports (Phase 3)")
     p_r.add_argument("--daily", action="store_true", help="Group realized P&L by day")
@@ -1386,7 +1454,25 @@ def main() -> int:
         return cmd_attrib_combo(args.since, args.limit, args.top, getattr(args, 'key', None), getattr(args, 'show', 0),getattr(args, "mfe", False))
 
     if args.cmd == "policy-recommend":
-        return cmd_policy_recommend(since=args.since, lookback=args.lookback, limit=args.limit, min_trades=args.min_trades, top=args.top, mfe=args.mfe, top_exits_per_entry=args.top_exits_per_entry)
+        me = getattr(args, "min_entry_trades", 10)
+        mx = getattr(args, "min_exit_trades", 10)
+        mc = getattr(args, "min_combo_trades", 10)
+        mt = getattr(args, "min_trades", None)
+        if mt is not None:
+            me = mx = mc = mt
+
+        return cmd_policy_recommend(
+            since=args.since,
+            lookback=args.lookback,
+            limit=args.limit,
+            min_entry_trades=me,
+            min_exit_trades=mx,
+            min_combo_trades=mc,
+            top=args.top,
+            mfe=args.mfe,
+            top_exits_per_entry=args.top_exits_per_entry,
+            emit_json=args.emit_json
+        )
 
     if args.cmd == "preflight":
         from .preflight import run_preflight
