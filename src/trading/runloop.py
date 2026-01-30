@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from .db import connect, init_db
 from .cooldown import is_in_cooldown
 from .lock import acquire_lock, release_lock, read_lock_info
+from trading.policy.loader import load_latest_policy, format_policy_summary
 
 import logging
 
@@ -129,6 +130,8 @@ def run_once(
 
     init_db()
 
+    policy = None
+
     got_lock, lock_path = acquire_lock()
     info = read_lock_info(lock_path)
     if not got_lock:
@@ -198,6 +201,32 @@ def run_once(
                 conn.execute("UPDATE runs SET asof_date=? WHERE id=?;", (asof, run_id))
             except Exception:
                 pass
+
+        # 1.5) Load latest policy snapshot (read-only for now)
+        def _policy_load() -> dict:
+            nonlocal policy
+            try:
+                pol = load_latest_policy()  # loader reads from /policies
+                if not pol:
+                    return {"loaded": False}
+
+                # Keep it compact in the run summary; full JSON stays on disk
+                out = {
+                    "loaded": True,
+                    "name": getattr(pol, "name", None),
+                    "asof": getattr(pol, "asof", None),
+                    "path": getattr(pol, "path", None),
+                }
+                policy = pol
+                # nice one-liner for logs
+                log.info("POLICY %s", format_policy_summary(pol))
+                return out
+            except Exception as e:
+                # policy is advisory; never fail the run because of it
+                log.warning("policy_load failed: %s: %s", type(e).__name__, e)
+                return {"loaded": False, "error": f"{type(e).__name__}: {e}"}
+
+        step("policy_load", _policy_load)
 
         # 2) Broker check + account snapshot
         from trading.broker.alpaca_broker import AlpacaPaperBroker
@@ -279,7 +308,7 @@ def run_once(
 
         def _plan():
             signals = generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof)
-            intents = plan_intents(signals)
+            intents = plan_intents(signals, policy=policy)
 
             cooldown_days = int(float(os.getenv("TRADING_SYMBOL_COOLDOWN_DAYS", "0")))
             blocked = 0

@@ -15,10 +15,14 @@ class Intent:
     action: str   # buy/sell/hold
     reason: str
     strength: float | None = None
-    # Optional: carry sizing hint forward (execute can use later)
     target_notional: float | None = None
-    # Phase 4: stable machine-friendly key for attribution/grouping
     signal_key: str | None = None
+
+    # Phase 5 (read-only): policy overlay (does NOT affect decisions)
+    policy_rec: str | None = None         # e.g. "BOOST", "REDUCE"
+    policy_score: float | None = None     # advisory score
+    policy_asof: str | None = None        # snapshot asof date
+    policy_best_exits: str | None = None  # comma-joined list for display
 
 
 def _norm_sym(sym: str | None) -> str:
@@ -124,6 +128,7 @@ def plan_intents(
     max_positions: int | None = None,
     per_position_notional: float | None = None,
     cash_buffer: float | None = None,
+    policy=None,  # Phase 5: optional policy snapshot (read-only)
 ) -> list[Intent]:
     """
     Planner enforces:
@@ -155,6 +160,38 @@ def plan_intents(
 
     intents: list[Intent] = []
     buy_candidates: list[Signal] = []
+
+    def _policy_for_entry(entry_key: str | None) -> tuple[str | None, float | None, str | None, str | None]:
+        """
+        Returns: (rec, score, asof, best_exits_csv)
+        """
+        if not policy or not entry_key:
+            return (None, None, None, None)
+
+        try:
+            rec_row = policy.entry_rec(entry_key) if hasattr(policy, "entry_rec") else None
+            rec = rec_row.get("rec") if isinstance(rec_row, dict) else None
+            score = rec_row.get("score") if isinstance(rec_row, dict) else None
+            asof = getattr(policy, "asof", None)
+
+            best = []
+            if hasattr(policy, "best_exits"):
+                xs = policy.best_exits(entry_key) or []
+                # xs is a list[dict] like {"exit_key": "...", ...}
+                for x in xs:
+                    k = x.get("exit_key")
+                    if k:
+                        best.append(str(k))
+            best_csv = ", ".join(best) if best else None
+
+            return (str(rec) if rec is not None else None,
+                    float(score) if score is not None else None,
+                    str(asof) if asof is not None else None,
+                    best_csv)
+        except Exception:
+            # policy is advisory; never break planning
+            return (None, None, None, None)
+
 
     # 1) Process SELL/HOLD decisions; collect BUY candidates
     for sig in signals:
@@ -217,6 +254,9 @@ def plan_intents(
         sym = _norm_sym(sig.symbol)
 
         if idx < n_buys_allowed:
+            entry_key = _signal_key_for("buy", sig.reason)
+            pol_rec, pol_score, pol_asof, pol_best = _policy_for_entry(entry_key)
+
             intents.append(
                 Intent(
                     sym,
@@ -224,9 +264,14 @@ def plan_intents(
                     sig.reason,
                     sig.strength,
                     target_notional=per_position_notional,
-                    signal_key=_signal_key_for("buy", sig.reason),
+                    signal_key=entry_key,
+                    policy_rec=pol_rec,
+                    policy_score=pol_score,
+                    policy_asof=pol_asof,
+                    policy_best_exits=pol_best,
                 )
             )
+
         else:
             if slots_left <= 0:
                 intents.append(Intent(sym, "hold", f"Max positions reached ({max_positions}); skip buy", sig.strength))
