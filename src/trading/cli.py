@@ -13,6 +13,7 @@ from trading.broker.sync import upsert_account, sync_positions
 from .exits_advisor import evaluate_exit_advice, ExitRuleConfig, emit_sell_intents, exit_rule_config_from_env
 from trading.analytics.mfe_mae import compute_excursions_for_closings
 from collections import defaultdict
+from trading.policy.loader import load_latest_policy
 
 log = logging.getLogger("trading")
 
@@ -121,7 +122,8 @@ def cmd_plan(fast: int, slow: int, universe: str = "sp500") -> int:
                 )
 
         # 3) Plan + save intents
-        intents = plan_intents(signals)
+        policy = load_latest_policy(policies_dir="policies")
+        intents = plan_intents(signals, policy=policy)
         save_intents(run_id, intents)
 
         buys = [i for i in intents if i.action == "buy"]
@@ -140,12 +142,33 @@ def cmd_plan(fast: int, slow: int, universe: str = "sp500") -> int:
         for i in sells:
             log.info("SELL %s | strength=%s | %s", i.symbol, i.strength, i.reason)
         for i in buys:
-            # if you added target_notional, include it
             tn = getattr(i, "target_notional", None)
+            extra = ""
+            rn = getattr(i, "policy_reco_notional", None)
+            if rn is not None and getattr(i, "policy_mult", None) is not None:
+                # show enforceability + skip-only if enforceable
+                enf = "enf" if getattr(i, "policy_enforceable", False) else "soft"
+                extra += f" | reco=${rn:.2f} ({enf})"
+                if getattr(i, "policy_would_skip", False):
+                    extra += " WOULD_SKIP"
+
             if tn is not None:
-                log.info("BUY  %s | strength=%s | $%s | %s", i.symbol, i.strength, tn, i.reason)
+                log.info(
+                    "BUY  %s | strength=%s | $%s | %s%s",
+                    i.symbol,
+                    i.strength,
+                    tn,
+                    i.reason,
+                    extra,
+                )
             else:
-                log.info("BUY  %s | strength=%s | %s", i.symbol, i.strength, i.reason)
+                log.info(
+                    "BUY  %s | strength=%s | %s%s",
+                    i.symbol,
+                    i.strength,
+                    i.reason,
+                    extra,
+                )
 
         finish_run(run_id, status="success")
         return 0

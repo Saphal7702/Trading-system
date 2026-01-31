@@ -18,11 +18,18 @@ class Intent:
     target_notional: float | None = None
     signal_key: str | None = None
 
-    # Phase 5 (read-only): policy overlay (does NOT affect decisions)
-    policy_rec: str | None = None         # e.g. "BOOST", "REDUCE"
-    policy_score: float | None = None     # advisory score
-    policy_asof: str | None = None        # snapshot asof date
-    policy_best_exits: str | None = None  # comma-joined list for display
+    # Phase 5 (read-only): policy overlay
+    policy_rec: str | None = None
+    policy_score: float | None = None
+    policy_asof: str | None = None
+    policy_best_exits: str | None = None
+
+    # Phase 5 (advisory): policy-aware sizing recommendation (NOT enforced)
+    policy_trades: int | None = None
+    policy_enforceable: bool = False
+    policy_mult: float | None = None
+    policy_reco_notional: float | None = None
+    policy_would_skip: bool = False
 
 
 def _norm_sym(sym: str | None) -> str:
@@ -151,6 +158,11 @@ def plan_intents(
     )
     cash_buffer = cash_buffer if cash_buffer is not None else _env_float("TRADING_CASH_BUFFER", 25.0)
 
+    # Policy sizing knobs
+    pol_min_trades = _env_int("TRADING_POLICY_MIN_TRADES_ENFORCE", 20)
+    pol_boost_mult = _env_float("TRADING_POLICY_BOOST_MULT", 1.25)
+    pol_reduce_mult = _env_float("TRADING_POLICY_REDUCE_MULT", 0.50)
+
     assumed_bp = _env_float("TRADING_ASSUMED_BP", 0.0)
     buying_power = _get_buying_power_fallback(default=assumed_bp)
 
@@ -191,7 +203,63 @@ def plan_intents(
         except Exception:
             # policy is advisory; never break planning
             return (None, None, None, None)
+        
+    def _policy_sizing_for_entry(entry_key: str | None, base_notional: float | None) -> dict:
+        """
+        Advisory only. Returns:
+          policy_trades, policy_enforceable, policy_mult, policy_reco_notional, policy_would_skip
+        """
+        out = {
+            "policy_trades": None,
+            "policy_enforceable": False,
+            "policy_mult": None,
+            "policy_reco_notional": None,
+            "policy_would_skip": False,
+        }
 
+        if not policy or not entry_key or base_notional is None:
+            return out
+
+        try:
+            rec_row = policy.entry_rec(entry_key) if hasattr(policy, "entry_rec") else None
+            if not isinstance(rec_row, dict):
+                return out
+
+            rec = rec_row.get("rec")
+            # handle either "trades" or "tr" depending on payload
+            trades_raw = rec_row.get("trades", rec_row.get("tr"))
+            trades = int(trades_raw) if trades_raw is not None else None
+
+            enforceable = bool(trades is not None and trades >= pol_min_trades)
+
+            mult = None
+            would_skip = False
+
+            # We only "trust" the recommendation once enforceable is True,
+            # but we still compute the advisory numbers either way.
+            if rec == "BOOST":
+                mult = pol_boost_mult
+            elif rec == "REDUCE":
+                mult = pol_reduce_mult
+            elif rec == "DISABLE":
+                mult = 0.0
+                would_skip = True
+            else:
+                mult = 1.0
+
+            reco_notional = base_notional * float(mult)
+
+            out.update({
+                "policy_trades": trades,
+                "policy_enforceable": enforceable,
+                "policy_mult": float(mult),
+                "policy_reco_notional": float(reco_notional),
+                # only consider skip meaningful when enforceable
+                "policy_would_skip": bool(would_skip and enforceable),
+            })
+            return out
+        except Exception:
+            return out
 
     # 1) Process SELL/HOLD decisions; collect BUY candidates
     for sig in signals:
@@ -255,7 +323,30 @@ def plan_intents(
 
         if idx < n_buys_allowed:
             entry_key = _signal_key_for("buy", sig.reason)
-            pol_rec, pol_score, pol_asof, pol_best = _policy_for_entry(entry_key)
+
+            # --- policy overlay (if you added this earlier) ---
+            pol_rec = pol_score = pol_asof = pol_best = None
+            if policy and entry_key:
+                try:
+                    rec_row = policy.entry_rec(entry_key) if hasattr(policy, "entry_rec") else None
+                    if isinstance(rec_row, dict):
+                        pol_rec = rec_row.get("rec")
+                        pol_score = rec_row.get("score")
+                    pol_asof = getattr(policy, "asof", None)
+
+                    best = []
+                    if hasattr(policy, "best_exits"):
+                        xs = policy.best_exits(entry_key) or []
+                        for x in xs:
+                            k = x.get("exit_key")
+                            if k:
+                                best.append(str(k))
+                    pol_best = ", ".join(best) if best else None
+                except Exception:
+                    pass
+
+            # --- advisory sizing ---
+            sizing = _policy_sizing_for_entry(entry_key, per_position_notional)
 
             intents.append(
                 Intent(
@@ -265,10 +356,15 @@ def plan_intents(
                     sig.strength,
                     target_notional=per_position_notional,
                     signal_key=entry_key,
-                    policy_rec=pol_rec,
-                    policy_score=pol_score,
-                    policy_asof=pol_asof,
+                    policy_rec=(str(pol_rec) if pol_rec is not None else None),
+                    policy_score=(float(pol_score) if pol_score is not None else None),
+                    policy_asof=(str(pol_asof) if pol_asof is not None else None),
                     policy_best_exits=pol_best,
+                    policy_trades=sizing["policy_trades"],
+                    policy_enforceable=bool(sizing["policy_enforceable"]),
+                    policy_mult=sizing["policy_mult"],
+                    policy_reco_notional=sizing["policy_reco_notional"],
+                    policy_would_skip=bool(sizing["policy_would_skip"]),
                 )
             )
 

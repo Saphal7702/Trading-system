@@ -206,23 +206,21 @@ def run_once(
         def _policy_load() -> dict:
             nonlocal policy
             try:
-                pol = load_latest_policy()  # loader reads from /policies
+                pol = load_latest_policy()
                 if not pol:
+                    policy = None  # <-- add this
                     return {"loaded": False}
 
-                # Keep it compact in the run summary; full JSON stays on disk
-                out = {
+                policy = pol
+                log.info("POLICY %s", format_policy_summary(pol))
+                return {
                     "loaded": True,
                     "name": getattr(pol, "name", None),
                     "asof": getattr(pol, "asof", None),
                     "path": getattr(pol, "path", None),
                 }
-                policy = pol
-                # nice one-liner for logs
-                log.info("POLICY %s", format_policy_summary(pol))
-                return out
             except Exception as e:
-                # policy is advisory; never fail the run because of it
+                policy = None  # <-- add this too (be conservative)
                 log.warning("policy_load failed: %s: %s", type(e).__name__, e)
                 return {"loaded": False, "error": f"{type(e).__name__}: {e}"}
 
