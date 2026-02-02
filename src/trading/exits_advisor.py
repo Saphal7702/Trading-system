@@ -6,6 +6,110 @@ import os
 
 from .db import connect
 
+def _format_policy_exit_annotation(
+    policy: Any | None,
+    *,
+    entry_key: str | None,
+    exit_key: str | None,
+    max_best: int = 3,
+) -> str:
+    """Return a compact policy note for an exit decision (advisory only)."""
+    if not policy or not entry_key or not exit_key:
+        return ""
+
+    try:
+        pol_asof = getattr(policy, "asof", None)
+
+        # Exit-level recommendation (may be missing if exit_key isn't in policy.exit_policy)
+        rec = None
+        score = None
+        tr = None
+        er = policy.exit_rec(exit_key) if hasattr(policy, "exit_rec") else None
+        if isinstance(er, dict):
+            rec = er.get("rec")
+            score = er.get("score")
+            tr = er.get("trades")
+
+        # Best exits for this entry (combo intelligence)
+        # Filter to only "positive" exits (score > 0 if present, else avg_ret_pct > 0).
+        best = policy.best_exits(entry_key) if hasattr(policy, "best_exits") else []
+        best_pos: list[tuple[str, float | None]] = []  # (exit_key, score)
+
+        if isinstance(best, list):
+            for x in best:
+                if not isinstance(x, dict):
+                    continue
+                k = x.get("exit_key")
+                if not k:
+                    continue
+                k = str(k)
+
+                sc = x.get("score")
+                sc_f = None
+                try:
+                    sc_f = float(sc) if sc is not None else None
+                except Exception:
+                    sc_f = None
+
+                # positivity rule
+                pos = False
+                if sc_f is not None:
+                    pos = sc_f > 0
+                else:
+                    # fallback if score missing
+                    ar = x.get("avg_ret_pct")
+                    try:
+                        pos = float(ar) > 0
+                    except Exception:
+                        pos = False
+
+                if pos:
+                    best_pos.append((k, sc_f))
+
+        # sort best positives by score (None last)
+        best_pos.sort(key=lambda t: (t[1] is None, -(t[1] or 0.0)))
+        best_keys = [k for (k, _) in best_pos][:max_best]
+
+        # rank of current exit among positive best exits
+        rank = None
+        for idx, k in enumerate(best_keys):
+            if k == str(exit_key):
+                rank = idx + 1
+                break
+
+        parts: list[str] = []
+        if pol_asof:
+            parts.append(f"pol_asof={pol_asof}")
+
+        if rec is not None:
+            parts.append(f"policy_exit={rec}")
+        else:
+            # exit_key not present in policy.exit_policy
+            parts.append("policy_exit=unscored")
+
+        if score is not None:
+            try:
+                parts.append(f"score={float(score):+.2f}")
+            except Exception:
+                pass
+        if tr is not None:
+            try:
+                parts.append(f"tr={int(tr)}")
+            except Exception:
+                pass
+
+        if best_keys:
+            parts.append(f"best=[{','.join(best_keys)}]")
+            if rank is not None:
+                parts.append(f"best_rank={rank}/{len(best_keys)}")
+        else:
+            parts.append("best=[none]")
+
+        return " ".join(parts)
+    except Exception:
+        return ""
+
+
 @dataclass(frozen=True)
 class ExitRuleConfig:
     # Hard stop loss
@@ -370,7 +474,9 @@ def emit_sell_intents(
     asof: str | None = None,
     cfg: ExitRuleConfig | None = None,
     dry_run: bool = False,
+    policy: Any | None = None,
 ) -> dict[str, Any]:
+
     cfg = cfg or exit_rule_config_from_env()
     rows = evaluate_exit_advice(asof=asof, cfg=cfg)
     sell_rows = [r for r in rows if r["action"] == "SELL"]
@@ -403,39 +509,36 @@ def emit_sell_intents(
         for r in sell_rows:
             symbol = r["symbol"]
             signal_key = r["exit_signal_key"]
+
             reason = f"{signal_key}: {r['rationale']}"
-            strength = float(r["priority"])
 
-            exists = conn.execute(
-                """
-                SELECT 1
-                FROM intents
-                WHERE run_id = ?
-                  AND symbol = ?
-                  AND action = 'sell'
-                  AND signal_key = ?
-                LIMIT 1;
-                """,
-                (run_id, symbol, signal_key),
-            ).fetchone()
-
-            if exists:
-                skipped += 1
-                continue
-
-            would_insert += 1
-
-            if dry_run:
-                continue
-
-            conn.execute(
-                """
-                INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
-                VALUES (?, ?, 'sell', ?, ?, ?);
-                """,
-                (run_id, symbol, strength, reason, signal_key),
+            # ---- policy advisory annotation (read-only) ----
+            note = _format_policy_exit_annotation(
+                policy,
+                entry_key=r.get("entry_signal_key"),
+                exit_key=r.get("exit_signal_key"),
             )
-            inserted += 1
+            if note:
+                reason = f"{reason} | {note}"
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
+                    VALUES (?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        run_id,
+                        symbol,
+                        "sell",
+                        None,
+                        reason,
+                        signal_key,
+                    ),
+                )
+                inserted += 1
+            except Exception:
+                skipped_existing += 1
 
         summary["inserted"] = inserted
         summary["would_insert"] = would_insert

@@ -10,7 +10,7 @@ from .universe_watchlist import load_watchlist_csv
 from .runloop import run_once
 from trading.broker.alpaca_broker import AlpacaPaperBroker
 from trading.broker.sync import upsert_account, sync_positions
-from .exits_advisor import evaluate_exit_advice, ExitRuleConfig, emit_sell_intents, exit_rule_config_from_env
+from .exits_advisor import evaluate_exit_advice, ExitRuleConfig, emit_sell_intents, exit_rule_config_from_env,_format_policy_exit_annotation
 from trading.analytics.mfe_mae import compute_excursions_for_closings
 from collections import defaultdict
 from trading.policy.loader import load_latest_policy
@@ -143,18 +143,37 @@ def cmd_plan(fast: int, slow: int, universe: str = "sp500") -> int:
             log.info("SELL %s | strength=%s | %s", i.symbol, i.strength, i.reason)
         for i in buys:
             tn = getattr(i, "target_notional", None)
-            extra = ""
-            rn = getattr(i, "policy_reco_notional", None)
-            if rn is not None and getattr(i, "policy_mult", None) is not None:
-                # show enforceability + skip-only if enforceable
-                enf = "enf" if getattr(i, "policy_enforceable", False) else "soft"
-                extra += f" | reco=${rn:.2f} ({enf})"
-                if getattr(i, "policy_would_skip", False):
-                    extra += " WOULD_SKIP"
 
+            # --- policy overlay (advisory only) ---
+            extra_parts: list[str] = []
+
+            policy_rec = getattr(i, "policy_rec", None)
+            if policy_rec:
+                extra_parts.append(f"policy={policy_rec}")
+
+                policy_score = getattr(i, "policy_score", None)
+                if policy_score is not None:
+                    extra_parts.append(f"score={policy_score:+.2f}")
+
+                policy_trades = getattr(i, "policy_trades", None)
+                if policy_trades is not None:
+                    extra_parts.append(f"tr={policy_trades}")
+
+                policy_reco_notional = getattr(i, "policy_reco_notional", None)
+                if policy_reco_notional is not None:
+                    enf = "enf" if getattr(i, "policy_enforceable", False) else "soft"
+                    extra_parts.append(f"reco=${policy_reco_notional:.2f}({enf})")
+
+                policy_best = getattr(i, "policy_best_exits", None)
+                if policy_best:
+                    extra_parts.append(f"best=[{policy_best}]")
+
+            extra = f" | {' '.join(extra_parts)}" if extra_parts else ""
+
+            # --- final log ---
             if tn is not None:
                 log.info(
-                    "BUY  %s | strength=%s | $%s | %s%s",
+                    "BUY  %s | strength=%s | $%.2f | %s%s",
                     i.symbol,
                     i.strength,
                     tn,
@@ -169,6 +188,7 @@ def cmd_plan(fast: int, slow: int, universe: str = "sp500") -> int:
                     i.reason,
                     extra,
                 )
+
 
         finish_run(run_id, status="success")
         return 0
@@ -1528,6 +1548,12 @@ def main() -> int:
         if not rows:
             log.info("EXITS: none (no open lots)")
             return 0
+        
+        policy = None
+        try:
+            policy = load_latest_policy(policies_dir="policies")
+        except Exception:
+            policy = None
 
         log.info(
             "EXITS (advisor) asof=%s rows=%s | stop_loss=%.2f%% trail=(peak>=%.2f%% dd<=-%.2f%%) "
@@ -1544,23 +1570,78 @@ def main() -> int:
         )
 
         for r in rows:
+            note = _format_policy_exit_annotation(
+                policy,
+                entry_key=r.get("entry_signal_key"),
+                exit_key=r.get("exit_signal_key"),
+            )
+
+            rationale = r.get("rationale") or ""
+            if note:
+                rationale = f"{rationale} | {note}"
+
+            # exact fields from your exit rows
+            qty = r.get("qty_open")
+            uret = r.get("unrealized_ret_pct")  # percent, already
+            upnl = r.get("unrealized_pnl")
+
+            hold = r.get("holding_days")
+            dd = r.get("drawdown_from_peak_pct")
+            peak = r.get("peak_gain_pct")
+
+            vwap = r.get("vwap_entry")
+            last = r.get("last_close")
+
+            def _f(v, default=None):
+                try:
+                    return float(v)
+                except Exception:
+                    return default
+
+            def _i(v, default=None):
+                try:
+                    return int(v)
+                except Exception:
+                    return default
+
+            qty_f = _f(qty)
+            uret_f = _f(uret)
+            upnl_f = _f(upnl)
+            dd_f = _f(dd)
+            peak_f = _f(peak)
+            vwap_f = _f(vwap)
+            last_f = _f(last)
+            hold_i = _i(hold)
+
+            qty_s  = f"{qty_f:8.4f}" if qty_f is not None else "     n/a"
+            uret_s = f"{uret_f:+7.2f}%" if uret_f is not None else "   n/a "
+            upnl_s = f"{upnl_f:+9.2f}" if upnl_f is not None else "     n/a"
+            dd_s   = f"{dd_f:+7.2f}%" if dd_f is not None else "   n/a "
+            peak_s = f"{peak_f:+7.2f}%" if peak_f is not None else "   n/a "
+            hold_s = f"{hold_i:3d}d" if hold_i is not None else " n/a"
+
+            vwap_s = f"{vwap_f:8.2f}" if vwap_f is not None else "     n/a"
+            last_s = f"{last_f:8.2f}" if last_f is not None else "     n/a"
+
             log.info(
-                "%-5s entry=%-22s action=%-5s prio=%3s ret=%+6.2f%% pnl=%+7.2f days=%2s peak=%+6.2f%% dd=%+6.2f%% | %s | %s",
-                r["symbol"],
-                r.get("entry_signal_key", "unknown"),
-                r["action"],
-                r["priority"],
-                r["unrealized_ret_pct"],
-                (r["unrealized_pnl"] or 0.0),
-                r["holding_days"],
-                r["peak_gain_pct"],
-                r["drawdown_from_peak_pct"],
-                r["exit_signal_key"],
-                r["rationale"],
+                "EXIT  entry=%-26s sym=%-6s qty=%s uret=%s upnl=%s hold=%s dd=%s peak=%s "
+                "vwap=%s last=%s exit=%-28s %s",
+                r.get("entry_signal_key", ""),
+                r.get("symbol", ""),
+                qty_s,
+                uret_s,
+                upnl_s,
+                hold_s,
+                dd_s,
+                peak_s,
+                vwap_s,
+                last_s,
+                r.get("exit_signal_key", ""),
+                rationale,
             )
 
         if args.emit_intents:
-                summary = emit_sell_intents(asof=args.asof, cfg=cfg, dry_run=args.dry_run)
+                summary = emit_sell_intents(asof=args.asof, cfg=cfg, dry_run=args.dry_run, policy=policy)
                 if args.dry_run:
                     log.info(
                         "EXITS emit-intents (dry-run): run_id=%s asof=%s | advisor_rows=%s sell_rows=%s | would_insert=%s skipped_existing=%s",

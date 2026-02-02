@@ -31,6 +31,17 @@ class Intent:
     policy_reco_notional: float | None = None
     policy_would_skip: bool = False
 
+    policy_rec: str | None = None
+    policy_score: float | None = None
+    policy_asof: str | None = None
+    policy_best_exits: str | None = None
+
+    policy_trades: int | None = None
+    policy_enforceable: bool = False
+    policy_mult: float | None = None
+    policy_reco_notional: float | None = None
+    policy_would_skip: bool = False
+
 
 def _norm_sym(sym: str | None) -> str:
     return (sym or "").strip().upper()
@@ -135,7 +146,7 @@ def plan_intents(
     max_positions: int | None = None,
     per_position_notional: float | None = None,
     cash_buffer: float | None = None,
-    policy=None,  # Phase 5: optional policy snapshot (read-only)
+    policy=None,  # PolicySnapshot | None (kept untyped to avoid import coupling)
 ) -> list[Intent]:
     """
     Planner enforces:
@@ -159,9 +170,27 @@ def plan_intents(
     cash_buffer = cash_buffer if cash_buffer is not None else _env_float("TRADING_CASH_BUFFER", 25.0)
 
     # Policy sizing knobs
-    pol_min_trades = _env_int("TRADING_POLICY_MIN_TRADES_ENFORCE", 20)
+    pol_min_trades_env = _env_int("TRADING_POLICY_MIN_TRADES_ENFORCE", 20)
     pol_boost_mult = _env_float("TRADING_POLICY_BOOST_MULT", 1.25)
     pol_reduce_mult = _env_float("TRADING_POLICY_REDUCE_MULT", 0.50)
+
+    def _policy_enforce_threshold() -> int:
+        """
+        Use stricter of:
+          - env enforcement threshold
+          - policy snapshot's own meta.min_entry_trades (what generated it)
+        """
+        thr = pol_min_trades_env
+        try:
+            if policy and isinstance(getattr(policy, "meta", None), dict):
+                v = policy.meta.get("min_entry_trades")
+                if v is not None:
+                    thr = max(thr, int(v))
+        except Exception:
+            pass
+        return thr
+
+    enforce_thr = _policy_enforce_threshold()
 
     assumed_bp = _env_float("TRADING_ASSUMED_BP", 0.0)
     buying_power = _get_buying_power_fallback(default=assumed_bp)
@@ -205,11 +234,11 @@ def plan_intents(
             return (None, None, None, None)
         
     def _policy_sizing_for_entry(entry_key: str | None, base_notional: float | None) -> dict:
-        """
-        Advisory only. Returns:
-          policy_trades, policy_enforceable, policy_mult, policy_reco_notional, policy_would_skip
-        """
         out = {
+            "policy_rec": None,
+            "policy_score": None,
+            "policy_asof": None,
+            "policy_best_exits": None,
             "policy_trades": None,
             "policy_enforceable": False,
             "policy_mult": None,
@@ -221,22 +250,20 @@ def plan_intents(
             return out
 
         try:
-            rec_row = policy.entry_rec(entry_key) if hasattr(policy, "entry_rec") else None
-            if not isinstance(rec_row, dict):
+            row = policy.entry_rec(entry_key)
+            if not isinstance(row, dict):
                 return out
 
-            rec = rec_row.get("rec")
-            # handle either "trades" or "tr" depending on payload
-            trades_raw = rec_row.get("trades", rec_row.get("tr"))
+            rec = row.get("rec")
+            score = row.get("score")
+            trades_raw = row.get("trades")
             trades = int(trades_raw) if trades_raw is not None else None
 
-            enforceable = bool(trades is not None and trades >= pol_min_trades)
+            enforceable = bool(trades is not None and trades >= enforce_thr)
 
-            mult = None
+            mult = 1.0
             would_skip = False
 
-            # We only "trust" the recommendation once enforceable is True,
-            # but we still compute the advisory numbers either way.
             if rec == "BOOST":
                 mult = pol_boost_mult
             elif rec == "REDUCE":
@@ -244,22 +271,33 @@ def plan_intents(
             elif rec == "DISABLE":
                 mult = 0.0
                 would_skip = True
-            else:
-                mult = 1.0
 
-            reco_notional = base_notional * float(mult)
+            reco_notional = float(base_notional) * float(mult)
+
+            best = []
+            try:
+                for x in policy.best_exits(entry_key)[:3]:
+                    ek = x.get("exit_key")
+                    if ek:
+                        best.append(str(ek))
+            except Exception:
+                pass
 
             out.update({
+                "policy_rec": str(rec) if rec is not None else None,
+                "policy_score": float(score) if score is not None else None,
+                "policy_asof": getattr(policy, "asof", None),
+                "policy_best_exits": ", ".join(best) if best else None,
                 "policy_trades": trades,
                 "policy_enforceable": enforceable,
                 "policy_mult": float(mult),
                 "policy_reco_notional": float(reco_notional),
-                # only consider skip meaningful when enforceable
                 "policy_would_skip": bool(would_skip and enforceable),
             })
             return out
         except Exception:
             return out
+
 
     # 1) Process SELL/HOLD decisions; collect BUY candidates
     for sig in signals:
@@ -324,29 +362,8 @@ def plan_intents(
         if idx < n_buys_allowed:
             entry_key = _signal_key_for("buy", sig.reason)
 
-            # --- policy overlay (if you added this earlier) ---
-            pol_rec = pol_score = pol_asof = pol_best = None
-            if policy and entry_key:
-                try:
-                    rec_row = policy.entry_rec(entry_key) if hasattr(policy, "entry_rec") else None
-                    if isinstance(rec_row, dict):
-                        pol_rec = rec_row.get("rec")
-                        pol_score = rec_row.get("score")
-                    pol_asof = getattr(policy, "asof", None)
-
-                    best = []
-                    if hasattr(policy, "best_exits"):
-                        xs = policy.best_exits(entry_key) or []
-                        for x in xs:
-                            k = x.get("exit_key")
-                            if k:
-                                best.append(str(k))
-                    pol_best = ", ".join(best) if best else None
-                except Exception:
-                    pass
-
-            # --- advisory sizing ---
-            sizing = _policy_sizing_for_entry(entry_key, per_position_notional)
+            # Single policy call (contains overlay + sizing)
+            pol = _policy_sizing_for_entry(entry_key, per_position_notional)
 
             intents.append(
                 Intent(
@@ -356,15 +373,19 @@ def plan_intents(
                     sig.strength,
                     target_notional=per_position_notional,
                     signal_key=entry_key,
-                    policy_rec=(str(pol_rec) if pol_rec is not None else None),
-                    policy_score=(float(pol_score) if pol_score is not None else None),
-                    policy_asof=(str(pol_asof) if pol_asof is not None else None),
-                    policy_best_exits=pol_best,
-                    policy_trades=sizing["policy_trades"],
-                    policy_enforceable=bool(sizing["policy_enforceable"]),
-                    policy_mult=sizing["policy_mult"],
-                    policy_reco_notional=sizing["policy_reco_notional"],
-                    policy_would_skip=bool(sizing["policy_would_skip"]),
+
+                    # policy overlay
+                    policy_rec=pol.get("policy_rec"),
+                    policy_score=pol.get("policy_score"),
+                    policy_asof=pol.get("policy_asof"),
+                    policy_best_exits=pol.get("policy_best_exits"),
+
+                    # advisory sizing
+                    policy_trades=pol.get("policy_trades"),
+                    policy_enforceable=bool(pol.get("policy_enforceable", False)),
+                    policy_mult=pol.get("policy_mult"),
+                    policy_reco_notional=pol.get("policy_reco_notional"),
+                    policy_would_skip=bool(pol.get("policy_would_skip", False)),
                 )
             )
 
