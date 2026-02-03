@@ -200,24 +200,83 @@ def cmd_plan(fast: int, slow: int, universe: str = "sp500") -> int:
 
 def cmd_show_intents(run_id: int) -> int:
     from .db import connect
+    import sqlite3
+
     with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT symbol, action, strength, reason, created_at
-            FROM intents
-            WHERE run_id = ?
-            ORDER BY action DESC, symbol ASC;
-            """,
-            (run_id,),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                  symbol, action, strength, reason, created_at,
+                  target_notional,
+                  policy_asof, policy_rec, policy_score, policy_trades,
+                  policy_reco_notional, policy_best_exits
+                FROM intents
+                WHERE run_id = ?
+                ORDER BY action DESC, symbol ASC;
+                """,
+                (run_id,),
+            ).fetchall()
+            has_policy = True
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                """
+                SELECT symbol, action, strength, reason, created_at
+                FROM intents
+                WHERE run_id = ?
+                ORDER BY action DESC, symbol ASC;
+                """,
+                (run_id,),
+            ).fetchall()
+            has_policy = False
 
     if not rows:
         log.info("No intents found for run_id=%s", run_id)
         return 0
 
+    # Helper to safely read from sqlite3.Row
+    def _col(r: sqlite3.Row, name: str, default=None):
+        try:
+            return r[name]
+        except Exception:
+            return default
+
     for r in rows:
-        log.info("%s %s | strength=%s | %s", r["action"].upper().ljust(4), r["symbol"], r["strength"], r["reason"])
+        action = str(_col(r, "action", "") or "").upper().ljust(4)
+        symbol = _col(r, "symbol", "")
+        strength = _col(r, "strength", None)
+        reason = _col(r, "reason", "")
+
+        base = f"{action} {symbol} | strength={strength} | {reason}"
+
+        if has_policy:
+            policy_rec = _col(r, "policy_rec", None)
+            if policy_rec:
+                extra = f" | pol_asof={_col(r, 'policy_asof', '')} policy={policy_rec}"
+
+                policy_score = _col(r, "policy_score", None)
+                if policy_score is not None:
+                    extra += f" score={float(policy_score):+.2f}"
+
+                policy_trades = _col(r, "policy_trades", None)
+                if policy_trades is not None:
+                    extra += f" tr={int(policy_trades)}"
+
+                reco = _col(r, "policy_reco_notional", None)
+                if reco is not None:
+                    extra += f" reco=${float(reco):.2f}"
+
+                best = _col(r, "policy_best_exits", None)
+                if best:
+                    extra += f" best=[{best}]"
+
+                log.info("%s%s", base, extra)
+                continue
+
+        log.info("%s", base)
+
     return 0
+
 
 def cmd_explain(symbol: str, fast: int, slow: int) -> int:
     from .explain import explain_symbol

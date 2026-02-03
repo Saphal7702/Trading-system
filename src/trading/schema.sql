@@ -39,7 +39,11 @@ CREATE TABLE IF NOT EXISTS runs (
   notes TEXT,
   asof_date TEXT,
   reason TEXT,
-  summary_json TEXT
+  summary_json TEXT,
+  policy_path TEXT,
+  policy_asof TEXT,
+  policy_loaded INTEGER DEFAULT 0,
+  policy_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS broker_accounts (
@@ -84,7 +88,18 @@ CREATE TABLE IF NOT EXISTS intents (
   strength REAL,
   reason TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  COLUMN signal_key TEXT
+  COLUMN signal_key TEXT,
+  COLUMN target_notional REAL,
+  COLUMN policy_path TEXT,
+  COLUMN policy_asof TEXT,
+  COLUMN policy_rec TEXT,
+  COLUMN policy_score REAL,
+  COLUMN policy_trades INTEGER,
+  COLUMN policy_enforceable INTEGER,      -- 0/1
+  COLUMN policy_mult REAL,
+  COLUMN policy_reco_notional REAL,
+  COLUMN policy_would_skip INTEGER,       -- 0/1
+  COLUMN policy_best_exits TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency

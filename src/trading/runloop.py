@@ -206,23 +206,50 @@ def run_once(
         def _policy_load() -> dict:
             nonlocal policy
             try:
-                pol = load_latest_policy()
+                pol = load_latest_policy()  # loader reads from /policies
                 if not pol:
-                    policy = None  # <-- add this
+                    with connect() as conn:
+                        conn.execute(
+                            "UPDATE runs SET policy_loaded=0 WHERE id=?;",
+                            (run_id,),
+                        )
                     return {"loaded": False}
 
                 policy = pol
-                log.info("POLICY %s", format_policy_summary(pol))
-                return {
+                out = {
                     "loaded": True,
                     "name": getattr(pol, "name", None),
                     "asof": getattr(pol, "asof", None),
                     "path": getattr(pol, "path", None),
                 }
+
+                with connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE runs
+                        SET policy_loaded=1, policy_asof=?, policy_path=?, policy_error=NULL
+                        WHERE id=?;
+                        """,
+                        (out["asof"], out["path"], run_id),
+                    )
+
+                log.info("POLICY %s", format_policy_summary(pol))
+                return out
+
             except Exception as e:
-                policy = None  # <-- add this too (be conservative)
-                log.warning("policy_load failed: %s: %s", type(e).__name__, e)
-                return {"loaded": False, "error": f"{type(e).__name__}: {e}"}
+                msg = f"{type(e).__name__}: {e}"
+                with connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE runs
+                        SET policy_loaded=0, policy_error=?
+                        WHERE id=?;
+                        """,
+                        (msg, run_id),
+                    )
+                log.warning("policy_load failed: %s", msg)
+                return {"loaded": False, "error": msg}
+
 
         step("policy_load", _policy_load)
 
