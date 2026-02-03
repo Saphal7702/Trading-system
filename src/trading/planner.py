@@ -19,23 +19,13 @@ class Intent:
     signal_key: str | None = None
 
     # Phase 5 (read-only): policy overlay
+    policy_path: str | None = None
+    policy_asof: str | None = None
     policy_rec: str | None = None
     policy_score: float | None = None
-    policy_asof: str | None = None
     policy_best_exits: str | None = None
 
-    # Phase 5 (advisory): policy-aware sizing recommendation (NOT enforced)
-    policy_trades: int | None = None
-    policy_enforceable: bool = False
-    policy_mult: float | None = None
-    policy_reco_notional: float | None = None
-    policy_would_skip: bool = False
-
-    policy_rec: str | None = None
-    policy_score: float | None = None
-    policy_asof: str | None = None
-    policy_best_exits: str | None = None
-
+    # Phase 5 (advisory): sizing recommendation (NOT enforced)
     policy_trades: int | None = None
     policy_enforceable: bool = False
     policy_mult: float | None = None
@@ -408,15 +398,61 @@ def plan_intents(
 
 
 def save_intents(run_id: int, intents: list[Intent]) -> int:
-    with connect() as conn:
-        conn.executemany(
-            """
-            INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
-            VALUES (?, ?, ?, ?, ?, ?);
-            """,
-            [
-                (run_id, _norm_sym(i.symbol), i.action, i.strength, i.reason, i.signal_key)
-                for i in intents
-            ],
+    """
+    Persist intents. If policy columns don't exist yet, fall back to the old insert
+    (so we don't brick older DBs).
+    """
+    import sqlite3
+
+    rows_new = [
+        (
+            run_id,
+            _norm_sym(i.symbol),
+            i.action,
+            i.strength,
+            i.reason,
+            i.signal_key,
+            i.target_notional,
+            i.policy_path,
+            i.policy_asof,
+            i.policy_rec,
+            i.policy_score,
+            i.policy_trades,
+            1 if getattr(i, "policy_enforceable", False) else 0,
+            i.policy_mult,
+            i.policy_reco_notional,
+            1 if getattr(i, "policy_would_skip", False) else 0,
+            i.policy_best_exits,
         )
+        for i in intents
+    ]
+
+    with connect() as conn:
+        try:
+            conn.executemany(
+                """
+                INSERT INTO intents(
+                    run_id, symbol, action, strength, reason, signal_key,
+                    target_notional,
+                    policy_path, policy_asof, policy_rec, policy_score, policy_trades,
+                    policy_enforceable, policy_mult, policy_reco_notional,
+                    policy_would_skip, policy_best_exits
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                rows_new,
+            )
+        except sqlite3.OperationalError:
+            # Old schema: only the original columns
+            conn.executemany(
+                """
+                INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                [
+                    (run_id, _norm_sym(i.symbol), i.action, i.strength, i.reason, i.signal_key)
+                    for i in intents
+                ],
+            )
+
     return len(intents)
