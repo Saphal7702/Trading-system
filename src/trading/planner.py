@@ -32,6 +32,13 @@ class Intent:
     policy_reco_notional: float | None = None
     policy_would_skip: bool = False
 
+    # Phase 6: policy utilization (still safe by default)
+    policy_mode: str | None = None              # off|reduce_only|allow_boost
+    base_rank: float | None = None              # signal-only rank (usually strength)
+    policy_rank_adj: float | None = None        # +/- adjustment from policy
+    final_rank: float | None = None             # base_rank + policy_rank_adj
+    base_notional: float | None = None          # planner base sizing (pre-policy)
+    effective_notional: float | None = None     # what we actually intend to execute
 
 def _norm_sym(sym: str | None) -> str:
     return (sym or "").strip().upper()
@@ -160,9 +167,29 @@ def plan_intents(
     cash_buffer = cash_buffer if cash_buffer is not None else _env_float("TRADING_CASH_BUFFER", 25.0)
 
     # Policy sizing knobs
+    # Policy utilization knobs 
+    # Defaults are conservative: reduce_only means policy can only reduce risk.
+    policy_mode = os.getenv("TRADING_POLICY_MODE", "reduce_only").strip().lower()
+    if policy_mode not in ("off", "reduce_only", "allow_boost"):
+        policy_mode = "reduce_only"
+
+    # Phase 5 sizing knobs (kept for backward compatibility)
     pol_min_trades_env = _env_int("TRADING_POLICY_MIN_TRADES_ENFORCE", 20)
-    pol_boost_mult = _env_float("TRADING_POLICY_BOOST_MULT", 1.25)
-    pol_reduce_mult = _env_float("TRADING_POLICY_REDUCE_MULT", 0.50)
+    pol_boost_mult_env = _env_float("TRADING_POLICY_BOOST_MULT", 1.25)
+    pol_reduce_mult_env = _env_float("TRADING_POLICY_REDUCE_MULT", 0.50)
+
+    # Phase 6 clamps + ranking knobs
+    pol_max_mult = _env_float("TRADING_POLICY_MAX_MULT", 1.25)
+    pol_min_mult = _env_float("TRADING_POLICY_MIN_MULT", 0.50)
+
+    pol_min_trades_boost = _env_int("TRADING_POLICY_MIN_TRADES_BOOST", 30)
+    pol_min_score_boost = _env_float("TRADING_POLICY_MIN_SCORE_BOOST", 0.55)
+    pol_reduce_rank_penalty = _env_float("TRADING_POLICY_REDUCE_RANK_PENALTY", 0.15)
+    pol_boost_rank_bonus = _env_float("TRADING_POLICY_BOOST_RANK_BONUS", 0.10)
+
+    # Clamp multipliers so policy cannot silently explode sizing.
+    pol_boost_mult = min(float(pol_boost_mult_env), float(pol_max_mult))
+    pol_reduce_mult = max(float(pol_reduce_mult_env), float(pol_min_mult))
 
     def _policy_enforce_threshold() -> int:
         """
@@ -337,57 +364,180 @@ def plan_intents(
         else:
             intents.append(Intent(sym, "hold", sig.reason, sig.strength))
 
-    # 2) Budget-aware BUY selection
-    buy_candidates.sort(key=lambda x: float(x.strength or 0.0), reverse=True)
+    # 2) Policy-aware BUY ranking + budget-aware selection (Phase 6)
+    # Base affordability still uses spendable cash, but we select buys using effective_notional
+    # so allow_boost cannot accidentally overspend.
+    def _boost_gate(trades: int | None, score: float | None) -> bool:
+        if trades is None or trades < pol_min_trades_boost:
+            return False
+        if score is None:
+            return False
+        try:
+            return float(score) >= float(pol_min_score_boost)
+        except Exception:
+            return False
+
+    enriched: list[dict] = []
+    for sig in buy_candidates:
+        sym = _norm_sym(sig.symbol)
+        entry_key = _signal_key_for("buy", sig.reason)
+
+        base_rank = float(sig.strength or 0.0)
+        base_notional = float(per_position_notional)
+
+        pol = _policy_sizing_for_entry(entry_key, base_notional)
+
+        rec = pol.get("policy_rec")
+        score = pol.get("policy_score")
+        trades = pol.get("policy_trades")
+        enforceable = bool(pol.get("policy_enforceable", False))
+
+        # Rank adjustment (conservative)
+        policy_rank_adj = 0.0
+        if policy_mode != "off" and enforceable:
+            if rec == "REDUCE":
+                policy_rank_adj = -abs(float(pol_reduce_rank_penalty))
+            elif rec == "BOOST" and policy_mode == "allow_boost" and _boost_gate(trades, score):
+                policy_rank_adj = abs(float(pol_boost_rank_bonus))
+
+        final_rank = base_rank + policy_rank_adj
+
+        # Effective sizing (safe by default)
+        suggested = pol.get("policy_reco_notional")
+        try:
+            suggested = float(suggested) if suggested is not None else base_notional
+        except Exception:
+            suggested = base_notional
+
+        effective = base_notional
+        if policy_mode != "off" and enforceable:
+            if policy_mode == "reduce_only":
+                effective = min(base_notional, suggested)
+            else:  # allow_boost
+                if suggested <= base_notional:
+                    effective = suggested
+                else:
+                    # only allow increases if BOOST passes gate
+                    if rec == "BOOST" and _boost_gate(trades, score):
+                        effective = suggested
+                    else:
+                        effective = base_notional
+
+        # Hard clamps (planner-side; execution still enforces its own caps)
+        min_eff = float(base_notional) * float(pol_min_mult)
+        max_eff = float(base_notional) * float(pol_max_mult)
+        effective = max(min_eff, min(max_eff, float(effective)))
+
+        enriched.append(
+            {
+                "sig": sig,
+                "sym": sym,
+                "entry_key": entry_key,
+                "pol": pol,
+                "base_rank": base_rank,
+                "policy_rank_adj": policy_rank_adj,
+                "final_rank": final_rank,
+                "base_notional": base_notional,
+                "effective_notional": effective,
+            }
+        )
+
+    # Sort by final_rank (policy-aware); tie-break by base_rank then symbol
+    enriched.sort(key=lambda x: (float(x["final_rank"]), float(x["base_rank"]), x["sym"]), reverse=True)
 
     slots_left = max(0, max_positions - held_count)
-
     spendable = max(0.0, buying_power - cash_buffer)
-    n_afford = int(spendable // per_position_notional) if per_position_notional > 0 else 0
-    n_buys_allowed = max(0, min(slots_left, n_afford))
 
-    for idx, sig in enumerate(buy_candidates):
-        sym = _norm_sym(sig.symbol)
+    remaining_slots = int(slots_left)
+    remaining_cash = float(spendable)
 
-        if idx < n_buys_allowed:
-            entry_key = _signal_key_for("buy", sig.reason)
+    picked: set[str] = set()
 
-            # Single policy call (contains overlay + sizing)
-            pol = _policy_sizing_for_entry(entry_key, per_position_notional)
+    for item in enriched:
+        sig = item["sig"]
+        sym = item["sym"]
+        eff = float(item["effective_notional"])
 
+        if remaining_slots <= 0:
+            continue
+
+        if eff <= 0:
+            continue
+
+        if remaining_cash < eff:
+            continue
+
+        # Pick this BUY
+        picked.add(sym)
+        remaining_slots -= 1
+        remaining_cash -= eff
+
+        pol = item["pol"]
+
+        intents.append(
+            Intent(
+                sym,
+                "buy",
+                sig.reason,
+                sig.strength,
+                target_notional=float(eff),  # Phase 6: utilization (execution uses this)
+                signal_key=item["entry_key"],
+
+                # policy overlay
+                policy_rec=pol.get("policy_rec"),
+                policy_score=pol.get("policy_score"),
+                policy_asof=pol.get("policy_asof"),
+                policy_best_exits=pol.get("policy_best_exits"),
+
+                # advisory sizing
+                policy_trades=pol.get("policy_trades"),
+                policy_enforceable=bool(pol.get("policy_enforceable", False)),
+                policy_mult=pol.get("policy_mult"),
+                policy_reco_notional=pol.get("policy_reco_notional"),
+                policy_would_skip=bool(pol.get("policy_would_skip", False)),
+
+                # phase 6 decision fields
+                policy_mode=policy_mode,
+                base_rank=float(item["base_rank"]),
+                policy_rank_adj=float(item["policy_rank_adj"]),
+                final_rank=float(item["final_rank"]),
+                base_notional=float(item["base_notional"]),
+                effective_notional=float(item["effective_notional"]),
+            )
+        )
+
+    # Emit HOLD intents for buys that were not picked, with explainable reasons
+    for item in enriched:
+        sig = item["sig"]
+        sym = item["sym"]
+        eff = float(item["effective_notional"])
+
+        if sym in picked:
+            continue
+
+        if slots_left <= 0:
+            intents.append(Intent(sym, "hold", f"Max positions reached ({max_positions}); skip buy", sig.strength))
+            continue
+
+        # Determine if it was cash-limited or rank-limited
+        # Note: remaining_cash/slots are after picks, so we use spendable/slots_left for messaging.
+        if spendable <= 0:
             intents.append(
                 Intent(
                     sym,
-                    "buy",
-                    sig.reason,
+                    "hold",
+                    f"Insufficient buying power (buffer ${cash_buffer:.2f}); skip buy",
                     sig.strength,
-                    target_notional=per_position_notional,
-                    signal_key=entry_key,
-
-                    # policy overlay
-                    policy_rec=pol.get("policy_rec"),
-                    policy_score=pol.get("policy_score"),
-                    policy_asof=pol.get("policy_asof"),
-                    policy_best_exits=pol.get("policy_best_exits"),
-
-                    # advisory sizing
-                    policy_trades=pol.get("policy_trades"),
-                    policy_enforceable=bool(pol.get("policy_enforceable", False)),
-                    policy_mult=pol.get("policy_mult"),
-                    policy_reco_notional=pol.get("policy_reco_notional"),
-                    policy_would_skip=bool(pol.get("policy_would_skip", False)),
                 )
             )
-
         else:
-            if slots_left <= 0:
-                intents.append(Intent(sym, "hold", f"Max positions reached ({max_positions}); skip buy", sig.strength))
-            elif n_afford <= 0:
+            # If eff itself exceeds spendable, it's definitely cash limited; otherwise it lost ranking.
+            if eff > spendable:
                 intents.append(
                     Intent(
                         sym,
                         "hold",
-                        f"Insufficient buying power for ${per_position_notional:.2f} (buffer ${cash_buffer:.2f}); skip buy",
+                        f"Insufficient buying power for ${eff:.2f} (buffer ${cash_buffer:.2f}); skip buy",
                         sig.strength,
                     )
                 )
@@ -399,12 +549,53 @@ def plan_intents(
 
 def save_intents(run_id: int, intents: list[Intent]) -> int:
     """
-    Persist intents. If policy columns don't exist yet, fall back to the old insert
-    (so we don't brick older DBs).
+    Persist intents.
+
+    We support three DB generations:
+      - Phase 1: base intent columns only
+      - Phase 5: policy overlay columns
+      - Phase 6: policy utilization columns (rank + effective sizing)
+
+    Insert falls back gracefully so older DBs don't brick.
     """
     import sqlite3
 
-    rows_new = [
+    # Newest schema (Phase 6)
+    rows_p6 = [
+        (
+            run_id,
+            _norm_sym(i.symbol),
+            i.action,
+            i.strength,
+            i.reason,
+            i.signal_key,
+            i.target_notional,
+
+            # Phase 5: policy overlay
+            i.policy_path,
+            i.policy_asof,
+            i.policy_rec,
+            i.policy_score,
+            i.policy_trades,
+            1 if getattr(i, "policy_enforceable", False) else 0,
+            i.policy_mult,
+            i.policy_reco_notional,
+            1 if getattr(i, "policy_would_skip", False) else 0,
+            i.policy_best_exits,
+
+            # Phase 6: utilization / decision fields
+            i.policy_mode,
+            i.base_rank,
+            i.policy_rank_adj,
+            i.final_rank,
+            i.base_notional,
+            i.effective_notional,
+        )
+        for i in intents
+    ]
+
+    # Phase 5 schema
+    rows_p5 = [
         (
             run_id,
             _norm_sym(i.symbol),
@@ -436,23 +627,40 @@ def save_intents(run_id: int, intents: list[Intent]) -> int:
                     target_notional,
                     policy_path, policy_asof, policy_rec, policy_score, policy_trades,
                     policy_enforceable, policy_mult, policy_reco_notional,
-                    policy_would_skip, policy_best_exits
+                    policy_would_skip, policy_best_exits,
+                    policy_mode, base_rank, policy_rank_adj, final_rank,
+                    base_notional, effective_notional
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                rows_new,
+                rows_p6,
             )
         except sqlite3.OperationalError:
-            # Old schema: only the original columns
-            conn.executemany(
-                """
-                INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
-                VALUES (?, ?, ?, ?, ?, ?);
-                """,
-                [
-                    (run_id, _norm_sym(i.symbol), i.action, i.strength, i.reason, i.signal_key)
-                    for i in intents
-                ],
-            )
+            try:
+                conn.executemany(
+                    """
+                    INSERT INTO intents(
+                        run_id, symbol, action, strength, reason, signal_key,
+                        target_notional,
+                        policy_path, policy_asof, policy_rec, policy_score, policy_trades,
+                        policy_enforceable, policy_mult, policy_reco_notional,
+                        policy_would_skip, policy_best_exits
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    rows_p5,
+                )
+            except sqlite3.OperationalError:
+                # Old schema: only the original columns
+                conn.executemany(
+                    """
+                    INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
+                    VALUES (?, ?, ?, ?, ?, ?);
+                    """,
+                    [
+                        (run_id, _norm_sym(i.symbol), i.action, i.strength, i.reason, i.signal_key)
+                        for i in intents
+                    ],
+                )
 
     return len(intents)

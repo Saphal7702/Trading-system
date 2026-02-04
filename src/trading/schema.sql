@@ -100,6 +100,13 @@ CREATE TABLE IF NOT EXISTS intents (
   COLUMN policy_reco_notional REAL,
   COLUMN policy_would_skip INTEGER,       -- 0/1
   COLUMN policy_best_exits TEXT
+
+  COLUMN policy_mode TEXT,                -- off|reduce_only|allow_boost
+  COLUMN base_rank REAL,
+  COLUMN policy_rank_adj REAL,
+  COLUMN final_rank REAL,
+  COLUMN base_notional REAL,
+  COLUMN effective_notional REAL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency
