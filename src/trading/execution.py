@@ -185,11 +185,19 @@ def execute_run(
         # 2) Submit ONLY DB-eligible orders (DB is source of truth)
         db_orders = conn.execute(
             f"""
-            SELECT id, symbol, side, qty, reason, idempotency_key, status
-            FROM orders
-            WHERE run_id = ?
-              AND status IN ({placeholders})
-            ORDER BY id ASC;
+            SELECT
+                o.id, o.symbol, o.side, o.qty, o.reason, o.idempotency_key, o.status, o.intent_id,
+               i.target_notional AS intent_notional,
+               i.final_rank AS intent_final_rank
+            FROM orders o
+            LEFT JOIN intents i
+              ON i.id = o.intent_id
+            WHERE o.run_id = ?
+              AND o.status IN ({placeholders})
+            ORDER BY
+              CASE o.side WHEN 'sell' THEN 0 ELSE 1 END,
+              COALESCE(i.final_rank, 0) DESC,
+              o.id ASC;
             """,
             (run_id, *eligible_statuses),
         ).fetchall()
@@ -286,7 +294,22 @@ def execute_run(
                     if close is None or close <= 0:
                         raise RuntimeError(f"No close price available to size BUY for {symbol}")
 
-                    target = float(per_position_notional) * float(notional_haircut)
+                    #target = float(per_position_notional) * float(notional_haircut)
+
+                    intent_notional = None
+                    try:
+                        intent_notional = row["intent_notional"]
+                    except Exception:
+                        intent_notional = None
+
+                    base_notional = float(per_position_notional)
+                    try:
+                        if intent_notional is not None:
+                            base_notional = float(intent_notional)
+                    except Exception:
+                        base_notional = float(per_position_notional)
+
+                    target = float(base_notional) * float(notional_haircut)
 
                     # Estimate qty for logging + executions table (broker will calculate actual fill qty)
                     raw_qty = target / close
