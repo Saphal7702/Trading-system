@@ -208,6 +208,7 @@ def plan_intents(
         return thr
 
     enforce_thr = _policy_enforce_threshold()
+    policy_path = getattr(policy, "path", None) if policy else None
 
     assumed_bp = _env_float("TRADING_ASSUMED_BP", 0.0)
     buying_power = _get_buying_power_fallback(default=assumed_bp)
@@ -341,7 +342,7 @@ def plan_intents(
                 )
                 continue
 
-            d = can_sell(opened_at, now=now)
+            d = can_sell(opened_at, now=now)          
             if not d.allowed:
                 intents.append(Intent(sym, "hold", f"Sell blocked: {d.reason}", sig.strength))
             else:
@@ -352,6 +353,9 @@ def plan_intents(
                         sig.reason,
                         sig.strength,
                         signal_key=_signal_key_for("sell", sig.reason),
+                        policy_path=policy_path,
+                        policy_asof=getattr(policy, "asof", None) if policy else None,
+                        policy_mode=policy_mode,
                     )
                 )
 
@@ -484,6 +488,7 @@ def plan_intents(
                 signal_key=item["entry_key"],
 
                 # policy overlay
+                policy_path=policy_path,
                 policy_rec=pol.get("policy_rec"),
                 policy_score=pol.get("policy_score"),
                 policy_asof=pol.get("policy_asof"),

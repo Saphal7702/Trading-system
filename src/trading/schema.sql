@@ -11,7 +11,9 @@ CREATE TABLE IF NOT EXISTS positions (
   qty REAL NOT NULL,
   avg_entry_price REAL,
   opened_at TEXT NOT NULL,
-  last_updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  COLUMN entry_signal_key TEXT,
+  COLUMN entry_notional REAL
 );
 
 CREATE TABLE IF NOT EXISTS orders (
