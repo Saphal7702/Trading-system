@@ -188,12 +188,6 @@ def _resolve_asof_date(conn) -> str:
 
 
 def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]:
-    """
-    Returns per-symbol open position aggregates + entry attribution context:
-      qty_open, cost_basis, vwap_entry, last_close, unrealized_pnl, unrealized_ret_pct,
-      holding_days, peak_close, drawdown_from_peak_pct, peak_gain_pct, first_entry_at,
-      entry_signal_key
-    """
     if not asof:
         asof = _resolve_asof_date(conn)
 
@@ -203,27 +197,36 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
       SELECT ? AS asof_date
     ),
 
+    -- Broker-synced truth: what is actually open right now
+    open_positions AS (
+      SELECT UPPER(symbol) AS symbol, qty
+      FROM positions
+      WHERE qty > 0.000001
+    ),
+
     open_pos_core AS (
       SELECT
-        pl.symbol,
+        UPPER(pl.symbol) AS symbol,
         SUM(pl.qty_open) AS qty_open,
         SUM(pl.qty_open * pl.entry_price) AS cost_basis,
         MIN(pl.entry_filled_at) AS first_entry_at
       FROM position_lots pl
+      JOIN open_positions op ON op.symbol = UPPER(pl.symbol)
       WHERE pl.qty_open > 0
-      GROUP BY pl.symbol
+      GROUP BY UPPER(pl.symbol)
     ),
 
     entry_sig AS (
       SELECT
-        pl.symbol,
+        UPPER(pl.symbol) AS symbol,
         MAX(i.signal_key) AS entry_signal_key
       FROM position_lots pl
+      JOIN open_positions op ON op.symbol = UPPER(pl.symbol)
       LEFT JOIN executions e ON e.id = pl.entry_execution_id
       LEFT JOIN orders o     ON o.id = e.order_id
       LEFT JOIN intents i    ON i.id = o.intent_id
       WHERE pl.qty_open > 0
-      GROUP BY pl.symbol
+      GROUP BY UPPER(pl.symbol)
     ),
 
     open_pos AS (
@@ -238,15 +241,15 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
     ),
 
     last_close AS (
-      SELECT b.symbol, b.c AS last_close
+      SELECT UPPER(b.symbol) AS symbol, b.c AS last_close
       FROM bars_daily b
       JOIN (
-        SELECT symbol, MAX(t) AS tmax
+        SELECT UPPER(symbol) AS symbol, MAX(t) AS tmax
         FROM bars_daily
         WHERE t <= (SELECT asof_date FROM asof)
-        GROUP BY symbol
+        GROUP BY UPPER(symbol)
       ) mx
-        ON mx.symbol = b.symbol AND mx.tmax = b.t
+        ON mx.symbol = UPPER(b.symbol) AND mx.tmax = b.t
     ),
 
     peak_since_entry AS (
@@ -255,7 +258,7 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
         MAX(b.c) AS peak_close
       FROM open_pos op
       JOIN bars_daily b
-        ON b.symbol = op.symbol
+        ON UPPER(b.symbol) = op.symbol
        AND b.t >= date(op.first_entry_at)
        AND b.t <= (SELECT asof_date FROM asof)
       GROUP BY op.symbol
