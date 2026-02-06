@@ -45,15 +45,18 @@ def sync_positions(broker: Broker) -> int:
 
             conn.execute(
                 """
-                INSERT INTO positions(symbol, qty, avg_entry_price, opened_at, last_updated_at)
-                VALUES (?, ?, ?, datetime('now'), datetime('now'))
+                INSERT INTO positions(symbol, qty, avg_entry_price, opened_at, last_updated_at, entry_signal_key, entry_notional)
+                VALUES (?, ?, ?, datetime('now'), datetime('now'), NULL, NULL)
                 ON CONFLICT(symbol) DO UPDATE SET
-                  qty=excluded.qty,
-                  avg_entry_price=excluded.avg_entry_price,
-                  last_updated_at=datetime('now');
+                qty=excluded.qty,
+                avg_entry_price=excluded.avg_entry_price,
+                last_updated_at=datetime('now'),
+                entry_signal_key=COALESCE(positions.entry_signal_key, excluded.entry_signal_key),
+                entry_notional=COALESCE(positions.entry_notional, excluded.entry_notional);
                 """,
                 (sym, qty, avg),
             )
+
 
         # Mark any previously-known positions that are no longer returned as closed (qty=0)
         if seen:
@@ -69,10 +72,10 @@ def sync_positions(broker: Broker) -> int:
         else:
             conn.execute("UPDATE positions SET qty=0, last_updated_at=datetime('now');")
 
-    updated = backfill_opened_at_from_fills()
     linked = link_executions_to_orders()
+    updated = backfill_opened_at_from_fills()
+    meta = backfill_position_entry_meta_from_executions()
     return len(positions)
-
 
 def backfill_opened_at_from_fills() -> int:
     """
@@ -133,3 +136,99 @@ def link_executions_to_orders() -> int:
             """
         )
         return cur.rowcount
+    
+def backfill_position_entry_meta_from_executions() -> int:
+    """
+    Populate:
+      positions.entry_signal_key
+      positions.entry_notional
+
+    Strategy:
+      - For each open position missing entry_signal_key, find the most recent BUY execution with a linked order.
+      - Join orders -> intents to fetch intents.signal_key and intents.target_notional.
+      - Write:
+          entry_signal_key = intent.signal_key (if present)
+          entry_notional    = intent.target_notional if present else qty*avg_entry_price
+
+    Conservative / idempotent:
+      - Only fills NULL entry_signal_key rows.
+      - Does not overwrite existing metadata.
+    """
+    with connect() as conn:
+        # Get open positions that need backfill
+        rows = conn.execute(
+            """
+            SELECT symbol, qty, avg_entry_price
+            FROM positions
+            WHERE qty > 0
+              AND entry_signal_key IS NULL;
+            """
+        ).fetchall()
+
+        updated = 0
+
+        for r in rows:
+            sym = (r["symbol"] or "").strip().upper()
+            if not sym:
+                continue
+
+            qty = float(r["qty"] or 0.0)
+            avg = r["avg_entry_price"]
+            try:
+                avg_f = float(avg) if avg is not None else None
+            except Exception:
+                avg_f = None
+
+            # Find the most recent BUY execution that is linked to an order + intent
+            x = conn.execute(
+                """
+                SELECT
+                    i.signal_key AS signal_key,
+                    i.target_notional AS target_notional
+                FROM executions e
+                JOIN orders o
+                  ON o.id = e.order_id
+                JOIN intents i
+                  ON i.id = o.intent_id
+                WHERE e.symbol = ?
+                  AND e.side = 'buy'
+                  AND e.filled_at IS NOT NULL
+                ORDER BY e.filled_at DESC
+                LIMIT 1;
+                """,
+                (sym,),
+            ).fetchone()
+
+            if not x:
+                # No linkage available yet; leave NULL (will show as UNKNOWN exposure bucket)
+                continue
+
+            signal_key = x["signal_key"]
+            tn = x["target_notional"]
+
+            # Best-effort entry_notional
+            entry_notional = None
+            try:
+                if tn is not None:
+                    entry_notional = float(tn)
+            except Exception:
+                entry_notional = None
+
+            if entry_notional is None and avg_f is not None:
+                entry_notional = float(qty) * float(avg_f)
+
+            conn.execute(
+                """
+                UPDATE positions
+                SET entry_signal_key = COALESCE(entry_signal_key, ?),
+                    entry_notional    = COALESCE(entry_notional, ?),
+                    last_updated_at   = datetime('now')
+                WHERE symbol = ?
+                  AND qty > 0
+                  AND entry_signal_key IS NULL;
+                """,
+                (signal_key, entry_notional, sym),
+            )
+            updated += 1
+
+        return updated

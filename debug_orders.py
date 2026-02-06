@@ -1,15 +1,14 @@
-import os, sqlite3
-from dotenv import load_dotenv
+import os
 
-load_dotenv()
-db = os.getenv("TRADING_DB_PATH")
+os.environ["TRADING_MAX_POSITIONS"] = "10"
+os.environ["TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY"] = "300"
+os.environ["TRADING_POLICY_MODE"] = "reduce_only"
 
-con = sqlite3.connect(db)
-con.row_factory = sqlite3.Row
+from trading.strategy_sma import Signal
+from trading.planner import plan_intents
 
-rows = con.execute("""
-SELECT symbol, tradable, fractionable, status, exchange FROM assets_cache WHERE symbol='LLY';
-""").fetchall()
+signals = [Signal("AAPL", "buy", "SMA20 crossed above SMA50", strength=0.9)]
 
-for r in rows:
-    print(dict(r))
+intents = plan_intents(signals)
+for i in intents:
+    print(i.symbol, i.action, i.reason, i.signal_key)
