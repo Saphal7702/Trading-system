@@ -97,6 +97,22 @@ def execute_run(
             "broker_order_id": r["broker_order_id"],
         }
 
+
+    def _exposure_by_signal_key(conn) -> dict[str, float]:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(entry_signal_key, 'UNKNOWN') AS k,
+                   SUM(COALESCE(entry_notional, 0.0)) AS notional
+            FROM positions
+            WHERE COALESCE(qty, 0) > 0
+            GROUP BY COALESCE(entry_signal_key, 'UNKNOWN');
+            """
+        ).fetchall()
+        out: dict[str, float] = {}
+        for r in rows:
+            out[str(r["k"])] = float(r["notional"] or 0.0)
+        return out
+
     # ------- sizing knobs (env controlled) -------
     per_position_notional = _env_float("TRADING_PER_POSITION", 100.0)
     notional_haircut = _env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)
@@ -105,6 +121,7 @@ def execute_run(
     # ------- safety knobs -------
     daily_cap = _env_int("TRADING_DAILY_TRADE_CAP", 999999)
     cooldown_days = _env_int("TRADING_SYMBOL_COOLDOWN_DAYS", 0)
+    max_exposure_per_signal = _env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 0.0)
 
     summary: dict[str, Any] = {
         "run_id": run_id,
@@ -124,6 +141,7 @@ def execute_run(
         "skipped_due_to_cap": 0,
         "skipped_due_to_open_order": 0,
         "skipped_due_to_cooldown": 0,
+        "skipped_due_to_exposure": 0,
         "cooldown_set": 0,
     }
 
@@ -187,8 +205,9 @@ def execute_run(
             f"""
             SELECT
                 o.id, o.symbol, o.side, o.qty, o.reason, o.idempotency_key, o.status, o.intent_id,
-               i.target_notional AS intent_notional,
-               i.final_rank AS intent_final_rank
+                i.target_notional AS intent_notional,
+                i.signal_key AS intent_signal_key,
+                i.final_rank AS intent_final_rank
             FROM orders o
             LEFT JOIN intents i
               ON i.id = o.intent_id
@@ -201,6 +220,15 @@ def execute_run(
             """,
             (run_id, *eligible_statuses),
         ).fetchall()
+
+
+        # Exposure cap backstop (Phase 6): execution refuses BUYs that breach per-signal exposure cap.
+        # Independent of planner and policy.
+        cap_enabled = float(max_exposure_per_signal) > 0.0
+        current_exposure: dict[str, float] = {}
+        planned_exposure: dict[str, float] = {}
+        if cap_enabled:
+            current_exposure = _exposure_by_signal_key(conn)
 
         if not db_orders:
             log.info("No DB-eligible orders to submit (statuses=%s).", eligible_statuses)
@@ -236,6 +264,10 @@ def execute_run(
             symbol = (row["symbol"] or "").upper().strip()
             side = (row["side"] or "").lower().strip()
             reason = row["reason"]
+
+            # Intent context (Phase 6): may be NULL for legacy rows
+            intent_notional = row["intent_notional"] if "intent_notional" in row.keys() else None
+            intent_signal_key = row["intent_signal_key"] if "intent_signal_key" in row.keys() else None
 
             if not symbol or side not in ("buy", "sell"):
                 log.info("Skip order id=%s: invalid symbol/side (symbol=%r side=%r)", order_id, symbol, side)
@@ -286,6 +318,34 @@ def execute_run(
                 log.info("Skip BUY %s due to cooldown (order_id=%s)", symbol, order_id)
                 continue
 
+            # Exposure cap backstop (BUY only)
+            if side == "buy" and cap_enabled:
+                key = (str(intent_signal_key).strip() if intent_signal_key is not None else "").strip() or "UNKNOWN"
+
+                # Determine intended notional (use intent target if present, else per_position_notional)
+                try:
+                    base_notional = float(intent_notional) if intent_notional is not None else float(per_position_notional)
+                except Exception:
+                    base_notional = float(per_position_notional)
+
+                intended = float(base_notional) * float(notional_haircut)
+
+                curr = float(current_exposure.get(key, 0.0))
+                planned = float(planned_exposure.get(key, 0.0))
+
+                if (curr + planned + intended) > float(max_exposure_per_signal):
+                    msg = (
+                        f"exposure_cap_hit key={key} cap={float(max_exposure_per_signal):.2f} "
+                        f"curr={curr:.2f} planned={planned:.2f} intended={intended:.2f}"
+                    )
+                    conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
+                    summary["skipped_due_to_exposure"] += 1
+                    log.info("Skip BUY %s (order_id=%s): %s", symbol, order_id, msg)
+                    continue
+
+                # Reserve exposure for later BUYs in this same run
+                planned_exposure[key] = planned + intended
+
             try:
                 qty_for_execution_row: float = 0.0  # for executions.qty
 
@@ -294,18 +354,9 @@ def execute_run(
                     if close is None or close <= 0:
                         raise RuntimeError(f"No close price available to size BUY for {symbol}")
 
-                    #target = float(per_position_notional) * float(notional_haircut)
-
-                    intent_notional = None
+                    base_notional = intent_notional if intent_notional is not None else per_position_notional
                     try:
-                        intent_notional = row["intent_notional"]
-                    except Exception:
-                        intent_notional = None
-
-                    base_notional = float(per_position_notional)
-                    try:
-                        if intent_notional is not None:
-                            base_notional = float(intent_notional)
+                        base_notional = float(base_notional)
                     except Exception:
                         base_notional = float(per_position_notional)
 

@@ -92,6 +92,19 @@ def _current_positions() -> dict[str, dict]:
 
     return pos
 
+def _exposure_by_signal_key() -> dict[str, float]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(entry_signal_key, 'UNKNOWN') AS k,
+                   SUM(COALESCE(entry_notional, 0.0)) AS notional
+            FROM positions
+            WHERE COALESCE(qty, 0) > 0
+            GROUP BY COALESCE(entry_signal_key, 'UNKNOWN');
+            """
+        ).fetchall()
+
+    return {str(r["k"]): float(r["notional"] or 0.0) for r in rows}
 
 def _get_buying_power_fallback(default: float = 0.0) -> float:
     """
@@ -150,12 +163,15 @@ def plan_intents(
       - compliance (min hold before sell)
       - budget realism for small accounts
       - max positions cap
+      - Phase 6: max exposure per entry signal_key (non-negotiable)
 
     Defaults controlled by env:
       TRADING_MAX_POSITIONS (default 5)
       TRADING_PER_POSITION  (default 100)
       TRADING_CASH_BUFFER   (default 25)
       TRADING_ASSUMED_BP    (default 0)  # fallback if broker_accounts empty
+
+      TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY (default 300)
     """
     pos = _current_positions()
     now = datetime.now(timezone.utc)
@@ -166,9 +182,7 @@ def plan_intents(
     )
     cash_buffer = cash_buffer if cash_buffer is not None else _env_float("TRADING_CASH_BUFFER", 25.0)
 
-    # Policy sizing knobs
-    # Policy utilization knobs 
-    # Defaults are conservative: reduce_only means policy can only reduce risk.
+    # Policy utilization knobs
     policy_mode = os.getenv("TRADING_POLICY_MODE", "reduce_only").strip().lower()
     if policy_mode not in ("off", "reduce_only", "allow_boost"):
         policy_mode = "reduce_only"
@@ -220,37 +234,6 @@ def plan_intents(
     intents: list[Intent] = []
     buy_candidates: list[Signal] = []
 
-    def _policy_for_entry(entry_key: str | None) -> tuple[str | None, float | None, str | None, str | None]:
-        """
-        Returns: (rec, score, asof, best_exits_csv)
-        """
-        if not policy or not entry_key:
-            return (None, None, None, None)
-
-        try:
-            rec_row = policy.entry_rec(entry_key) if hasattr(policy, "entry_rec") else None
-            rec = rec_row.get("rec") if isinstance(rec_row, dict) else None
-            score = rec_row.get("score") if isinstance(rec_row, dict) else None
-            asof = getattr(policy, "asof", None)
-
-            best = []
-            if hasattr(policy, "best_exits"):
-                xs = policy.best_exits(entry_key) or []
-                # xs is a list[dict] like {"exit_key": "...", ...}
-                for x in xs:
-                    k = x.get("exit_key")
-                    if k:
-                        best.append(str(k))
-            best_csv = ", ".join(best) if best else None
-
-            return (str(rec) if rec is not None else None,
-                    float(score) if score is not None else None,
-                    str(asof) if asof is not None else None,
-                    best_csv)
-        except Exception:
-            # policy is advisory; never break planning
-            return (None, None, None, None)
-        
     def _policy_sizing_for_entry(entry_key: str | None, base_notional: float | None) -> dict:
         out = {
             "policy_rec": None,
@@ -316,6 +299,11 @@ def plan_intents(
         except Exception:
             return out
 
+    # ---- Phase 6 Exposure Cap state ----
+    max_exposure = _env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 300.0)
+    exposure = _exposure_by_signal_key()  # current open exposure by entry_signal_key
+    planned_exposure: dict[str, float] = {}  # exposure added by buys picked in THIS planning run
+    blocked_by_exposure: set[str] = set()
 
     # 1) Process SELL/HOLD decisions; collect BUY candidates
     for sig in signals:
@@ -342,7 +330,7 @@ def plan_intents(
                 )
                 continue
 
-            d = can_sell(opened_at, now=now)          
+            d = can_sell(opened_at, now=now)
             if not d.allowed:
                 intents.append(Intent(sym, "hold", f"Sell blocked: {d.reason}", sig.strength))
             else:
@@ -369,8 +357,6 @@ def plan_intents(
             intents.append(Intent(sym, "hold", sig.reason, sig.strength))
 
     # 2) Policy-aware BUY ranking + budget-aware selection (Phase 6)
-    # Base affordability still uses spendable cash, but we select buys using effective_notional
-    # so allow_boost cannot accidentally overspend.
     def _boost_gate(trades: int | None, score: float | None) -> bool:
         if trades is None or trades < pol_min_trades_boost:
             return False
@@ -421,13 +407,12 @@ def plan_intents(
                 if suggested <= base_notional:
                     effective = suggested
                 else:
-                    # only allow increases if BOOST passes gate
                     if rec == "BOOST" and _boost_gate(trades, score):
                         effective = suggested
                     else:
                         effective = base_notional
 
-        # Hard clamps (planner-side; execution still enforces its own caps)
+        # Hard clamps
         min_eff = float(base_notional) * float(pol_min_mult)
         max_eff = float(base_notional) * float(pol_max_mult)
         effective = max(min_eff, min(max_eff, float(effective)))
@@ -446,7 +431,7 @@ def plan_intents(
             }
         )
 
-    # Sort by final_rank (policy-aware); tie-break by base_rank then symbol
+    # Sort by final_rank (policy-aware)
     enriched.sort(key=lambda x: (float(x["final_rank"]), float(x["base_rank"]), x["sym"]), reverse=True)
 
     slots_left = max(0, max_positions - held_count)
@@ -461,20 +446,27 @@ def plan_intents(
         sig = item["sig"]
         sym = item["sym"]
         eff = float(item["effective_notional"])
+        entry_key = item["entry_key"] or "UNKNOWN"
 
         if remaining_slots <= 0:
             continue
-
         if eff <= 0:
             continue
-
         if remaining_cash < eff:
+            continue
+
+        # ---- Exposure cap check (Phase 6, non-negotiable) ----
+        curr = float(exposure.get(entry_key, 0.0))
+        planned = float(planned_exposure.get(entry_key, 0.0))
+        if (curr + planned + eff) > float(max_exposure):
+            blocked_by_exposure.add(sym)
             continue
 
         # Pick this BUY
         picked.add(sym)
         remaining_slots -= 1
         remaining_cash -= eff
+        planned_exposure[entry_key] = planned + eff
 
         pol = item["pol"]
 
@@ -484,7 +476,7 @@ def plan_intents(
                 "buy",
                 sig.reason,
                 sig.strength,
-                target_notional=float(eff),  # Phase 6: utilization (execution uses this)
+                target_notional=float(eff),
                 signal_key=item["entry_key"],
 
                 # policy overlay
@@ -520,12 +512,29 @@ def plan_intents(
         if sym in picked:
             continue
 
-        if slots_left <= 0:
-            intents.append(Intent(sym, "hold", f"Max positions reached ({max_positions}); skip buy", sig.strength))
+        if sym in blocked_by_exposure:
+            intents.append(
+                Intent(
+                    sym,
+                    "hold",
+                    f"Exposure cap hit for {item['entry_key'] or 'UNKNOWN'} (cap ${max_exposure:.2f}); skip buy",
+                    sig.strength,
+                )
+            )
             continue
 
-        # Determine if it was cash-limited or rank-limited
-        # Note: remaining_cash/slots are after picks, so we use spendable/slots_left for messaging.
+        if remaining_slots <= 0:
+            intents.append(
+                Intent(
+                    sym,
+                    "hold",
+                    f"Max positions reached ({max_positions}); skip buy",
+                    sig.strength,
+                )
+            )
+            continue
+
+
         if spendable <= 0:
             intents.append(
                 Intent(
@@ -536,7 +545,6 @@ def plan_intents(
                 )
             )
         else:
-            # If eff itself exceeds spendable, it's definitely cash limited; otherwise it lost ranking.
             if eff > spendable:
                 intents.append(
                     Intent(
@@ -550,7 +558,6 @@ def plan_intents(
                 intents.append(Intent(sym, "hold", "Budget/slots limited; skip buy", sig.strength))
 
     return intents
-
 
 def save_intents(run_id: int, intents: list[Intent]) -> int:
     """
