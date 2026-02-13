@@ -1341,7 +1341,7 @@ def main() -> int:
     p_t.add_argument("--desc", action="store_true", help="Sort descending")
 
 
-    p_exp = sub.add_parser("exposure", help="Exposure by symbol (market value + % of equity) (Phase 3)")
+    p_exp = sub.add_parser("exposure", help="Exposure by symbol (market value + percentage of equity) (Phase 3)")
     p_exp.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD). Default: resolve_asof_date()")
     p_exp.add_argument("--top", type=int, required=False, default=20, help="Show top N symbols by market value")
 
