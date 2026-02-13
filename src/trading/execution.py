@@ -145,9 +145,23 @@ def execute_run(
         "cooldown_set": 0,
     }
 
-    # 1) Build + persist (idempotent) from intents
-    proposed = build_orders_from_intents(run_id=run_id, default_qty=qty_default)
+        # 1) Build + persist (idempotent) from intents
+    # Phase 6: intent-queue execution (execute pending intents across runs)
+    # Toggle with TRADING_EXECUTION_MODE=run|queue (default queue).
+    exec_mode = os.getenv("TRADING_EXECUTION_MODE", "queue").strip().lower()
+    lookback_days = _env_int("TRADING_INTENT_QUEUE_LOOKBACK_DAYS", 7)
+
+    if exec_mode == "run":
+        proposed = build_orders_from_intents(run_id=run_id, default_qty=qty_default)
+    else:
+        proposed = build_orders_from_intent_queue(
+            run_id=run_id,
+            default_qty=qty_default,
+            lookback_days=lookback_days,
+        )
+
     inserted = persist_orders(run_id=run_id, orders=proposed)
+
 
     summary["proposed"] = len(proposed)
     summary["inserted"] = inserted
@@ -501,6 +515,89 @@ def build_orders_from_intents(run_id: int, default_qty: float = 1.0) -> list[Pro
         reason = r["reason"]
 
         idem = _make_idempotency_key(symbol, side, day)
+        chosen[(symbol, side)] = ProposedOrder(
+            symbol=symbol,
+            side=side,
+            qty=default_qty,
+            reason=reason,
+            idempotency_key=idem,
+            intent_id=intent_id,
+        )
+
+    return list(chosen.values())
+
+
+
+def build_orders_from_intent_queue(
+    *,
+    run_id: int,
+    default_qty: float = 1.0,
+    lookback_days: int = 7,
+    include_run_id: bool = False,
+) -> list[ProposedOrder]:
+    """
+    Intent-queue execution (Phase 6):
+    Build ProposedOrders from *pending* intents regardless of run_id.
+
+    Pending intent definition (conservative):
+      - intents.action in ('buy','sell')
+      - no order row exists linked via orders.intent_id
+      - intents.created_at within lookback window (prevents executing very old intents)
+
+    Notes:
+      - We still persist orders under the CURRENT run_id for auditability.
+      - intent_id is preserved for attribution (intent knows its original run_id).
+      - We dedupe by (symbol, side) and keep the MOST RECENT intent within the window.
+    """
+    day = _today_key()
+    lookback_days = int(lookback_days) if lookback_days is not None else 7
+    if lookback_days <= 0:
+        lookback_days = 7
+
+    # SQLite datetime modifier like '-7 days'
+    modifier = f"-{lookback_days} days"
+
+    with connect() as conn:
+        if include_run_id:
+            rows = conn.execute(
+                """
+                SELECT i.id, i.symbol, i.action, i.reason, i.created_at, i.run_id
+                FROM intents i
+                LEFT JOIN orders o
+                  ON o.intent_id = i.id
+                WHERE i.action IN ('buy','sell')
+                  AND o.id IS NULL
+                  AND i.created_at >= datetime('now', ?)
+                ORDER BY i.created_at ASC, i.id ASC;
+                """,
+                (modifier,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT i.id, i.symbol, i.action, i.reason, i.created_at
+                FROM intents i
+                LEFT JOIN orders o
+                  ON o.intent_id = i.id
+                WHERE i.action IN ('buy','sell')
+                  AND o.id IS NULL
+                  AND i.created_at >= datetime('now', ?)
+                ORDER BY i.created_at ASC, i.id ASC;
+                """,
+                (modifier,),
+            ).fetchall()
+
+    chosen: dict[tuple[str, str], ProposedOrder] = {}
+    for r in rows:
+        intent_id = int(r["id"]) if r["id"] is not None else None
+        symbol = str(r["symbol"]).strip().upper()
+        side = str(r["action"]).strip().lower()
+        reason = r["reason"]
+
+        # Per-day idempotency across the order table (symbol+side per day).
+        idem = _make_idempotency_key(symbol, side, day)
+
+        # Keep the latest intent for this (symbol, side)
         chosen[(symbol, side)] = ProposedOrder(
             symbol=symbol,
             side=side,
