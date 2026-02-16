@@ -36,6 +36,42 @@ def find_today_logs() -> list[Path]:
         return []
     return sorted(LOGDIR.glob(f"*{DAY}*.log"))
 
+def summarize_jobs_from_logs(logs: list[Path]) -> list[str]:
+    # Keep only the latest line per job (data/buy/sell)
+    latest: dict[str, str] = {}
+
+    for lp in logs:
+        name = lp.name
+        txt = tail_file(lp, n=220)
+
+        job = None
+        if name.startswith("data_"):
+            job = "data"
+        elif name.startswith("buy_"):
+            job = "buy"
+        elif name.startswith("sell_"):
+            job = "sell"
+        else:
+            continue
+
+        if job == "data":
+            fetched = [ln for ln in txt.splitlines() if "Fetched bars:" in ln]
+            if fetched:
+                latest[job] = f"- data: OK ({fetched[-1].strip()})"
+            else:
+                latest[job] = "- data: ran (no fetched summary found)"
+        else:
+            pre = [ln for ln in txt.splitlines() if "PREFLIGHT" in ln]
+            if pre:
+                latest[job] = f"- {job}: {pre[-1].strip()}"
+            else:
+                latest[job] = f"- {job}: ran (no PREFLIGHT line found)"
+
+    out: list[str] = []
+    for job in ("data", "buy", "sell"):
+        if job in latest:
+            out.append(latest[job])
+    return out
 
 def main() -> int:
     parts: list[str] = []
@@ -137,6 +173,14 @@ def main() -> int:
                 parts.append("- none")
         except Exception as e:
             parts.append(f"(account_snapshots_daily not available: {e})")
+        parts.append("")
+
+        parts.append("=== Jobs (today, from logs) ===")
+        logs = find_today_logs()
+        if not logs:
+            parts.append("- none")
+        else:
+            parts.extend(summarize_jobs_from_logs(logs))
         parts.append("")
 
         # Errors / warnings from logs
