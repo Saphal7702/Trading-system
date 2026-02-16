@@ -20,12 +20,6 @@ fi
 # DB path (EDIT THIS to your actual sqlite location)
 export TRADING_DB_PATH="${TRADING_DB_PATH:-/home/saphal7702/Trading/TradingData/trading.sqlite}"
 
-# Safety defaults (override in .trading_env if desired)
-export TRADING_POLICY_MODE="${TRADING_POLICY_MODE:-reduce_only}"
-export TRADING_MAX_POSITIONS="${TRADING_MAX_POSITIONS:-5}"
-export TRADING_CASH_BUFFER="${TRADING_CASH_BUFFER:-25}"
-export TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY="${TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY:-300}"
-
 cd "$ROOT"
 source "$VENV/bin/activate"
 
