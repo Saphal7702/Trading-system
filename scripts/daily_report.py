@@ -4,6 +4,7 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+import subprocess
 
 ROOT = Path("/home/saphal7702/Trading/Trading-system")
 LOGDIR = ROOT / "logs"
@@ -72,6 +73,17 @@ def summarize_jobs_from_logs(logs: list[Path]) -> list[str]:
         if job in latest:
             out.append(latest[job])
     return out
+
+def get_performance_output() -> str:
+    try:
+        out = subprocess.check_output(
+            ["python", "-m", "trading", "performance"],
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        return out.strip()
+    except subprocess.CalledProcessError as e:
+        return f"(performance command failed)\n{e.output}"
 
 def main() -> int:
     parts: list[str] = []
@@ -181,6 +193,11 @@ def main() -> int:
             parts.append("- none")
         else:
             parts.extend(summarize_jobs_from_logs(logs))
+        parts.append("")
+
+        #Overall Performance
+        parts.append("=== Performance ===")
+        parts.append(get_performance_output())
         parts.append("")
 
         # Errors / warnings from logs
