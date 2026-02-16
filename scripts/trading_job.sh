@@ -38,11 +38,17 @@ case "$job" in
     run python -m trading fetch-bars --days 10
     ;;
   buy)
-    run python -m trading preflight
+    run python -m trading preflight || {
+      echo "[$(date '+%F %T')] Prefight blocked; skipping run-once." | tee -a "$log"
+      exit 0
+    }
     run python -m trading run-once --execute
     ;;
   sell)
-    run python -m trading preflight
+    run python -m trading preflight || {
+      echo "[$(date '+%F %T')] Prefight blocked; skipping exits/run-once." | tee -a "$log"
+      exit 0
+    }
     run python -m trading exits --emit-intents
     run python -m trading run-once --execute
     ;;
