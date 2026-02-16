@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS positions (
   avg_entry_price REAL,
   opened_at TEXT NOT NULL,
   last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  COLUMN entry_signal_key TEXT,
-  COLUMN entry_notional REAL
+  entry_signal_key TEXT,
+  entry_notional REAL
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS orders (
   filled_qty REAL,
   filled_avg_price REAL,
   filled_at TEXT,
-  COLUMN intent_id INTEGER
+  intent_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS executions (
   filled_avg_price REAL,
   filled_at TEXT,
   raw_json TEXT,
-  COLUMN order_id INTEGER
+  order_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS bars_daily (
@@ -90,25 +90,25 @@ CREATE TABLE IF NOT EXISTS intents (
   strength REAL,
   reason TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  COLUMN signal_key TEXT,
-  COLUMN target_notional REAL,
-  COLUMN policy_path TEXT,
-  COLUMN policy_asof TEXT,
-  COLUMN policy_rec TEXT,
-  COLUMN policy_score REAL,
-  COLUMN policy_trades INTEGER,
-  COLUMN policy_enforceable INTEGER,      -- 0/1
-  COLUMN policy_mult REAL,
-  COLUMN policy_reco_notional REAL,
-  COLUMN policy_would_skip INTEGER,       -- 0/1
-  COLUMN policy_best_exits TEXT
+  signal_key TEXT,
+  target_notional REAL,
+  policy_path TEXT,
+  policy_asof TEXT,
+  policy_rec TEXT,
+  policy_score REAL,
+  policy_trades INTEGER,
+  policy_enforceable INTEGER,      -- 0/1
+  policy_mult REAL,
+  policy_reco_notional REAL,
+  policy_would_skip INTEGER,       -- 0/1
+  policy_best_exits TEXT
 
-  COLUMN policy_mode TEXT,                -- off|reduce_only|allow_boost
-  COLUMN base_rank REAL,
-  COLUMN policy_rank_adj REAL,
-  COLUMN final_rank REAL,
-  COLUMN base_notional REAL,
-  COLUMN effective_notional REAL
+  policy_mode TEXT,                -- off|reduce_only|allow_boost
+  base_rank REAL,
+  policy_rank_adj REAL,
+  final_rank REAL,
+  base_notional REAL,
+  effective_notional REAL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency

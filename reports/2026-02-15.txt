@@ -1,0 +1,19 @@
+Trading Daily Report - 2026-02-15
+Generated: 2026-02-15 11:11:21 (America/Denver)
+DB: trading.sqlite
+
+=== Runs (today) ===
+(runs table not readable with expected columns; skipping)
+
+=== Intents (today) ===
+(intents table not readable with expected created_at; skipping)
+
+=== Orders (today) ===
+(orders table not readable with expected requested_at; skipping)
+
+=== Latest Account Snapshot ===
+(account_snapshots not available; skipping)
+
+=== Errors / Warnings (from logs) ===
+- no obvious errors found in today's log tails
+
