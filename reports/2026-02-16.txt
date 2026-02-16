@@ -1,0 +1,19 @@
+Trading Daily Report - 2026-02-16
+Generated: 2026-02-16 09:31:30 (America/Denver)
+DB: /home/saphal7702/Trading/TradingData/trading.sqlite
+
+=== Runs (today) ===
+- none
+
+=== Intents (today) ===
+- none
+
+=== Orders (today) ===
+- none
+
+=== Latest Account Snapshot ===
+- asof_date=2026-02-13 cash=231.94 equity=538.27 buying_power=231.94 long_mv=306.33 run_id=106
+
+=== Errors / Warnings (from logs) ===
+- no logs found for today in logs/
+
