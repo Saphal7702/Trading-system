@@ -1,5 +1,5 @@
 Trading Daily Report - 2026-02-16
-Generated: 2026-02-16 09:31:30 (America/Denver)
+Generated: 2026-02-16 18:10:02 (America/Denver)
 DB: /home/saphal7702/Trading/TradingData/trading.sqlite
 
 === Runs (today) ===
@@ -14,6 +14,21 @@ DB: /home/saphal7702/Trading/TradingData/trading.sqlite
 === Latest Account Snapshot ===
 - asof_date=2026-02-13 cash=231.94 equity=538.27 buying_power=231.94 long_mv=306.33 run_id=106
 
+=== Jobs (today, from logs) ===
+- data: OK (2026-02-16 09:39:26,543 | INFO | trading | Fetched bars: total=2390 | symbols=492 | universe=sp500 | limit=500)
+- buy: 2026-02-16 10:02:07,371 | INFO | trading | PREFLIGHT ok=False exec_safe=False asof=2026-02-13 stale_days=3 market_open=False reason=market_closed buying_power=231.94 equity=537.47 open_orders=0 cooldown_active=0 cap_remaining=5 min_bp_required=105.00 blockers=['preflight_not_ok(data_or_market)']
+- sell: 2026-02-16 13:30:03,125 | INFO | trading | PREFLIGHT ok=False exec_safe=False asof=2026-02-13 stale_days=3 market_open=False reason=market_closed buying_power=231.94 equity=537.47 open_orders=0 cooldown_active=0 cap_remaining=5 min_bp_required=105.00 blockers=['preflight_not_ok(data_or_market)']
+
+=== Performance ===
+2026-02-16 18:10:02,613 | INFO | trading | PERFORMANCE 2026-01-23→2026-02-13 | days=14 | start=514.13 end=538.27 | cum=+4.70% | maxDD=-1.74% | avgDaily=+0.3568%
+2026-02-16 18:10:02,613 | INFO | trading | Best day:  2026-02-03  +1.41%
+2026-02-16 18:10:02,613 | INFO | trading | Worst day: 2026-01-30  -1.37%
+2026-02-16 18:10:02,614 | INFO | trading | EXIT ATTRIBUTION (realized) 2026-01-23→2026-02-13 | trades=10
+2026-02-16 18:10:02,614 | INFO | trading |   exit_take_profit_5pct            trades=4   pnl=  +25.68
+2026-02-16 18:10:02,614 | INFO | trading |   exit_take_profit_14pct           trades=1   pnl=  +15.95
+2026-02-16 18:10:02,614 | INFO | trading |   exit_early_failure_5d            trades=4   pnl=   -4.57
+2026-02-16 18:10:02,614 | INFO | trading |   exit_stop_loss_5pct              trades=1   pnl=   -5.21
+
 === Errors / Warnings (from logs) ===
-- no logs found for today in logs/
+- no obvious errors found in today's log tails
 
