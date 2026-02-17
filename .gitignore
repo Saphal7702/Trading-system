@@ -21,6 +21,8 @@ venv/
 
 # Logs
 *.log
+logs/
+reports/
 
 # Data (if you save local market data later)
 data/
