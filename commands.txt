@@ -29,6 +29,10 @@ trading exits --emit-intents
 trading execute --run-id X --submit
 trading run-once
 
+/*Policies*/
+trading policy-recommend
+trading policy-recommend --emit-json
+
 /*Performance, Analysis and Feedbacks*/
 trading exits
 trading exits --emit-intents --dry-run
