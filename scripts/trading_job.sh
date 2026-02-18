@@ -35,7 +35,7 @@ run() {
 # Use python -m trading to avoid PATH issues under cron
 case "$job" in
   data)
-    run python -m trading fetch-bars --days 10
+    run python -m trading fetch-bars --days 400
     ;;
   buy)
     run python -m trading preflight || {

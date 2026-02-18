@@ -283,6 +283,15 @@ def apply_new_executions(run_id: int | None = None) -> LotsApplyResult:
                 if side not in ("buy", "sell"):
                     continue
 
+                ok, qty, price, filled_at = _is_filled_execution(ex)
+                if not ok:
+                    # don’t crash runs because broker hasn’t finalized the fill yet
+                    log.info(
+                        "Skip execution (not filled yet): exec_id=%s side=%s sym=%s qty=%s price=%s filled_at=%s",
+                        ex.get("id"), side, ex.get("symbol"), qty, price, filled_at
+                    )
+                    continue
+
                 exec_id = int(ex["id"])
 
                 if side == "buy":
@@ -410,3 +419,10 @@ def get_realized_pnl_for_date(asof_date: str) -> float:
             (asof_date,),
         ).fetchone()
     return _to_float(row["pnl"] if row else 0.0)
+
+def _is_filled_execution(ex: Mapping[str, Any]) -> tuple[bool, float, float, str]:
+    qty = _to_float(_pick(ex, "filled_qty", "qty", "quantity", default=0.0))
+    price = _to_float(_pick(ex, "filled_avg_price", "avg_price", "price", "fill_price", default=0.0))
+    filled_at = _to_str(_pick(ex, "filled_at", "executed_at", "execution_time", default=""))
+    ok = (qty > 0) and (price > 0) and bool(filled_at)
+    return ok, qty, price, filled_at
