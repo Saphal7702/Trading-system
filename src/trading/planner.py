@@ -45,10 +45,6 @@ def _norm_sym(sym: str | None) -> str:
 
 
 def _signal_key_for(action: str, reason: str) -> str | None:
-    """
-    Map free-text reason -> stable signal key.
-    Keep keys stable forever once introduced.
-    """
     a = (action or "").strip().lower()
     r = (reason or "").strip()
 
@@ -58,7 +54,10 @@ def _signal_key_for(action: str, reason: str) -> str | None:
     if a == "sell" and "SMA20 crossed below SMA50" in r:
         return "sma20_cross_down_sma50"
 
-    # Unknown/unmapped signal (safe)
+    # MRIT mappings (NEW)
+    if a == "buy" and r.startswith("MRIT:"):
+        return "mrit_rsi2_pullback_uptrend"
+
     return None
 
 
@@ -355,6 +354,15 @@ def plan_intents(
 
         else:
             intents.append(Intent(sym, "hold", sig.reason, sig.strength))
+
+    # NEW: De-dup BUY candidates by symbol (keep strongest)
+    dedup: dict[str, Signal] = {}
+    for s in buy_candidates:
+        sym = _norm_sym(s.symbol)
+        prev = dedup.get(sym)
+        if prev is None or float(s.strength or 0.0) > float(prev.strength or 0.0):
+            dedup[sym] = s
+    buy_candidates = list(dedup.values())
 
     # 2) Policy-aware BUY ranking + budget-aware selection (Phase 6)
     def _boost_gate(trades: int | None, score: float | None) -> bool:
