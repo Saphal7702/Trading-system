@@ -327,12 +327,35 @@ def run_once(
 
         step("build_universe", _build_universe)
 
-        # 5) Plan intents (reuse your existing pieces, but not CLI)
+        # 5) Plan intents 
         from .strategy_sma import generate_signals_sma
+        from .strategy_mrit import generate_signals_mrit  # NEW
         from .planner import plan_intents, save_intents
 
         def _plan():
-            signals = generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof)
+            entry_mode = os.getenv("TRADING_ENTRY_MODE", "sma").strip().lower()
+            # options: sma | mrit | both
+
+            if entry_mode == "mrit":
+                signals = generate_signals_mrit(universe=universe, asof=asof)
+            elif entry_mode == "both":
+                signals = []
+                signals += generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof)
+                signals += generate_signals_mrit(universe=universe, asof=asof)
+                # optional: de-dup symbols so you don't double-buy same ticker
+                seen = set()
+                deduped = []
+                for s in sorted(signals, key=lambda x: (x.action != "buy", -(x.strength or 0.0))):
+                    # keep best BUY per symbol first; holds can be ignored
+                    if s.symbol in seen and s.action == "buy":
+                        continue
+                    if s.action == "buy":
+                        seen.add(s.symbol)
+                    deduped.append(s)
+                signals = deduped
+            else:
+                signals = generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof)
+
             intents = plan_intents(signals, policy=policy)
 
             cooldown_days = int(float(os.getenv("TRADING_SYMBOL_COOLDOWN_DAYS", "0")))
@@ -358,7 +381,9 @@ def run_once(
                 "holds": holds,
                 "cooldown_blocked": blocked,
                 "cooldown_days": cooldown_days,
+                "entry_mode": entry_mode,
             }
+
 
         step("plan", _plan)
 
