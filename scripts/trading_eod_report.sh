@@ -8,7 +8,7 @@ if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
     VENV_ACTIVATE="Scripts/activate"
 else
     # Linux / macOS
-    DEFAULT_ROOT="/home/saphal/projects/trading-system" 
+    DEFAULT_ROOT="/home/saphal7702/Trading/Trading-system" 
     VENV_ACTIVATE="bin/activate"
 fi
 
