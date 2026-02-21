@@ -558,6 +558,250 @@ def cmd_show_universe(universe: str, asof: str | None, limit: int) -> int:
         )
     return 0
 
+def cmd_perf_by_signal(since: str | None, to_date: str | None) -> int:
+    from .db import connect
+    from datetime import datetime, timedelta
+
+    def _today() -> str:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+    if not to_date:
+        to_date = _today()
+
+    if not since:
+        since = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+
+    sql = """
+    SELECT
+      COALESCE(i.signal_key, 'unknown') AS entry_signal_key,
+      COUNT(*) AS trades,
+      SUM(CASE WHEN lc.realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+      ROUND(SUM(lc.realized_pnl), 2) AS pnl,
+      ROUND(AVG(lc.realized_pnl), 2) AS avg_pnl,
+      ROUND(AVG(((lc.exit_price - lc.entry_price) / NULLIF(lc.entry_price, 0.0)) * 100.0), 3) AS avg_ret_pct,
+      ROUND(AVG(julianday(substr(lc.exit_filled_at,1,10)) - julianday(substr(lc.entry_filled_at,1,10))), 2) AS avg_hold_days
+    FROM lot_closings lc
+    LEFT JOIN executions e ON e.id = lc.entry_execution_id
+    LEFT JOIN orders o     ON o.id = e.order_id
+    LEFT JOIN intents i    ON i.id = o.intent_id
+    WHERE substr(lc.exit_filled_at, 1, 10) BETWEEN ? AND ?
+    GROUP BY COALESCE(i.signal_key, 'unknown')
+    ORDER BY SUM(lc.realized_pnl) DESC;
+    """
+
+    with connect() as conn:
+        rows = conn.execute(sql, (since, to_date)).fetchall()
+
+    if not rows:
+        log.info("PERF-BY-SIGNAL none | range=%s→%s (no lot_closings)", since, to_date)
+        return 0
+
+    total_trades = sum(int(r["trades"]) for r in rows)
+    total_pnl = sum(float(r["pnl"] or 0.0) for r in rows)
+    log.info("PERF-BY-SIGNAL (realized) %s→%s | keys=%s trades=%s pnl=%+.2f", since, to_date, len(rows), total_trades, total_pnl)
+
+    for r in rows:
+        trades = int(r["trades"])
+        wins = int(r["wins"] or 0)
+        win_pct = (wins / trades * 100.0) if trades else 0.0
+        log.info(
+            "  %-28s trades=%-4d win=%5.1f%% pnl=%+9.2f avg=%+7.2f avgRet=%+6.2f%% hold=%4.1fd",
+            r["entry_signal_key"],
+            trades,
+            win_pct,
+            float(r["pnl"] or 0.0),
+            float(r["avg_pnl"] or 0.0),
+            float(r["avg_ret_pct"] or 0.0),
+            float(r["avg_hold_days"] or 0.0),
+        )
+
+    return 0
+
+def cmd_perf_by_signal_open(asof: str | None) -> int:
+    from .db import connect
+    from .asof import resolve_asof_date
+
+    with connect() as conn:
+        asof = resolve_asof_date(conn, asof)
+
+        sql = """
+        WITH last_bar AS (
+          SELECT b.symbol, b.c AS last_close
+          FROM bars_daily b
+          JOIN (
+            SELECT symbol, MAX(t) AS t
+            FROM bars_daily
+            WHERE t <= ?
+            GROUP BY symbol
+          ) m
+            ON m.symbol = b.symbol AND m.t = b.t
+        )
+        SELECT
+          COALESCE(p.entry_signal_key, 'unknown') AS entry_signal_key,
+          COUNT(*) AS positions,
+          ROUND(SUM(p.qty * p.avg_entry_price), 2) AS cost,
+          ROUND(SUM(p.qty * lb.last_close), 2) AS mv,
+          ROUND(SUM((p.qty * lb.last_close) - (p.qty * p.avg_entry_price)), 2) AS upnl,
+          ROUND(
+            CASE
+              WHEN SUM(p.qty * p.avg_entry_price) = 0 THEN 0
+              ELSE (SUM((p.qty * lb.last_close) - (p.qty * p.avg_entry_price)) / SUM(p.qty * p.avg_entry_price)) * 100.0
+            END
+          , 3) AS uret_pct,
+          ROUND(AVG(julianday(?) - julianday(substr(p.opened_at,1,10))), 2) AS avg_hold_days
+        FROM positions p
+        JOIN last_bar lb ON lb.symbol = p.symbol
+        WHERE p.qty > 0 AND p.avg_entry_price IS NOT NULL
+        GROUP BY COALESCE(p.entry_signal_key, 'unknown')
+        ORDER BY upnl DESC;
+        """
+
+        rows = conn.execute(sql, (asof, asof)).fetchall()
+
+    if not rows:
+        log.info("PERF-BY-SIGNAL-OPEN none | asof=%s (no open positions)", asof)
+        return 0
+
+    total_cost = sum(float(r["cost"] or 0.0) for r in rows)
+    total_upnl = sum(float(r["upnl"] or 0.0) for r in rows)
+    total_mv = sum(float(r["mv"] or 0.0) for r in rows)
+
+    tot_ret = 0.0
+    if total_cost > 0:
+        tot_ret = (total_upnl / total_cost) * 100.0
+
+    log.info(
+        "PERF-BY-SIGNAL-OPEN (unrealized) asof=%s | keys=%s pos=%s cost=%.2f mv=%.2f upnl=%+.2f uret=%+.2f%%",
+        asof, len(rows), sum(int(r["positions"]) for r in rows), total_cost, total_mv, total_upnl, tot_ret
+    )
+
+    for r in rows:
+        log.info(
+            "  %-28s pos=%-3d cost=%9.2f mv=%9.2f upnl=%+9.2f uret=%+6.2f%% hold=%4.1fd",
+            r["entry_signal_key"],
+            int(r["positions"]),
+            float(r["cost"] or 0.0),
+            float(r["mv"] or 0.0),
+            float(r["upnl"] or 0.0),
+            float(r["uret_pct"] or 0.0),
+            float(r["avg_hold_days"] or 0.0),
+        )
+
+    return 0
+
+def cmd_perf_by_signal_total(since: str | None, to_date: str | None, asof: str | None) -> int:
+    from .db import connect
+    from .asof import resolve_asof_date
+    from datetime import datetime, timedelta
+
+    def _today() -> str:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+    if not to_date:
+        to_date = _today()
+    if not since:
+        since = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+
+    # default unrealized snapshot date
+    asof = asof or to_date
+
+    with connect() as conn:
+        asof = resolve_asof_date(conn, asof)
+
+        sql = """
+        WITH
+        realized AS (
+          SELECT
+            COALESCE(i.signal_key, 'unknown') AS entry_signal_key,
+            COUNT(*) AS trades,
+            SUM(CASE WHEN lc.realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(lc.realized_pnl) AS rpnl,
+            AVG(lc.realized_pnl) AS avg_rpnl,
+            AVG(((lc.exit_price - lc.entry_price) / NULLIF(lc.entry_price,0.0)) * 100.0) AS avg_ret_pct,
+            AVG(julianday(substr(lc.exit_filled_at,1,10)) - julianday(substr(lc.entry_filled_at,1,10))) AS avg_hold_days
+          FROM lot_closings lc
+          LEFT JOIN executions e ON e.id = lc.entry_execution_id
+          LEFT JOIN orders o     ON o.id = e.order_id
+          LEFT JOIN intents i    ON i.id = o.intent_id
+          WHERE substr(lc.exit_filled_at, 1, 10) BETWEEN ? AND ?
+          GROUP BY COALESCE(i.signal_key, 'unknown')
+        ),
+        last_bar AS (
+          SELECT b.symbol, b.c AS last_close
+          FROM bars_daily b
+          JOIN (
+            SELECT symbol, MAX(t) AS t
+            FROM bars_daily
+            WHERE t <= ?
+            GROUP BY symbol
+          ) m
+            ON m.symbol = b.symbol AND m.t = b.t
+        ),
+        openpos AS (
+          SELECT
+            COALESCE(p.entry_signal_key, 'unknown') AS entry_signal_key,
+            COUNT(*) AS positions,
+            SUM(p.qty * p.avg_entry_price) AS cost,
+            SUM(p.qty * lb.last_close) AS mv,
+            SUM((p.qty * lb.last_close) - (p.qty * p.avg_entry_price)) AS upnl
+          FROM positions p
+          JOIN last_bar lb ON lb.symbol = p.symbol
+          WHERE p.qty > 0 AND p.avg_entry_price IS NOT NULL
+          GROUP BY COALESCE(p.entry_signal_key, 'unknown')
+        ),
+        keys AS (
+          SELECT entry_signal_key FROM realized
+          UNION
+          SELECT entry_signal_key FROM openpos
+        )
+        SELECT
+          k.entry_signal_key,
+          COALESCE(r.trades, 0) AS trades,
+          COALESCE(r.wins, 0) AS wins,
+          COALESCE(r.rpnl, 0.0) AS realized_pnl,
+          COALESCE(o.positions, 0) AS positions,
+          COALESCE(o.cost, 0.0) AS open_cost,
+          COALESCE(o.mv, 0.0) AS open_mv,
+          COALESCE(o.upnl, 0.0) AS unrealized_pnl,
+          (COALESCE(r.rpnl, 0.0) + COALESCE(o.upnl, 0.0)) AS total_pnl
+        FROM keys k
+        LEFT JOIN realized r ON r.entry_signal_key = k.entry_signal_key
+        LEFT JOIN openpos o  ON o.entry_signal_key = k.entry_signal_key
+        ORDER BY total_pnl DESC;
+        """
+
+        rows = conn.execute(sql, (since, to_date, asof)).fetchall()
+
+    if not rows:
+        log.info("PERF-BY-SIGNAL-TOTAL none | realized=%s→%s asof=%s", since, to_date, asof)
+        return 0
+
+    tot_r = sum(float(r["realized_pnl"] or 0.0) for r in rows)
+    tot_u = sum(float(r["unrealized_pnl"] or 0.0) for r in rows)
+    tot_t = sum(float(r["total_pnl"] or 0.0) for r in rows)
+
+    log.info(
+        "PERF-BY-SIGNAL-TOTAL realized=%s→%s asof=%s | keys=%s rpnl=%+.2f upnl=%+.2f total=%+.2f",
+        since, to_date, asof, len(rows), tot_r, tot_u, tot_t
+    )
+
+    for r in rows:
+        trades = int(r["trades"])
+        wins = int(r["wins"])
+        win_pct = (wins / trades * 100.0) if trades else 0.0
+        log.info(
+            "  %-28s trades=%-4d win=%5.1f%% rpnl=%+9.2f pos=%-3d upnl=%+9.2f total=%+9.2f",
+            r["entry_signal_key"],
+            trades,
+            win_pct,
+            float(r["realized_pnl"] or 0.0),
+            int(r["positions"]),
+            float(r["unrealized_pnl"] or 0.0),
+            float(r["total_pnl"] or 0.0),
+        )
+
+    return 0
+
 def cmd_exposure(asof: str | None, top: int = 20) -> int:
     from .db import connect
     from .asof import resolve_asof_date
@@ -1287,6 +1531,18 @@ def main() -> int:
     p_perf.add_argument("--since", required=False, help="Filter snapshots from YYYY-MM-DD")
     p_perf.add_argument("--last", type=int, required=False, help="Use only last N snapshot days (non-monthly)")
 
+    p_pbs = sub.add_parser("perf-by-signal", help="Realized performance grouped by ENTRY signal_key (from lot_closings).")
+    p_pbs.add_argument("--since", default=None, help="Start date YYYY-MM-DD (inclusive). Default: 90d ago.")
+    p_pbs.add_argument("--to", dest="to_date", default=None, help="End date YYYY-MM-DD (inclusive). Default: today.")
+
+    p_pbso = sub.add_parser("perf-by-signal-open", help="Unrealized performance grouped by entry_signal_key (positions).")
+    p_pbso.add_argument("--asof", default=None, help="As-of date YYYY-MM-DD (default: latest market date in DB).")
+
+    p_pbst = sub.add_parser("perf-by-signal-total", help="Combined realized+unrealized performance by entry_signal_key.")
+    p_pbst.add_argument("--since", default=None, help="Start date YYYY-MM-DD (inclusive). Default: 90d ago.")
+    p_pbst.add_argument("--to", dest="to_date", default=None, help="End date YYYY-MM-DD (inclusive). Default: today.")
+    p_pbst.add_argument("--asof", default=None, help="As-of date for unrealized snapshot (default: --to or latest).")
+
     pae = sub.add_parser("attrib-entry", help="Entry signal attribution (realized trades)")
     pae.add_argument("--since", default=None, help="YYYY-MM-DD")
     pae.add_argument("--limit", type=int, default=None, help="Max journal rows to read")
@@ -1546,6 +1802,15 @@ def main() -> int:
 
         return 0
     
+    if args.cmd == "perf-by-signal":
+        return cmd_perf_by_signal(args.since, args.to_date)
+    
+    if args.cmd == "perf-by-signal-open":
+        return cmd_perf_by_signal_open(args.asof)
+
+    if args.cmd == "perf-by-signal-total":
+        return cmd_perf_by_signal_total(args.since, args.to_date, args.asof)
+
     if args.cmd == "attrib-entry":
         return cmd_attrib_entry(args.since, args.limit, args.top, getattr(args, 'key', None), getattr(args, 'show', 0))
     

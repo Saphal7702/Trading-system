@@ -38,6 +38,10 @@ trading exits
 trading exits --emit-intents --dry-run
 trading exits --trail-peak 8 --trail-dd 3
 
+trading perf-by-signal --since 2026-02-01
+trading perf-by-signal-open
+trading perf-by-signal-total --since 2026-02-01
+
 trading performance
 trading performance --last 20
 trading performance --monthly
