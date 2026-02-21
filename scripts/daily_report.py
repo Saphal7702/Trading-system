@@ -6,16 +6,20 @@ from datetime import datetime
 from pathlib import Path
 import subprocess
 
-ROOT = Path("/home/saphal7702/Trading/Trading-system")
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+
+ROOT = Path(os.environ.get("TRADING_ROOT_PATH", "C:/Users/Saphal/Desktop/Projects/Trading-system"))
 LOGDIR = ROOT / "logs"
 RPTDIR = ROOT / "reports"
 RPTDIR.mkdir(parents=True, exist_ok=True)
 
-DB = os.environ.get("TRADING_DB_PATH", "/home/saphal7702/Trading/TradingData/trading.sqlite")
+DB = Path(os.environ.get("TRADING_DB_PATH", "C:/Users/Saphal/Desktop/Projects/TradingData/trading.sqlite"))
 TZ = os.environ.get("TZ", "America/Denver")
 
 DAY = datetime.now().strftime("%Y-%m-%d")
 REPORT_PATH = RPTDIR / f"{DAY}.txt"
+PDF_PATH = RPTDIR / f"{DAY}.pdf"
 
 
 def q(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[tuple]:
@@ -36,6 +40,7 @@ def find_today_logs() -> list[Path]:
     if not LOGDIR.exists():
         return []
     return sorted(LOGDIR.glob(f"*{DAY}*.log"))
+
 
 def summarize_jobs_from_logs(logs: list[Path]) -> list[str]:
     # Keep only the latest line per job (data/buy/sell)
@@ -74,6 +79,7 @@ def summarize_jobs_from_logs(logs: list[Path]) -> list[str]:
             out.append(latest[job])
     return out
 
+
 def get_performance_output() -> str:
     try:
         out = subprocess.check_output(
@@ -85,6 +91,44 @@ def get_performance_output() -> str:
     except subprocess.CalledProcessError as e:
         return f"(performance command failed)\n{e.output}"
 
+
+def write_pdf(report_text: str, pdf_path: Path) -> None:
+    """Render the full text report into a simple, readable PDF."""
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    c = canvas.Canvas(str(pdf_path), pagesize=letter)
+    width, height = letter
+
+    # Layout
+    left = 36
+    top = height - 36
+    bottom = 36
+    line_h = 11
+
+    c.setTitle(pdf_path.name)
+    c.setFont("Courier", 9)
+
+    y = top
+    for raw in report_text.splitlines():
+        # Hard wrap long lines so they don't run off the page
+        line = raw.rstrip("\n")
+        if not line:
+            chunks = [""]
+        else:
+            max_chars = 110
+            chunks = [line[i: i + max_chars] for i in range(0, len(line), max_chars)]
+
+        for ch in chunks:
+            if y <= bottom:
+                c.showPage()
+                c.setFont("Courier", 9)
+                y = top
+            c.drawString(left, y, ch)
+            y -= line_h
+
+    c.save()
+
+
 def main() -> int:
     parts: list[str] = []
     parts.append(f"Trading Daily Report - {DAY}")
@@ -94,7 +138,6 @@ def main() -> int:
 
     conn = sqlite3.connect(DB)
     try:
-        # Runs today (your schema: started_at, asof_date, notes)
         parts.append("=== Runs (today) ===")
         try:
             rows = q(
@@ -119,7 +162,6 @@ def main() -> int:
             parts.append(f"(runs query failed: {e})")
         parts.append("")
 
-        # Intents today (your schema: created_at exists)
         parts.append("=== Intents (today) ===")
         try:
             rows = q(
@@ -141,7 +183,6 @@ def main() -> int:
             parts.append(f"(intents query failed: {e})")
         parts.append("")
 
-        # Orders today (your schema: requested_at exists)
         parts.append("=== Orders (today) ===")
         try:
             rows = q(
@@ -163,7 +204,6 @@ def main() -> int:
             parts.append(f"(orders query failed: {e})")
         parts.append("")
 
-        # Snapshot (your schema: account_snapshots_daily)
         parts.append("=== Latest Account Snapshot ===")
         try:
             r = q(
@@ -195,12 +235,10 @@ def main() -> int:
             parts.extend(summarize_jobs_from_logs(logs))
         parts.append("")
 
-        #Overall Performance
         parts.append("=== Performance ===")
         parts.append(get_performance_output())
         parts.append("")
 
-        # Errors / warnings from logs
         parts.append("=== Errors / Warnings (from logs) ===")
         logs = find_today_logs()
         if not logs:
@@ -209,7 +247,11 @@ def main() -> int:
             hit = False
             for lp in logs[-8:]:
                 txt = tail_file(lp, n=220)
-                if ("Traceback (most recent call last)" in txt) or ("ERROR" in txt) or ("Exception:" in txt):
+                if (
+                    "Traceback (most recent call last)" in txt
+                    or "ERROR" in txt
+                    or "Exception:" in txt
+                ):
                     hit = True
                     parts.append(f"\n--- {lp.name} (tail) ---\n{txt}\n")
             if not hit:
@@ -219,7 +261,10 @@ def main() -> int:
     finally:
         conn.close()
 
-    REPORT_PATH.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    report_text = "\n".join(parts) + "\n"
+    REPORT_PATH.write_text(report_text, encoding="utf-8")
+    write_pdf(report_text, PDF_PATH)
+
     print(str(REPORT_PATH))
     return 0
 
