@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import os
+import math
 
 from .db import connect
 
@@ -316,6 +317,76 @@ def _fetch_sma(conn, symbol: str, asof: str | None) -> tuple[float | None, float
     return sma20, sma50
 
 
+def _fetch_atr(
+    conn,
+    *,
+    symbol: str,
+    asof: str | None,
+    period: int = 14,
+    lookback_pad: int = 5,
+) -> float | None:
+    """Compute ATR(period) from daily bars up to `asof`.
+
+    True Range (TR) per day:
+      TR = max(H-L, |H-prevC|, |L-prevC|)
+
+    ATR returned here is SMA(TR, period) over the most recent `period` TR values.
+    This is stable and sufficient for exit bands (TP/SL) without adding stored indicators.
+    """
+    if not asof:
+        asof = _resolve_asof_date(conn)
+
+    # Need at least period+1 closes to produce `period` TR observations.
+    n = max(period + 1 + lookback_pad, period + 2)
+    rows = conn.execute(
+        """
+        SELECT t, h, l, c
+        FROM bars_daily
+        WHERE symbol=? AND t<=?
+        ORDER BY t DESC
+        LIMIT ?;
+        """,
+        (symbol, asof, n),
+    ).fetchall()
+
+    if not rows or len(rows) < period + 1:
+        return None
+
+    rows = list(reversed(rows))  # chronological
+
+    highs: list[float] = []
+    lows: list[float] = []
+    closes: list[float] = []
+    for r in rows:
+        if r["h"] is None or r["l"] is None or r["c"] is None:
+            continue
+        highs.append(float(r["h"]))
+        lows.append(float(r["l"]))
+        closes.append(float(r["c"]))
+
+    if len(closes) < period + 1:
+        return None
+
+    trs: list[float] = []
+    for i in range(1, len(closes)):
+        h = highs[i]
+        l = lows[i]
+        pc = closes[i - 1]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        if tr <= 0 or math.isnan(tr):
+            continue
+        trs.append(float(tr))
+
+    if len(trs) < period:
+        return None
+
+    window = trs[-period:]
+    atr = sum(window) / float(period)
+    if atr <= 0 or math.isnan(atr):
+        return None
+    return float(atr)
+
+
 def _rule_priority(signal_key: str) -> int:
     """
     Higher means more urgent.
@@ -337,6 +408,87 @@ def _rule_priority(signal_key: str) -> int:
     return 0
 
 
+def _env_float_full(name: str) -> float | None:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _env_int_full(name: str) -> int | None:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return None
+    try:
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def _env_bool_full(name: str) -> bool | None:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return None
+    return v.lower() in ("1", "true", "t", "yes", "y", "on")
+
+
+def _exit_profile_name(entry_signal_key: str) -> str:
+    """Map entry signal to an exit profile name."""
+    k = (entry_signal_key or "").lower()
+    if k.startswith("mrit_"):
+        return "MRIT"
+    return "DEFAULT"
+
+
+def _apply_profile_overrides(base: ExitRuleConfig, profile: str) -> ExitRuleConfig:
+    """Return ExitRuleConfig based on base, overridden by per-profile env vars.
+
+    Env naming convention:
+      TRADING_EXIT_PROFILE_{PROFILE}_STOP_LOSS_PCT
+      TRADING_EXIT_PROFILE_{PROFILE}_TAKE_PROFIT_PCT
+      TRADING_EXIT_PROFILE_{PROFILE}_EARLY_FAIL_DAYS
+      ...
+    """
+    if profile == "DEFAULT":
+        return base
+
+    pfx = f"TRADING_EXIT_PROFILE_{profile.upper()}_"
+
+    stop_loss = _env_float_full(pfx + "STOP_LOSS_PCT")
+    early_days = _env_int_full(pfx + "EARLY_FAIL_DAYS")
+    early_max = _env_float_full(pfx + "EARLY_FAIL_MAX_RET_PCT")
+
+    trail_peak = _env_float_full(pfx + "TRAIL_PEAK_PCT")
+    trail_dd = _env_float_full(pfx + "TRAIL_DD_PCT")
+
+    be_peak = _env_float_full(pfx + "BREAKEVEN_PEAK_PCT")
+    be_floor = _env_float_full(pfx + "BREAKEVEN_FLOOR_PCT")
+
+    take_profit = _env_float_full(pfx + "TAKE_PROFIT_PCT")
+
+    time_days = _env_int_full(pfx + "TIME_STOP_DAYS")
+    time_min = _env_float_full(pfx + "TIME_STOP_MIN_RET_PCT")
+
+    enable_sma = _env_bool_full(pfx + "ENABLE_SMA_REVERSAL")
+
+    return ExitRuleConfig(
+        stop_loss_pct=stop_loss if stop_loss is not None else base.stop_loss_pct,
+        early_fail_days=early_days if early_days is not None else base.early_fail_days,
+        early_fail_max_ret_pct=early_max if early_max is not None else base.early_fail_max_ret_pct,
+        trail_activate_peak_gain_pct=trail_peak if trail_peak is not None else base.trail_activate_peak_gain_pct,
+        trail_drawdown_pct=trail_dd if trail_dd is not None else base.trail_drawdown_pct,
+        break_even_peak_gain_pct=be_peak if be_peak is not None else base.break_even_peak_gain_pct,
+        break_even_floor_ret_pct=be_floor if be_floor is not None else base.break_even_floor_ret_pct,
+        take_profit_pct=take_profit if take_profit is not None else base.take_profit_pct,
+        time_stop_days=time_days if time_days is not None else base.time_stop_days,
+        time_stop_min_ret_pct=time_min if time_min is not None else base.time_stop_min_ret_pct,
+        enable_sma_reversal=enable_sma if enable_sma is not None else base.enable_sma_reversal,
+    )
+
+
 def evaluate_exit_advice(
     *,
     asof: str | None = None,
@@ -352,6 +504,7 @@ def evaluate_exit_advice(
     cfg = cfg or exit_rule_config_from_env()
 
     with connect() as conn:
+        asof_eff = asof or _resolve_asof_date(conn)
         metrics = _fetch_open_position_metrics(conn, asof)
 
         advice: list[dict[str, Any]] = []
@@ -363,8 +516,22 @@ def evaluate_exit_advice(
             dd = float(m["drawdown_from_peak_pct"]) if m["drawdown_from_peak_pct"] is not None else 0.0
             entry_signal_key = str(m.get("entry_signal_key") or "unknown")
 
+            profile = _exit_profile_name(entry_signal_key)
+            cfg_eff = _apply_profile_overrides(cfg, profile)
+
+            # ATR (primarily for MRIT): profile-aware env controls
+            #   TRADING_EXIT_PROFILE_MRIT_ATR_PERIOD=14
+            #   TRADING_EXIT_PROFILE_MRIT_TP_ATR_MULT=1.0
+            #   TRADING_EXIT_PROFILE_MRIT_SL_ATR_MULT=1.5
+            atr_period = _env_int_full(f"TRADING_EXIT_PROFILE_{profile.upper()}_ATR_PERIOD") or 14
+            tp_atr_mult = _env_float_full(f"TRADING_EXIT_PROFILE_{profile.upper()}_TP_ATR_MULT")
+            sl_atr_mult = _env_float_full(f"TRADING_EXIT_PROFILE_{profile.upper()}_SL_ATR_MULT")
+
+            last_close = float(m["last_close"]) if m.get("last_close") is not None else None
+            vwap_entry = float(m["vwap_entry"]) if m.get("vwap_entry") is not None else None
+
             sma20 = sma50 = None
-            if cfg.enable_sma_reversal:
+            if cfg_eff.enable_sma_reversal:
                 sma20, sma50 = _fetch_sma(conn, symbol, asof)
 
             # Decide rule
@@ -372,47 +539,81 @@ def evaluate_exit_advice(
             action = "HOLD"
             rationale = "No exit rule triggered."
 
+            # 0) ATR-based exits (only if enabled + we can compute ATR)
+            atr = None
+            if tp_atr_mult is not None or sl_atr_mult is not None:
+                # Currently intended for MRIT, but profile-aware by env. If you set
+                # TP_ATR_MULT/SL_ATR_MULT for other profiles, it will work too.
+                if last_close is not None and vwap_entry is not None:
+                    atr = _fetch_atr(conn, symbol=symbol, asof=asof_eff, period=int(atr_period))
+
+            if atr is not None and atr > 0 and last_close is not None and vwap_entry is not None:
+                tp_px = (vwap_entry + float(tp_atr_mult) * atr) if tp_atr_mult is not None else None
+                sl_px = (vwap_entry - float(sl_atr_mult) * atr) if sl_atr_mult is not None else None
+
+                # Stop first
+                if sl_px is not None and last_close <= sl_px:
+                    exit_signal = f"exit_stop_loss_atr{float(sl_atr_mult):g}"
+                    action = "SELL"
+                    rationale = (
+                        f"[{profile}][ATR] Stop: last={last_close:.2f} <= sl={sl_px:.2f} "
+                        f"(entry={vwap_entry:.2f} atr={atr:.2f} period={atr_period})"
+                    )
+
+                # Take profit second
+                elif tp_px is not None and last_close >= tp_px:
+                    exit_signal = f"exit_take_profit_atr{float(tp_atr_mult):g}"
+                    action = "SELL"
+                    rationale = (
+                        f"[{profile}][ATR] Take: last={last_close:.2f} >= tp={tp_px:.2f} "
+                        f"(entry={vwap_entry:.2f} atr={atr:.2f} period={atr_period})"
+                    )
+
             # 1) Hard stop loss
-            if ret <= -abs(cfg.stop_loss_pct):
-                exit_signal = f"exit_stop_loss_{int(cfg.stop_loss_pct)}pct"
+            if action == "HOLD" and ret <= -abs(cfg_eff.stop_loss_pct):
+                exit_signal = f"exit_stop_loss_{int(cfg_eff.stop_loss_pct)}pct"
                 action = "SELL"
-                rationale = f"Hard stop: ret={ret:.2f}% <= -{cfg.stop_loss_pct:.2f}%"
+                rationale = f"Hard stop: ret={ret:.2f}% <= -{cfg_eff.stop_loss_pct:.2f}%"
 
             # 2) Trailing stop (only after meaningful peak gain)
-            elif peak_gain >= cfg.trail_activate_peak_gain_pct and dd <= -abs(cfg.trail_drawdown_pct):
-                exit_signal = f"exit_trailing_dd{int(cfg.trail_drawdown_pct)}_peak{int(cfg.trail_activate_peak_gain_pct)}"
+            elif action == "HOLD" and peak_gain >= cfg_eff.trail_activate_peak_gain_pct and dd <= -abs(cfg_eff.trail_drawdown_pct):
+                exit_signal = f"exit_trailing_dd{int(cfg_eff.trail_drawdown_pct)}_peak{int(cfg_eff.trail_activate_peak_gain_pct)}"
                 action = "SELL"
                 rationale = f"Trailing stop: peak_gain={peak_gain:.2f}% and drawdown={dd:.2f}%"
 
             # 3) SMA reversal
-            elif cfg.enable_sma_reversal and sma20 is not None and sma50 is not None and sma50 is not None and sma20 < sma50:
+            elif action == "HOLD" and cfg_eff.enable_sma_reversal and sma20 is not None and sma50 is not None and sma20 < sma50:
                 exit_signal = "exit_sma_reversal_sma20_below_sma50"
                 action = "SELL"
                 rationale = f"Trend reversal: SMA20={sma20:.4f} < SMA50={sma50:.4f}"
 
             # 4) Early failure stop
-            elif days >= cfg.early_fail_days and ret <= cfg.early_fail_max_ret_pct:
-                exit_signal = f"exit_early_failure_{cfg.early_fail_days}d"
+            elif action == "HOLD" and days >= cfg_eff.early_fail_days and ret <= cfg_eff.early_fail_max_ret_pct:
+                exit_signal = f"exit_early_failure_{cfg_eff.early_fail_days}d"
                 action = "SELL"
-                rationale = f"Early failure: days={days} ret={ret:.2f}% <= {cfg.early_fail_max_ret_pct:.2f}%"
+                rationale = f"Early failure: days={days} ret={ret:.2f}% <= {cfg_eff.early_fail_max_ret_pct:.2f}%"
 
             # 5) Time stop
-            elif days >= cfg.time_stop_days and ret < cfg.time_stop_min_ret_pct:
-                exit_signal = f"exit_time_stop_{cfg.time_stop_days}d"
+            elif action == "HOLD" and days >= cfg_eff.time_stop_days and ret < cfg_eff.time_stop_min_ret_pct:
+                exit_signal = f"exit_time_stop_{cfg_eff.time_stop_days}d"
                 action = "SELL"
-                rationale = f"Time stop: days={days} ret={ret:.2f}% < {cfg.time_stop_min_ret_pct:.2f}%"
+                rationale = f"Time stop: days={days} ret={ret:.2f}% < {cfg_eff.time_stop_min_ret_pct:.2f}%"
 
             # 6) Take profit (soft)
-            elif ret >= cfg.take_profit_pct:
-                exit_signal = f"exit_take_profit_{int(cfg.take_profit_pct)}pct"
+            elif action == "HOLD" and ret >= cfg_eff.take_profit_pct:
+                exit_signal = f"exit_take_profit_{int(cfg_eff.take_profit_pct)}pct"
                 action = "SELL"
-                rationale = f"Take profit: ret={ret:.2f}% >= {cfg.take_profit_pct:.2f}%"
+                rationale = f"Take profit: ret={ret:.2f}% >= {cfg_eff.take_profit_pct:.2f}%"
 
             # Optional WATCH: early negative before early_fail_days
-            elif days < cfg.early_fail_days and ret < 0:
+            elif action == "HOLD" and days < cfg_eff.early_fail_days and ret < 0:
                 exit_signal = "watch_early_weakness"
                 action = "WATCH"
-                rationale = f"Early weakness: days={days} ret={ret:.2f}% (monitor until day {cfg.early_fail_days})"
+                rationale = f"Early weakness: days={days} ret={ret:.2f}% (monitor until day {cfg_eff.early_fail_days})"
+
+            # Prefix rationale with profile tag unless already included.
+            if profile != "DEFAULT" and not rationale.startswith(f"[{profile}]"):
+                rationale = f"[{profile}] {rationale}"
 
             priority = _rule_priority(exit_signal)
 
@@ -436,6 +637,7 @@ def evaluate_exit_advice(
                     "rationale": rationale,
                     "sma20": sma20,
                     "sma50": sma50,
+                    "exit_profile": profile,
                 }
             )
 
@@ -541,7 +743,7 @@ def emit_sell_intents(
                 )
                 inserted += 1
             except Exception:
-                skipped_existing += 1
+                skipped += 1
 
         summary["inserted"] = inserted
         summary["would_insert"] = would_insert
