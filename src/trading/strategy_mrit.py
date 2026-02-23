@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from typing import Optional
 from dataclasses import dataclass
+import logging
+import os
 
 from .db import connect
-from .strategy_sma import Signal  # reuse existing Signal dataclass:contentReference[oaicite:2]{index=2}
+from .strategy_sma import Signal
+
+log = logging.getLogger("trading")
 
 def _sma(values: list[float], window: int) -> list[Optional[float]]:
     out: list[Optional[float]] = [None] * len(values)
@@ -55,6 +59,46 @@ def _rsi_wilder(closes: list[float], period: int) -> list[Optional[float]]:
 
     return out
 
+def _market_regime_gate(conn, *, asof: str) -> tuple[bool, str]:
+    """
+    MRIT market gate: allow buys only when market proxy is in up regime.
+    Up regime default: PROXY close > PROXY SMA200.
+    """
+    enabled = os.getenv("TRADING_MRIT_MARKET_GATE", "1").strip().lower() not in ("0", "false", "no")
+    proxy = os.getenv("TRADING_MRIT_MARKET_PROXY", "SPY").strip().upper()
+    sma_n = int(float(os.getenv("TRADING_MRIT_MARKET_SMA", "200")))
+
+    if not enabled:
+        return True, "MRIT market gate disabled"
+
+    rows = conn.execute(
+        """
+        SELECT t, c
+        FROM bars_daily
+        WHERE symbol=? AND t<=?
+        ORDER BY t ASC;
+        """,
+        (proxy, asof),
+    ).fetchall()
+
+    closes = [float(r["c"]) for r in rows if r["c"] is not None]
+
+    # Safer default: fail-closed (block MRIT) if we can't compute the gate reliably.
+    if len(closes) < sma_n + 5:
+        return False, f"MRIT gated OFF: insufficient {proxy} bars for SMA{sma_n} (have {len(closes)})"
+
+    sma = _sma(closes, sma_n)
+    i = len(closes) - 1
+    if sma[i] is None:
+        return False, f"MRIT gated OFF: {proxy} SMA{sma_n} unavailable"
+
+    c = closes[i]
+    s = float(sma[i])
+
+    if c > s:
+        return True, f"MRIT gate OK: {proxy} c({c:.2f}) > SMA{sma_n}({s:.2f})"
+    return False, f"MRIT gated OFF: {proxy} c({c:.2f}) <= SMA{sma_n}({s:.2f})"
+
 def generate_signals_mrit(
     *,
     universe: str = "sp500",
@@ -72,8 +116,13 @@ def generate_signals_mrit(
     """
     from .asof import resolve_asof_date
 
+    proxy = os.getenv("TRADING_MRIT_MARKET_PROXY", "SPY").strip().upper()
+
     with connect() as conn:
         asof = resolve_asof_date(conn, asof)
+
+        gate_ok, gate_note = _market_regime_gate(conn, asof=asof)
+        log.info("MRIT market gate | %s", gate_note)
 
         rows = conn.execute(
             """
@@ -85,11 +134,24 @@ def generate_signals_mrit(
             (asof, universe),
         ).fetchall()
 
-    syms = [r["symbol"] for r in rows]
-    signals: list[Signal] = []
+        syms = [r["symbol"] for r in rows]
+        signals: list[Signal] = []
 
-    with connect() as conn:
+        # If gated off, don't waste time computing indicators for every symbol
+        if not gate_ok:
+            for sym in syms:
+                if sym == proxy:
+                    signals.append(Signal(sym, "hold", "Skip market proxy symbol"))
+                else:
+                    signals.append(Signal(sym, "hold", gate_note))
+            return signals
+
+        # Gate is ON: do the normal per-symbol work
         for sym in syms:
+            if sym == proxy:
+                signals.append(Signal(sym, "hold", "Skip market proxy symbol"))
+                continue
+
             rows = conn.execute(
                 """
                 SELECT t, c
@@ -132,4 +194,4 @@ def generate_signals_mrit(
             else:
                 signals.append(Signal(sym, "hold", "No MRIT setup"))
 
-    return signals
+        return signals

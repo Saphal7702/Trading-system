@@ -42,7 +42,9 @@ B. Buy pipeline (run-once)
         - Buy logic: SMA20 ↑ crosses SMA50 - “The market is now paying higher prices than it was over the last ~2 months”
             - Recent prices (last ~month) are rising faster than the medium-term trend
             - Momentum has turned positive relative to trend
-        
+
+    1.1 Stragey MRIT
+        - Mean Reversion Inside Trend
 
     2. Raw Signals Generations
         - raw buy signals are computed on the fly from daily OHLCV bars and are not stored in the database.
