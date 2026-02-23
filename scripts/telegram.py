@@ -80,15 +80,30 @@ def _build_brief_summary(report_text: str) -> str:
                         bp = part.split("=", 1)[1]
 
         elif section == "=== Jobs (today, from logs) ===":
-            # Flag preflight blockers (common "warning" users care about)
             if "PREFLIGHT" in ln and "blockers=[" in ln and "blockers=[]" not in ln:
+                job = None
+                if ln.lstrip().startswith("- buy:"):
+                    job = "Buy"
+                elif ln.lstrip().startswith("- sell:"):
+                    job = "Sell"
+
                 if "insufficient_buying_power" in ln:
-                    if "⚠ Sell blocked (insufficient buying power)" not in warnings:
-                        warnings.append("⚠ Sell blocked (insufficient buying power)")
+                    if job == "Sell":
+                        msg = "⚠ Sell step skipped (min buying power gate)"
+                    else:
+                        msg = "⚠ Buy blocked (insufficient buying power)"
+                    if msg not in warnings:
+                        warnings.append(msg)
+
                 elif "market_open=False" in ln:
-                    warnings.append("⚠ Market closed")
+                    msg = "⚠ Market closed"
+                    if msg not in warnings:
+                        warnings.append(msg)
+
                 else:
-                    warnings.append("⚠ Preflight blockers present")
+                    msg = f"⚠ {job + ' ' if job else ''}preflight blockers present"
+                    if msg not in warnings:
+                        warnings.append(msg)
 
         elif section == "=== Performance ===":
             if "| INFO | trading | PERFORMANCE" in ln:
