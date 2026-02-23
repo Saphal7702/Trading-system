@@ -35,7 +35,6 @@ else
 fi
 
 # 4. Generate report
-# Use 'python' or 'python3' depending on your environment
 PYTHON_EXE="python"
 if [[ "$OSTYPE" != "msys" && "$OSTYPE" != "cygwin" ]]; then
     PYTHON_EXE="python3"
