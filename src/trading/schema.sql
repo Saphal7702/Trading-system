@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS intents (
   policy_mult REAL,
   policy_reco_notional REAL,
   policy_would_skip INTEGER,       -- 0/1
-  policy_best_exits TEXT
+  policy_best_exits TEXT,
 
   policy_mode TEXT,                -- off|reduce_only|allow_boost
   base_rank REAL,
@@ -164,9 +164,6 @@ CREATE TABLE IF NOT EXISTS symbol_cooldowns (
 CREATE INDEX IF NOT EXISTS ix_universe_daily_lookup
 ON universe_daily(asof_date, universe, include, score DESC);
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency
-ON orders(idempotency_key)
-WHERE idempotency_key IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_exec_broker_order
 ON executions(broker, broker_order_id)
@@ -231,3 +228,77 @@ CREATE TABLE IF NOT EXISTS account_snapshots_daily (
 CREATE INDEX IF NOT EXISTS ix_orders_intent_id ON orders(intent_id);
 CREATE INDEX IF NOT EXISTS ix_exec_order_id ON executions(order_id);
 CREATE INDEX IF NOT EXISTS ix_intents_signal_key ON intents(signal_key);
+
+-- ---- Phase 8: Institutional Risk Layer ----
+
+CREATE TABLE IF NOT EXISTS portfolio_state (
+  env TEXT PRIMARY KEY,                       -- 'paper' | 'live'
+  state TEXT NOT NULL,                        -- NORMAL | PAUSE_BUYS | SELL_ONLY | HALT_ALL
+  reason TEXT,
+  set_by TEXT NOT NULL,                       -- system | operator
+  set_at TEXT NOT NULL,                       -- ISO timestamp
+  expires_at TEXT,                            -- ISO timestamp, optional
+  allow_sells INTEGER NOT NULL DEFAULT 1,      -- 1/0
+  allow_buys  INTEGER NOT NULL DEFAULT 1,      -- 1/0
+  allow_broker INTEGER NOT NULL DEFAULT 1,     -- 1/0
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS risk_limits (
+  env TEXT PRIMARY KEY,
+  max_dd_pause_buys_pct REAL NOT NULL,        -- e.g. 0.05
+  max_dd_sell_only_pct  REAL NOT NULL,        -- e.g. 0.08
+  max_dd_halt_all_pct   REAL NOT NULL,        -- e.g. 0.12
+  hysteresis_reset_pct  REAL NOT NULL,        -- e.g. 0.03 (resume only if dd <= this)
+  min_equity_floor      REAL NOT NULL,        -- optional equity floor (0 disables)
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS risk_peak_reset (
+  env TEXT PRIMARY KEY,
+  reset_ts TEXT NOT NULL,                     -- ISO timestamp
+  reason TEXT,
+  actor TEXT NOT NULL,                        -- system | operator
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS risk_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  env TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  event_type TEXT NOT NULL,                   -- DD_TRIGGER | STATE_CHANGE | OVERRIDE_SET | OVERRIDE_CLEAR | PEAK_RESET ...
+  prev_state TEXT,
+  new_state TEXT,
+  metrics_json TEXT,
+  reason TEXT,
+  actor TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_risk_events_env_ts
+ON risk_events(env, ts);
+
+CREATE TABLE IF NOT EXISTS risk_daily (
+  env TEXT NOT NULL,
+  date TEXT NOT NULL,                         -- YYYY-MM-DD
+  equity REAL NOT NULL,
+  peak_equity REAL NOT NULL,
+  drawdown_pct REAL NOT NULL,
+  state TEXT NOT NULL,
+  buys_blocked INTEGER NOT NULL,
+  sells_blocked INTEGER NOT NULL,
+  broker_blocked INTEGER NOT NULL,
+  notes TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (env, date)
+);
+
+-- Default seeds (safe if already present)
+INSERT OR IGNORE INTO portfolio_state(env, state, reason, set_by, set_at, expires_at, allow_sells, allow_buys, allow_broker, updated_at)
+VALUES
+  ('paper', 'NORMAL', 'seed', 'system', datetime('now'), NULL, 1, 1, 1, datetime('now')),
+  ('live',  'NORMAL', 'seed', 'system', datetime('now'), NULL, 1, 1, 1, datetime('now'));
+
+INSERT OR IGNORE INTO risk_limits(env, max_dd_pause_buys_pct, max_dd_sell_only_pct, max_dd_halt_all_pct, hysteresis_reset_pct, min_equity_floor, updated_at)
+VALUES
+  ('paper', 0.05, 0.08, 0.12, 0.03, 0.0, datetime('now')),
+  ('live',  0.05, 0.08, 0.12, 0.03, 0.0, datetime('now'));

@@ -29,6 +29,14 @@ trading exits --emit-intents
 trading execute --run-id X --submit
 trading run-once
 
+/*Risk Management*/
+trading risk status
+trading risk set --state SELL_ONLY --reason "manual kill switch" --expires-minutes 240
+trading risk clear --reason "resume normal"
+trading risk reset-peak --reason "start new evaluation window"
+trading risk set --state HALT_ALL --reason "test halt"
+trading run-once
+
 /*Policies*/
 trading policy-recommend
 trading policy-recommend --emit-json
