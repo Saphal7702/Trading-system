@@ -20,6 +20,9 @@ def execute_run(
     qty_default: float = 1.0,
     submit: bool = False,
     retry_failed: bool = False,
+    allow_buys: bool = True,
+    allow_sells: bool = True,
+    risk_state: str | None = None,
 ) -> dict[str, Any]:
     """
     Core execution routine (Phase 2): callable from CLI and runloop.
@@ -32,6 +35,7 @@ def execute_run(
       - SELL sells full current position qty
       - paper-gated via is_paper_submit_allowed()
       - safety rails: daily trade cap, open-order protection, cooldown (planner + execution backup)
+      - NEW: execution-layer risk gating (PAUSE_BUYS / SELL_ONLY / HALT_ALL)
     """
     from .cooldown import is_in_cooldown, set_cooldown  # local import ok
 
@@ -97,7 +101,6 @@ def execute_run(
             "broker_order_id": r["broker_order_id"],
         }
 
-
     def _exposure_by_signal_key(conn) -> dict[str, float]:
         rows = conn.execute(
             """
@@ -142,10 +145,13 @@ def execute_run(
         "skipped_due_to_open_order": 0,
         "skipped_due_to_cooldown": 0,
         "skipped_due_to_exposure": 0,
+        "skipped_due_to_risk_buys": 0,
+        "skipped_due_to_risk_sells": 0,
+        "risk_state": risk_state,
         "cooldown_set": 0,
     }
 
-        # 1) Build + persist (idempotent) from intents
+    # 1) Build + persist (idempotent) from intents
     # Phase 6: intent-queue execution (execute pending intents across runs)
     # Toggle with TRADING_EXECUTION_MODE=run|queue (default queue).
     exec_mode = os.getenv("TRADING_EXECUTION_MODE", "queue").strip().lower()
@@ -162,18 +168,20 @@ def execute_run(
 
     inserted = persist_orders(run_id=run_id, orders=proposed)
 
-
     summary["proposed"] = len(proposed)
     summary["inserted"] = inserted
 
     log.info(
-        "Execute(run_id=%s): proposed=%s | inserted_into_db=%s | retry_failed=%s | per_pos=$%.2f | haircut=%.4f",
+        "Execute(run_id=%s): proposed=%s | inserted_into_db=%s | retry_failed=%s | per_pos=$%.2f | haircut=%.4f | risk_state=%s | allow_buys=%s allow_sells=%s",
         run_id,
         len(proposed),
         inserted,
         retry_failed,
         per_position_notional,
         notional_haircut,
+        risk_state,
+        bool(allow_buys),
+        bool(allow_sells),
     )
 
     if not proposed:
@@ -235,9 +243,7 @@ def execute_run(
             (run_id, *eligible_statuses),
         ).fetchall()
 
-
         # Exposure cap backstop (Phase 6): execution refuses BUYs that breach per-signal exposure cap.
-        # Independent of planner and policy.
         cap_enabled = float(max_exposure_per_signal) > 0.0
         current_exposure: dict[str, float] = {}
         planned_exposure: dict[str, float] = {}
@@ -279,7 +285,6 @@ def execute_run(
             side = (row["side"] or "").lower().strip()
             reason = row["reason"]
 
-            # Intent context (Phase 6): may be NULL for legacy rows
             intent_notional = row["intent_notional"] if "intent_notional" in row.keys() else None
             intent_signal_key = row["intent_signal_key"] if "intent_signal_key" in row.keys() else None
 
@@ -294,6 +299,21 @@ def execute_run(
             )
             if cur.rowcount != 1:
                 log.info("Skip %s %s: could not claim order (already handled)", side.upper(), symbol)
+                continue
+
+            # NEW: execution-layer risk gate (hard backstop)
+            if side == "buy" and not bool(allow_buys):
+                msg = f"risk_gate_buy_blocked state={risk_state or 'UNKNOWN'}"
+                conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
+                summary["skipped_due_to_risk_buys"] += 1
+                log.info("Skip BUY %s (order_id=%s): %s", symbol, order_id, msg)
+                continue
+
+            if side == "sell" and not bool(allow_sells):
+                msg = f"risk_gate_sell_blocked state={risk_state or 'UNKNOWN'}"
+                conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
+                summary["skipped_due_to_risk_sells"] += 1
+                log.info("Skip SELL %s (order_id=%s): %s", symbol, order_id, msg)
                 continue
 
             # Enforce daily trade cap (after claim for concurrency safety)
@@ -312,7 +332,7 @@ def execute_run(
                 )
                 continue
 
-            # Open-order protection: do not submit if any other open-ish internal order exists for this symbol
+            # Open-order protection
             other = _find_open_order_for_symbol(conn, symbol, exclude_order_id=order_id)
             if other is not None:
                 msg = (
@@ -335,8 +355,6 @@ def execute_run(
             # Exposure cap backstop (BUY only)
             if side == "buy" and cap_enabled:
                 key = (str(intent_signal_key).strip() if intent_signal_key is not None else "").strip() or "UNKNOWN"
-
-                # Determine intended notional (use intent target if present, else per_position_notional)
                 try:
                     base_notional = float(intent_notional) if intent_notional is not None else float(per_position_notional)
                 except Exception:
@@ -357,11 +375,10 @@ def execute_run(
                     log.info("Skip BUY %s (order_id=%s): %s", symbol, order_id, msg)
                     continue
 
-                # Reserve exposure for later BUYs in this same run
                 planned_exposure[key] = planned + intended
 
             try:
-                qty_for_execution_row: float = 0.0  # for executions.qty
+                qty_for_execution_row: float = 0.0
 
                 if side == "buy":
                     close = _last_close(conn, symbol)
@@ -376,7 +393,6 @@ def execute_run(
 
                     target = float(base_notional) * float(notional_haircut)
 
-                    # Estimate qty for logging + executions table (broker will calculate actual fill qty)
                     raw_qty = target / close
                     scale = 10 ** frac_decimals
                     est_qty = math.floor(raw_qty * scale) / scale
@@ -396,10 +412,8 @@ def execute_run(
                         reason,
                     )
 
-                    # Submit as NOTIONAL
                     bo = broker.place_market_order(symbol, "buy", notional=float(target))
 
-                    # Store est_qty for visibility (note: only an estimate)
                     try:
                         conn.execute("UPDATE orders SET qty=? WHERE id=?;", (float(est_qty), order_id))
                     except Exception:
@@ -420,13 +434,11 @@ def execute_run(
 
                 broker_order_id = str(getattr(bo, "id", None))
 
-                # Save broker order id on orders row
                 conn.execute(
                     "UPDATE orders SET status='submitted', broker_order_id=? WHERE id=?;",
                     (broker_order_id, order_id),
                 )
 
-                # Set cooldown only for BUY, only if broker_order_id is present, and only if asof is known
                 if side == "buy" and broker_order_id and cooldown_days > 0 and asof:
                     until = set_cooldown(
                         symbol=symbol,
@@ -437,7 +449,6 @@ def execute_run(
                     summary["cooldown_set"] += 1
                     log.info("Cooldown set: %s until=%s (days=%s)", symbol, until, cooldown_days)
 
-                # Save execution snapshot (raw_json keeps broker response)
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
@@ -462,9 +473,13 @@ def execute_run(
 
         summary["submitted"] = submitted
 
-    log.info("Submitted total=%s", summary["submitted"])
+    log.info(
+        "Submitted total=%s | skipped_risk_buys=%s skipped_risk_sells=%s",
+        summary["submitted"],
+        summary["skipped_due_to_risk_buys"],
+        summary["skipped_due_to_risk_sells"],
+    )
     return summary
-
 
 @dataclass(frozen=True)
 class ProposedOrder:

@@ -17,6 +17,19 @@ from trading.policy.loader import load_latest_policy
 
 log = logging.getLogger("trading")
 
+def _make_broker():
+    """Return the correct broker (paper vs live) based on settings.env."""
+    s = get_settings()
+    env = getattr(s, "env", "paper")
+    if str(env).lower() == "live":
+        try:
+            from trading.broker.alpaca_broker import AlpacaLiveBroker  # type: ignore
+        except Exception as e:
+            raise RuntimeError("env=live but AlpacaLiveBroker is not available") from e
+        return AlpacaLiveBroker()  # type: ignore
+
+    return AlpacaPaperBroker()
+
 def cmd_healthcheck() -> int:
     s = get_settings()
     log.info("Env: %s", s.env)
@@ -73,16 +86,80 @@ def cmd_status() -> int:
     return 0
 
 def cmd_broker_check() -> int:
-    b = AlpacaPaperBroker()
+    b = _make_broker()
     upsert_account(b)
     a = b.get_account()
     log.info("Broker OK: %s | status=%s | buying_power=%s | equity=%s", a.broker, a.status, a.buying_power, a.equity)
     return 0
 
 def cmd_sync_positions() -> int:
-    b = AlpacaPaperBroker()
+    b = _make_broker()
     n = sync_positions(b)
     log.info("Synced %s positions from %s", n, b.name)
+    return 0
+
+def cmd_risk_status() -> int:
+    from .risk.state import get_effective_state
+    from .risk.limits import get_limits
+    from .risk.circuit_breaker import compute_peak_and_dd
+    s = get_settings()
+    env = getattr(s, "env", "paper")
+
+    state = get_effective_state(env)
+    limits = get_limits(env)
+
+    # Try to compute dd using latest snapshot if available
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT asof_date, equity FROM account_snapshots_daily ORDER BY asof_date DESC LIMIT 1;"
+        ).fetchone()
+    equity = float(row["equity"]) if row else None
+    peak, dd = compute_peak_and_dd(env=env, equity=equity)
+
+    log.info("RISK env=%s state=%s allow_buys=%s allow_sells=%s allow_broker=%s", env, state["state"], state["allow_buys"], state["allow_sells"], state["allow_broker"])
+    if equity is not None:
+        log.info("RISK equity=%.2f peak=%.2f drawdown=%.2f%%", equity, peak, dd * 100.0)
+    log.info(
+        "LIMITS pause_buys=%.2f%% sell_only=%.2f%% halt_all=%.2f%% reset<=%.2f%%",
+        limits["max_dd_pause_buys_pct"] * 100.0,
+        limits["max_dd_sell_only_pct"] * 100.0,
+        limits["max_dd_halt_all_pct"] * 100.0,
+        limits["hysteresis_reset_pct"] * 100.0,
+    )
+
+    # Last 5 events
+    with connect() as conn:
+        ev = conn.execute(
+            "SELECT ts, event_type, prev_state, new_state, reason, actor FROM risk_events WHERE env=? ORDER BY ts DESC LIMIT 5;",
+            (env,),
+        ).fetchall()
+    for r in ev:
+        log.info("EVENT %s | %s %s->%s | actor=%s | %s", r["ts"], r["event_type"], r["prev_state"], r["new_state"], r["actor"], r["reason"])
+
+    return 0
+
+def cmd_risk_set(state: str, reason: str, expires_minutes: int | None = None) -> int:
+    from .risk.state import set_operator_override
+    s = get_settings()
+    env = getattr(s, "env", "paper")
+    set_operator_override(env=env, state=state, reason=reason, expires_minutes=expires_minutes)
+    log.warning("RISK override set env=%s state=%s reason=%s", env, state, reason)
+    return 0
+
+def cmd_risk_clear() -> int:
+    from .risk.state import clear_operator_override
+    s = get_settings()
+    env = getattr(s, "env", "paper")
+    clear_operator_override(env=env)
+    log.warning("RISK override cleared env=%s", env)
+    return 0
+
+def cmd_risk_reset_peak(reason: str) -> int:
+    from .risk.state import reset_peak
+    s = get_settings()
+    env = getattr(s, "env", "paper")
+    reset_peak(env=env, reason=reason)
+    log.warning("RISK peak reset env=%s reason=%s", env, reason)
     return 0
 
 def cmd_fetch_bars(days: int, universe: str, limit: int , sleep_ms: int) -> int:
@@ -1492,6 +1569,23 @@ def main() -> int:
     p_pf = sub.add_parser("preflight", help="Sanity checks before running (calendar, bars freshness, account, open orders)")
     p_pf.add_argument("--universe", default="sp500")
 
+    # risk (Phase 8)
+    p_risk = sub.add_parser("risk", help="Institutional risk controls (state machine + circuit breaker)")
+    risk_sub = p_risk.add_subparsers(dest="risk_cmd", required=True)
+
+    risk_sub.add_parser("status", help="Show current risk state, drawdown, limits, and recent risk events")
+
+    p_rset = risk_sub.add_parser("set", help="Set an operator override state (SELL_ONLY or HALT_ALL recommended)")
+    p_rset.add_argument("--state", required=True, choices=["NORMAL", "PAUSE_BUYS", "SELL_ONLY", "HALT_ALL"])
+    p_rset.add_argument("--reason", required=True)
+    p_rset.add_argument("--expires-minutes", type=int, default=None, help="Optional TTL for override")
+
+    p_rclr = risk_sub.add_parser("clear", help="Clear operator override (system re-evaluates state next run)")
+    p_rclr.add_argument("--reason", default="operator_clear", help="Optional note for audit log")
+
+    p_rpk = risk_sub.add_parser("reset-peak", help="Reset peak equity anchor used for drawdown calculations")
+    p_rpk.add_argument("--reason", required=True)
+
     p_run = sub.add_parser("run", help="Execute one trading cycle (Phase 1 skeleton)")
     p_run.add_argument("--notes", default="", help="Optional notes to store in runs table")
 
@@ -2086,5 +2180,19 @@ def main() -> int:
                     )
 
         return 0
+
+    if args.cmd == "risk":
+        if args.risk_cmd == "status":
+            return cmd_risk_status()
+        if args.risk_cmd == "set":
+            return cmd_risk_set(args.state, args.reason, args.expires_minutes)
+        if args.risk_cmd == "clear":
+            from .risk.events import emit_event
+            s = get_settings(); env = getattr(s, 'env', 'paper')
+            emit_event(env=env, event_type='OVERRIDE_CLEAR_NOTE', prev_state=None, new_state=None, metrics={}, reason=args.reason, actor='operator')
+            return cmd_risk_clear()
+        if args.risk_cmd == "reset-peak":
+            return cmd_risk_reset_peak(args.reason)
+        return 2
 
     return 1

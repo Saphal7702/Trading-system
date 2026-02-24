@@ -11,6 +11,9 @@ from .db import connect, init_db
 from .cooldown import is_in_cooldown
 from .lock import acquire_lock, release_lock, read_lock_info
 from trading.policy.loader import load_latest_policy, format_policy_summary
+from trading.risk.state import seed_risk_defaults, get_effective_state
+from trading.risk.circuit_breaker import evaluate_and_apply
+from trading.risk.daily import upsert_risk_daily
 
 import logging
 
@@ -20,7 +23,6 @@ from .pnl.snapshots import upsert_account_snapshot
 NY = ZoneInfo("America/New_York")
 
 log = logging.getLogger("trading")
-
 
 @dataclass
 class RunResult:
@@ -129,6 +131,9 @@ def run_once(
     """
 
     init_db()
+
+    env = os.environ.get("TRADING_ENV", "paper")
+    seed_risk_defaults(env)
 
     policy = None
 
@@ -255,10 +260,28 @@ def run_once(
 
         # 2) Broker check + account snapshot
         from trading.broker.alpaca_broker import AlpacaPaperBroker
+        # Live broker class is optional; import only if env=live
+        try:
+            from trading.broker.alpaca_broker import AlpacaLiveBroker  # type: ignore
+        except Exception:
+            AlpacaLiveBroker = None  # type: ignore
+
         from trading.broker.sync import upsert_account, sync_positions
         from .broker.orders_sync import sync_orders
 
-        broker = AlpacaPaperBroker()
+        risk_pre = step('risk_state_pre', lambda: get_effective_state(env))
+        if risk_pre.get('state') == 'HALT_ALL' and risk_pre.get('allow_broker') == 0:
+            finish_run(run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')
+            log.warning('RUN SKIPPED run_id=%s reason=HALT_ALL (broker blocked)', run_id)
+            return RunResult(run_id=run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')
+
+        # Broker selection (paper vs live)
+        if str(env).lower() == 'live':
+            if AlpacaLiveBroker is None:
+                raise RuntimeError('env=live but AlpacaLiveBroker is not available in trading.broker.alpaca_broker')
+            broker = AlpacaLiveBroker()  # type: ignore
+        else:
+            broker = AlpacaPaperBroker()
 
         def _brokercheck():
             upsert_account(broker)
@@ -266,6 +289,17 @@ def run_once(
             return {"broker": a.broker, "status": a.status, "buying_power": a.buying_power, "equity": a.equity}
 
         step("brokercheck", _brokercheck)
+
+        # 2.1) Portfolio circuit breaker (drawdown-based) + state transitions
+        risk = step('risk_circuit_breaker', lambda: evaluate_and_apply(env=env, broker=broker, asof=asof))
+        allow_buys = bool(risk.get("allow_buys", 1)) if isinstance(risk, dict) else True
+        allow_sells = bool(risk.get('allow_sells', 1))
+        allow_broker = bool(risk.get('allow_broker', 1))
+
+        if not allow_broker:
+            finish_run(run_id, status='skipped', asof=asof, summary=summary, reason='broker_blocked')
+            log.warning('RUN SKIPPED run_id=%s reason=broker_blocked state=%s dd=%.4f', run_id, risk.get('state'), float(risk.get('drawdown_pct') or 0.0))
+            return RunResult(run_id=run_id, status='skipped', asof=asof, summary=summary, reason='broker_blocked')
 
         def _env_bool(name: str, default: bool = False) -> bool:
             v = os.getenv(name)
@@ -356,7 +390,17 @@ def run_once(
             else:
                 signals = generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof)
 
-            intents = plan_intents(signals, policy=policy)
+            intents = plan_intents(signals, policy=policy, allow_buys=bool(risk["allow_buys"]),risk_state=risk["state"])
+
+            risk_blocked = 0
+            if not allow_buys:
+                filtered = []
+                for i in intents:
+                    if i.action == 'buy':
+                        risk_blocked += 1
+                        continue
+                    filtered.append(i)
+                intents = filtered
 
             cooldown_days = int(float(os.getenv("TRADING_SYMBOL_COOLDOWN_DAYS", "0")))
             blocked = 0
@@ -380,6 +424,8 @@ def run_once(
                 "sells": sells,
                 "holds": holds,
                 "cooldown_blocked": blocked,
+                "risk_buys_blocked": risk_blocked,
+                "risk_state": risk.get("state") if isinstance(risk, dict) else None,
                 "cooldown_days": cooldown_days,
                 "entry_mode": entry_mode,
             }
@@ -393,11 +439,18 @@ def run_once(
             if not execute_requested:
                 return {"skipped": True, "reason": "execute_not_requested"}
 
+            # Risk gate: buys already filtered at planning time, but protect execution anyway.
+            if not allow_broker:
+                return {"skipped": True, "reason": "broker_blocked_by_risk"}
+
             out = execute_run(
                 run_id=run_id,
                 qty_default=1.0,
                 submit=True,
                 retry_failed=False,
+                allow_buys=allow_buys,
+                allow_sells=allow_sells,
+                risk_state=risk.get("state") if isinstance(risk, dict) else None,
             )
             return out
 
@@ -463,6 +516,13 @@ def run_once(
             return {"asof": asof, "cash": cash, "equity": equity, "buying_power": buying_power, "long_mv": long_mv}
         
         step("account_snapshot", _snapshot_account)
+
+        # 7.7) Risk daily snapshot (state + drawdown)
+        try:
+            step('risk_daily', lambda: upsert_risk_daily(env=env, asof=asof, risk=risk))
+        except Exception as _e:
+            # do not fail the run due to risk_daily persistence issues
+            log.warning('risk_daily failed: %s', _e)
 
         # 8) Finish + one-line report
         finish_run(run_id, status="success", asof=asof, summary=summary)

@@ -155,7 +155,9 @@ def plan_intents(
     max_positions: int | None = None,
     per_position_notional: float | None = None,
     cash_buffer: float | None = None,
-    policy=None,  # PolicySnapshot | None (kept untyped to avoid import coupling)
+    policy=None,
+    allow_buys: bool = True,
+    risk_state: str | None = None,
 ) -> list[Intent]:
     """
     Planner enforces:
@@ -232,6 +234,7 @@ def plan_intents(
 
     intents: list[Intent] = []
     buy_candidates: list[Signal] = []
+    risk_buys_blocked = 0
 
     def _policy_sizing_for_entry(entry_key: str | None, base_notional: float | None) -> dict:
         out = {
@@ -350,7 +353,12 @@ def plan_intents(
             if holding:
                 intents.append(Intent(sym, "hold", "Already holding; skip buy", sig.strength))
             else:
-                buy_candidates.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
+                if not allow_buys:
+                    rs = risk_state or "RISK_BLOCK"
+                    intents.append(Intent(sym, "hold", f"Buy blocked by risk state: {rs}", sig.strength))
+                    risk_buys_blocked += 1
+                else:
+                    buy_candidates.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
 
         else:
             intents.append(Intent(sym, "hold", sig.reason, sig.strength))
