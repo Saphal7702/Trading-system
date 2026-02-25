@@ -101,7 +101,7 @@ def cmd_sync_positions() -> int:
 def cmd_risk_status() -> int:
     from .risk.state import get_effective_state
     from .risk.limits import get_limits
-    from .risk.circuit_breaker import compute_peak_and_dd
+    from .risk.circuit_breaker import compute_peak_and_dd, explain_risk_status
     s = get_settings()
     env = getattr(s, "env", "paper")
 
@@ -116,9 +116,17 @@ def cmd_risk_status() -> int:
     equity = float(row["equity"]) if row else None
     peak, dd = compute_peak_and_dd(env=env, equity=equity)
 
-    log.info("RISK env=%s state=%s allow_buys=%s allow_sells=%s allow_broker=%s", env, state["state"], state["allow_buys"], state["allow_sells"], state["allow_broker"])
+    log.info(
+        "RISK env=%s state=%s allow_buys=%s allow_sells=%s allow_broker=%s",
+        env,
+        state["state"],
+        state["allow_buys"],
+        state["allow_sells"],
+        state["allow_broker"],
+    )
     if equity is not None:
         log.info("RISK equity=%.2f peak=%.2f drawdown=%.2f%%", equity, peak, dd * 100.0)
+
     log.info(
         "LIMITS pause_buys=%.2f%% sell_only=%.2f%% halt_all=%.2f%% reset<=%.2f%%",
         limits["max_dd_pause_buys_pct"] * 100.0,
@@ -127,6 +135,63 @@ def cmd_risk_status() -> int:
         limits["hysteresis_reset_pct"] * 100.0,
     )
 
+    # ---- NEW: streaks + held_ok + would_auto_state ----
+    if equity is not None:
+        diag = explain_risk_status(
+            env=env,
+            equity=float(equity),
+            peak_equity=float(peak),
+            drawdown_pct=float(dd),
+            effective_state=state,
+            limits=limits,
+        )
+
+        log.info(
+            "AUTO instant=%s streak_candidate=%s would_auto=%s operator_override=%s",
+            diag["instant_state"],
+            diag["streak_candidate"],
+            diag["would_auto_state"],
+            diag["operator_override"],
+        )
+
+        log.info(
+            "STREAKS pause_ge=%s/%s sell_ge=%s/%s halt_ge=%s/%s clear_le=%s/%s",
+            diag["streaks"]["pause_ge"],
+            diag["cfg"]["pause_streak_days"],
+            diag["streaks"]["sell_ge"],
+            diag["cfg"]["sell_streak_days"],
+            diag["streaks"]["halt_ge"],
+            diag["cfg"]["halt_streak_days"],
+            diag["streaks"]["clear_le"],
+            diag["cfg"]["clear_streak_days"],
+        )
+
+        log.info(
+            "RECOVERY held_ok=%s age_min=%s can_deescalate=%s min_hold_min=%s reset<=%.2f%% set_at=%s",
+            diag["held_ok"],
+            diag.get("age_minutes"),
+            diag["can_deescalate"],
+            diag["cfg"]["min_hold_minutes"],
+            diag["limits"]["reset"] * 100.0,
+            diag.get("set_at"),
+        )
+
+        log.info(
+            "DECISION desired=%s reason=%s blocked_by_hold=%s",
+            diag["desired_state"],
+            diag["decision_reason"],
+            diag["blocked_by_hold"],
+        )
+
+        hr = diag.get("headroom") or {}
+        log.info(
+            "HEADROOM to_pause=%.2f%% to_sell=%.2f%% to_halt=%.2f%% to_reset=%.2f%%",
+            float(hr.get("to_pause_buys", 0.0)) * 100.0,
+            float(hr.get("to_sell_only", 0.0)) * 100.0,
+            float(hr.get("to_halt_all", 0.0)) * 100.0,
+            float(hr.get("to_reset_band", 0.0)) * 100.0,
+        )
+
     # Last 5 events
     with connect() as conn:
         ev = conn.execute(
@@ -134,7 +199,15 @@ def cmd_risk_status() -> int:
             (env,),
         ).fetchall()
     for r in ev:
-        log.info("EVENT %s | %s %s->%s | actor=%s | %s", r["ts"], r["event_type"], r["prev_state"], r["new_state"], r["actor"], r["reason"])
+        log.info(
+            "EVENT %s | %s %s->%s | actor=%s | %s",
+            r["ts"],
+            r["event_type"],
+            r["prev_state"],
+            r["new_state"],
+            r["actor"],
+            r["reason"],
+        )
 
     return 0
 
