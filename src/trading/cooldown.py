@@ -28,9 +28,13 @@ def set_cooldown(symbol: str, asof: str, days: int, reason: str) -> str:
             INSERT INTO symbol_cooldowns(symbol, cooldown_until, reason)
             VALUES (?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
-              cooldown_until=excluded.cooldown_until,
-              reason=excluded.reason,
-              set_at=datetime('now');
+            cooldown_until = CASE
+                WHEN excluded.cooldown_until > symbol_cooldowns.cooldown_until
+                THEN excluded.cooldown_until
+                ELSE symbol_cooldowns.cooldown_until
+            END,
+            reason = excluded.reason,
+            set_at = datetime('now');
             """,
             (sym, until, reason),
         )

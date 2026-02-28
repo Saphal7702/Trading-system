@@ -342,12 +342,15 @@ def run_once(
 
         cal = step("calendar_check", _calendar_gate)
         if cal.get("skipped"):
-            # mark run as skipped (or success with reason)
             with connect() as conn:
                 conn.execute("UPDATE runs SET asof_date=? WHERE id=?;", (cal["trade_day"], run_id))
             finish_run(run_id, status="skipped")
             log.info("RUN SKIPPED run_id=%s reason=%s trade_day=%s", run_id, cal["reason"], cal["trade_day"])
-            return RunResult(run_id=run_id, reason=cal["reason"], asof=cal["trade_day"])
+            return RunResult(run_id=run_id, status="skipped", asof=cal["trade_day"], summary=summary, reason=cal["reason"])
+
+        asof = cal["trade_day"]
+        with connect() as conn:
+            conn.execute("UPDATE runs SET asof_date=? WHERE id=?;", (asof, run_id))
 
         # 3) Pre-sync orders/positions
         step("sync_orders_pre", lambda: vars(sync_orders(limit=200)))

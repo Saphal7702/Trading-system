@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 1. Detect OS and set appropriate default Root Path
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
-    # Windows (Git Bash / MSYS)
     DEFAULT_ROOT="/c/Users/Saphal/Desktop/Projects/Trading-system"
     VENV_ACTIVATE="Scripts/activate"
+    VENV_PY_REL="Scripts/python"
 else
-    # Linux / macOS
-    DEFAULT_ROOT="/home/saphal7702/Trading/Trading-system" 
+    DEFAULT_ROOT="/home/saphal7702/Trading/Trading-paper/Trading-system"
     VENV_ACTIVATE="bin/activate"
+    VENV_PY_REL="bin/python"
 fi
 
 export ROOT="${TRADING_ROOT_PATH:-$DEFAULT_ROOT}"
@@ -17,7 +16,6 @@ VENV="$ROOT/.venv"
 ENVFILE="$ROOT/.env"
 export TZ="America/Denver"
 
-# 2. Load Environment Variables
 if [ -f "$ENVFILE" ]; then
   set -a
   source "$ENVFILE"
@@ -26,7 +24,6 @@ fi
 
 cd "$ROOT"
 
-# 3. Activate Virtual Environment based on OS structure
 if [ -f "$VENV/$VENV_ACTIVATE" ]; then
     source "$VENV/$VENV_ACTIVATE"
 else
@@ -34,23 +31,23 @@ else
     exit 1
 fi
 
-# 4. Generate report
-PYTHON_EXE="python"
-if [[ "$OSTYPE" != "msys" && "$OSTYPE" != "cygwin" ]]; then
-    PYTHON_EXE="python3"
+# Always use venv python explicitly (no PATH ambiguity)
+PYTHON_EXE="$VENV/$VENV_PY_REL"
+if [ ! -x "$PYTHON_EXE" ]; then
+  echo "Error: Python executable not found at $PYTHON_EXE"
+  exit 1
 fi
 
 # Generate report
-REPORT_PATH="$(python "$ROOT/scripts/daily_report.py")"
+REPORT_PATH="$("$PYTHON_EXE" "$ROOT/scripts/daily_report.py")"
 export TRADING_REPORT_PATH="$REPORT_PATH"
 
-# PDF path is generated alongside the txt report
 PDF_PATH="${REPORT_PATH%.txt}.pdf"
 export TRADING_PDF_PATH="$PDF_PATH"
 
-# 5. Send to Telegram
+# Send to Telegram
 if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-  $PYTHON_EXE "$ROOT/scripts/telegram.py" # <--- Fixed to match PYTHON_EXE
+  "$PYTHON_EXE" "$ROOT/scripts/telegram.py"
 else
   echo "Telegram env not set; report generated at: $REPORT_PATH"
 fi
