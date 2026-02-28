@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -101,10 +102,12 @@ def run_trading_cli(args: list[str], *, timeout_s: int = 45) -> str:
     Run: python -m trading <args...>
     Returns stdout+stderr (cleaned). Never raises.
     """
-    cmd = ["python", "-m", "trading"] + args
+    cmd = [sys.executable, "-m", "trading"] + args
     try:
         p = subprocess.run(
             cmd,
+            cwd=str(ROOT),                
+            env=os.environ.copy(),   
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

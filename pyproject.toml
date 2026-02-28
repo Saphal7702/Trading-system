@@ -10,8 +10,8 @@ requires-python = ">=3.10"
 dependencies = [
   "python-dotenv==1.0.1",
   "requests>=2.31",
-  "numpy>=1.26",
-  "pandas>=2.1",
+  "pytz",
+  "reportlab",
   "alpaca-py==0.28.0",
 ]
 
