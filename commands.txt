@@ -7,6 +7,11 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -e .
 
+#Git Branches
+main      → production (live)
+dev       → integration / paper
+feature/* → short-lived
+
 #Activate venv
 source .venv/bin/activate (Linux/Mac)
 .\.venv\Scripts\Activate.ps1 (Windows)
