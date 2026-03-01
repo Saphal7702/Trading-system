@@ -7,18 +7,26 @@ from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from .base import AccountSummary, PositionSnapshot
 from alpaca.trading.requests import GetCalendarRequest
 
-class AlpacaPaperBroker:
-    """
-    Thin wrapper around Alpaca TradingClient (paper).
-    """
-    name = "alpaca-paper"
+class AlpacaBroker:
     def __init__(self) -> None:
         key = os.getenv("ALPACA_API_KEY", "").strip()
         secret = os.getenv("ALPACA_API_SECRET", "").strip()
         if not key or not secret:
             raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET in environment")
 
-        paper_flag = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+        env = os.getenv("TRADING_ENV", "paper").strip().lower()
+        paper_flag = os.getenv("ALPACA_PAPER", "true").strip().lower() == "true"
+
+        # Safety locks
+        if env == "live" and paper_flag:
+            raise RuntimeError("TRADING_ENV=live but ALPACA_PAPER=true")
+        if env == "paper" and not paper_flag:
+            raise RuntimeError("TRADING_ENV=paper but ALPACA_PAPER=false")
+
+        self.env = env
+        self.paper = paper_flag
+        self.name = "alpaca-paper" if paper_flag else "alpaca-live"
+
         self.client = TradingClient(key, secret, paper=paper_flag)
 
     def get_account(self) -> AccountSummary:
