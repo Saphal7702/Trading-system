@@ -18,8 +18,8 @@ class AlpacaPaperBroker:
         if not key or not secret:
             raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_API_SECRET in environment")
 
-        # Paper by default (your project assumes paper in early phases)
-        self.client = TradingClient(key, secret, paper=True)
+        paper_flag = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+        self.client = TradingClient(key, secret, paper=paper_flag)
 
     def get_account(self) -> AccountSummary:
         acct = self.client.get_account()
