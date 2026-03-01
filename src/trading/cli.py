@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from .compliance import can_sell
 from .universe_watchlist import load_watchlist_csv
 from .runloop import run_once
-from trading.broker.alpaca_broker import AlpacaPaperBroker
+from trading.broker.alpaca_broker import AlpacaBroker
 from trading.broker.sync import upsert_account, sync_positions
 from .exits_advisor import evaluate_exit_advice, ExitRuleConfig, emit_sell_intents, exit_rule_config_from_env,_format_policy_exit_annotation
 from trading.analytics.mfe_mae import compute_excursions_for_closings
@@ -18,17 +18,9 @@ from trading.policy.loader import load_latest_policy
 log = logging.getLogger("trading")
 
 def _make_broker():
-    """Return the correct broker (paper vs live) based on settings.env."""
-    s = get_settings()
-    env = getattr(s, "env", "paper")
-    if str(env).lower() == "live":
-        try:
-            from trading.broker.alpaca_broker import AlpacaLiveBroker  # type: ignore
-        except Exception as e:
-            raise RuntimeError("env=live but AlpacaLiveBroker is not available") from e
-        return AlpacaLiveBroker()  # type: ignore
-
-    return AlpacaPaperBroker()
+    """Return broker instance (env-driven via .env settings)."""
+    from trading.broker.alpaca_broker import AlpacaBroker  # env-driven (paper/live)
+    return AlpacaBroker()
 
 def cmd_healthcheck() -> int:
     s = get_settings()
