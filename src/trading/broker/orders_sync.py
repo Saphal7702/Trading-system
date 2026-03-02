@@ -3,10 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-
 from ..db import connect
-from .alpaca_broker import AlpacaPaperBroker
-
+from .factory import make_broker
 
 @dataclass(frozen=True)
 class SyncResult:
@@ -57,7 +55,7 @@ def sync_orders(limit: int = 200) -> SyncResult:
       - orders.filled_qty / orders.filled_avg_price / orders.filled_at (if columns exist)
       - executions.filled_avg_price / executions.filled_at + raw_json snapshot
     """
-    b = AlpacaPaperBroker()
+    b = make_broker()
     broker_orders = b.list_recent_orders(status="all", limit=limit)
 
     scanned = 0

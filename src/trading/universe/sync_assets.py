@@ -2,10 +2,10 @@ from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass, AssetStatus
 
 from ..db import connect
-from ..broker.alpaca_broker import AlpacaPaperBroker
+from ..broker.factory import make_broker
 
 def sync_assets_cache() -> int:
-    broker = AlpacaPaperBroker()
+    broker = make_broker()
 
     req = GetAssetsRequest(
         asset_class=AssetClass.US_EQUITY,
