@@ -10,7 +10,7 @@ from typing import Any
 
 from .db import connect
 from .cooldown import set_cooldown
-from .broker.alpaca_broker import AlpacaPaperBroker
+from .broker.factory import make_broker
 
 log = logging.getLogger("trading")
 
@@ -204,7 +204,7 @@ def execute_run(
     eligible_statuses = ("created", "failed") if retry_failed else ("created",)
     placeholders = ",".join("?" for _ in eligible_statuses)
 
-    broker = AlpacaPaperBroker()
+    broker = make_broker()
     submitted = 0
 
     with connect() as conn:
