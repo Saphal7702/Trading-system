@@ -1,5 +1,8 @@
-
 /*********************************** Project Commands ****************************************************/
+#Pyproject Info
+Database: Sqlite
+Broker: Alpaca
+
 #Project setup
 sudo apt install python3-venv -y
 python3 -m venv .venv
@@ -100,37 +103,27 @@ trading sync-positions
 
 /**************************************************************************************************************/
 
-/*********************************** Project Requirements ****************************************************/
-#Pyproject Info
-Database: Sqlite
-Broker: Alpaca
 
-#Install requirements
-pip install -e .
-/**************************************************************************************************************/
+/***********************************  Git Commands (This Project):  **********************************************************/
+git branch                  -> Show Branches
+git checkout branchName     -> Switch to the Branch
 
+git add .                   -> Puts a file from the Working Directory into the Staging Area of the Branch.
+git commit -m "message"     -> Permanently records the staged changes as a new commit in the Branch.
+git push                    - > Push the branch to the remote
 
-/***********************************  Git Commands:  **********************************************************/
+git pull
+git merge --ff-only paper
+git push
+
+/***********************************  Git Other Commands:  **********************************************************/
 #All Git Commands:
 git init	                -> Creates a new Git repository in the current directory.
 git status	                -> Shows the state of your working directory and staging area (which files are modified, staged, or untracked).
 git log	                    -> Shows the commit history
-
-#Git Push
-git branch                  -> Shows all the Branches
 git checkout -b branchName  -> Create a new Branch
-git checkout branchName     -> Switch to the Branch
-git add .                   -> Puts a file from the Working Directory into the Staging Area of the Branch.
-git commit -m "message"     -> Permanently records the staged changes as a new commit in the Branch.
-git push -u origin branchName - > Push the branch to the remote
-
-#Git Pull
 git fetch
 git branch -a
-git checkout branchName
-git pull
-
-# Merging to the main Branch
 git checkout main           -> Switch to Main
 git pull origin main        -> Pull from Main
 git merge branchName        -> Merge the Branch

@@ -71,10 +71,10 @@ def run_preflight(*, universe: str = "sp500") -> PreflightResult:
     staleness_days = (today_ny - asof_date).days
 
     # 2) Broker + calendar
-    from trading.broker.alpaca_broker import AlpacaPaperBroker
     from trading.broker.sync import upsert_account
 
-    broker = AlpacaPaperBroker()
+    from trading.cli import _make_broker
+    broker = _make_broker()
     upsert_account(broker)
     acct = broker.get_account()
 
