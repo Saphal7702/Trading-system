@@ -259,13 +259,7 @@ def run_once(
         step("policy_load", _policy_load)
 
         # 2) Broker check + account snapshot
-        from trading.broker.alpaca_broker import AlpacaPaperBroker
-        # Live broker class is optional; import only if env=live
-        try:
-            from trading.broker.alpaca_broker import AlpacaLiveBroker  # type: ignore
-        except Exception:
-            AlpacaLiveBroker = None  # type: ignore
-
+        from trading.broker.factory import make_broker
         from trading.broker.sync import upsert_account, sync_positions
         from .broker.orders_sync import sync_orders
 
@@ -275,13 +269,7 @@ def run_once(
             log.warning('RUN SKIPPED run_id=%s reason=HALT_ALL (broker blocked)', run_id)
             return RunResult(run_id=run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')
 
-        # Broker selection (paper vs live)
-        if str(env).lower() == 'live':
-            if AlpacaLiveBroker is None:
-                raise RuntimeError('env=live but AlpacaLiveBroker is not available in trading.broker.alpaca_broker')
-            broker = AlpacaLiveBroker()  # type: ignore
-        else:
-            broker = AlpacaPaperBroker()
+        broker = make_broker()
 
         def _brokercheck():
             upsert_account(broker)
