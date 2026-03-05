@@ -28,6 +28,18 @@ class LotsApplyResult:
 # Helpers (row access)
 # ----------------------------
 
+def _row_get(r, key, default=None):
+    try:
+        # sqlite3.Row supports keys()
+        if hasattr(r, "keys") and key in r.keys():
+            return r[key]
+        # plain dict
+        if isinstance(r, dict):
+            return r.get(key, default)
+    except Exception:
+        pass
+    return default
+
 def _pick(row: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
     """
     Return the first non-None value for the first existing key in `row`.
@@ -288,7 +300,7 @@ def apply_new_executions(run_id: int | None = None) -> LotsApplyResult:
                     # don’t crash runs because broker hasn’t finalized the fill yet
                     log.info(
                         "Skip execution (not filled yet): exec_id=%s side=%s sym=%s qty=%s price=%s filled_at=%s",
-                        ex.get("id"), side, ex.get("symbol"), qty, price, filled_at
+                        _row_get(ex, "id"), side, _row_get(ex, "symbol"), qty, price, filled_at
                     )
                     continue
 

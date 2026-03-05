@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Require TRADING_ROOT_PATH from environment or .env
+ROOT="${TRADING_ROOT_PATH:-$(cd "$(dirname "$0")/.." && pwd)}"
+
+# OS detection only for venv layout
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
-    DEFAULT_ROOT="/c/Users/Saphal/Desktop/Projects/Trading-system"
     VENV_ACTIVATE="Scripts/activate"
     VENV_PY_REL="Scripts/python"
 else
-    DEFAULT_ROOT="/home/saphal7702/Trading/Trading-paper/Trading-system"
     VENV_ACTIVATE="bin/activate"
     VENV_PY_REL="bin/python"
 fi
 
-export ROOT="${TRADING_ROOT_PATH:-$DEFAULT_ROOT}"
 VENV="$ROOT/.venv"
 ENVFILE="$ROOT/.env"
 export TZ="America/Denver"
 
+# Load .env if present
 if [ -f "$ENVFILE" ]; then
   set -a
   source "$ENVFILE"
@@ -24,6 +26,7 @@ fi
 
 cd "$ROOT"
 
+# Activate virtualenv
 if [ -f "$VENV/$VENV_ACTIVATE" ]; then
     source "$VENV/$VENV_ACTIVATE"
 else
@@ -31,8 +34,9 @@ else
     exit 1
 fi
 
-# Always use venv python explicitly (no PATH ambiguity)
+# Always use venv python explicitly
 PYTHON_EXE="$VENV/$VENV_PY_REL"
+
 if [ ! -x "$PYTHON_EXE" ]; then
   echo "Error: Python executable not found at $PYTHON_EXE"
   exit 1
