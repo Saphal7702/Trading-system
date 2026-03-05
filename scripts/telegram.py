@@ -125,6 +125,7 @@ def _build_brief_summary(report_text: str) -> str:
                 has_errors = True
 
     # Defaults if missing
+    env = os.getenv("TRADING_ENV")
     buy_cnt = buy_cnt if buy_cnt is not None else 0
     sell_cnt = sell_cnt if sell_cnt is not None else 0
     hold_cnt = hold_cnt if hold_cnt is not None else 0
@@ -132,6 +133,7 @@ def _build_brief_summary(report_text: str) -> str:
     title_day = day or "(unknown date)"
     out: list[str] = []
     out.append(f"📊 Trading Daily Report — {title_day}")
+    out.append(f"System — {env}")
     out.append("")
     out.append(f"Runs: {runs_success}/{runs_total} success")
     out.append(f"Buys: {buy_cnt}")
