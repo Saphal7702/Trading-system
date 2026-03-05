@@ -38,6 +38,7 @@ def execute_run(
       - NEW: execution-layer risk gating (PAUSE_BUYS / SELL_ONLY / HALT_ALL)
     """
     from .cooldown import is_in_cooldown, set_cooldown  # local import ok
+    from .market_calendar import today_ny_str
 
     def _env_float(name: str, default: float) -> float:
         v = os.getenv(name)
@@ -124,6 +125,7 @@ def execute_run(
     # ------- safety knobs -------
     daily_cap = _env_int("TRADING_DAILY_TRADE_CAP", 999999)
     cooldown_days = _env_int("TRADING_SYMBOL_COOLDOWN_DAYS", 0)
+    sell_cooldown_days = _env_int("TRADING_SELL_COOLDOWN_DAYS", 0)
     max_exposure_per_signal = _env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 0.0)
 
     summary: dict[str, Any] = {
@@ -149,6 +151,8 @@ def execute_run(
         "skipped_due_to_risk_sells": 0,
         "risk_state": risk_state,
         "cooldown_set": 0,
+        "sell_cooldown_days": sell_cooldown_days,
+        "sell_cooldown_set": 0,
     }
 
     # 1) Build + persist (idempotent) from intents
@@ -214,13 +218,15 @@ def execute_run(
             (run_id,),
         ).fetchone()
         asof = run_row["asof_date"] if run_row and run_row["asof_date"] else None
-        summary["asof"] = asof
 
-        if cooldown_days > 0 and not asof:
-            log.info(
-                "Cooldown enabled but runs.asof_date is NULL for run_id=%s; cooldown will not be set/enforced in execution.",
-                run_id,
-            )
+        if not asof:
+            asof = today_ny_str()
+            try:
+                conn.execute("UPDATE runs SET asof_date=? WHERE id=? AND asof_date IS NULL;", (asof, run_id))
+            except Exception:
+                pass
+
+        summary["asof"] = asof
 
         # 2) Submit ONLY DB-eligible orders (DB is source of truth)
         db_orders = conn.execute(
@@ -448,6 +454,16 @@ def execute_run(
                     )
                     summary["cooldown_set"] += 1
                     log.info("Cooldown set: %s until=%s (days=%s)", symbol, until, cooldown_days)
+
+                if side == "sell" and broker_order_id and sell_cooldown_days > 0 and asof:
+                    until = set_cooldown(
+                        symbol=symbol,
+                        asof=asof,
+                        days=sell_cooldown_days,
+                        reason="sell_submitted",
+                    )
+                    summary["sell_cooldown_set"] += 1
+                    log.info("SELL cooldown set: %s until=%s (days=%s)", symbol, until, sell_cooldown_days)
 
                 conn.execute(
                     """
