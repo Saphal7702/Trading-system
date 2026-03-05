@@ -113,7 +113,7 @@ git commit -m "message"     -> Permanently records the staged changes as a new c
 git push                    - > Push the branch to the remote
 
 git pull
-git merge --ff-only paper
+git merge --no-ff paper
 git push
 
 /***********************************  Git Other Commands:  **********************************************************/
