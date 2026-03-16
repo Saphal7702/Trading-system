@@ -13,7 +13,6 @@ pip install -e .
 #Git Branches
 main      → production (live)
 dev       → integration / paper
-feature/* → short-lived
 
 #Activate venv
 source .venv/bin/activate (Linux/Mac)
@@ -26,23 +25,28 @@ trading load-universe --file data/sp500.csv
 trading fetch-bars --days 400
 trading preflight
 
+/*Risk Management*/
+trading risk status
+trading risk set --state SELL_ONLY --reason "manual kill switch" --expires-minutes 240
+trading risk set --state NORMAL --reason "paper resume"
+trading risk clear --reason "resume normal"
+trading risk reset-peak --reason "start new evaluation window"
+trading risk set --state HALT_ALL --reason "test halt"
+trading run-once
+
 /*Automated executions (Planning and Buying)*/
 trading run-once
 trading show-intents --run-id X
 trading run-once --execute
 
 /*Manual Selling for now (Selling and Exit strategy)*/
+trading sync-assets
+trading sync-orders
+trading sync-positions
 trading exits
+trading exits --dry-run --emit-intents
 trading exits --emit-intents
 trading execute --run-id X --submit
-trading run-once
-
-/*Risk Management*/
-trading risk status
-trading risk set --state SELL_ONLY --reason "manual kill switch" --expires-minutes 240
-trading risk clear --reason "resume normal"
-trading risk reset-peak --reason "start new evaluation window"
-trading risk set --state HALT_ALL --reason "test halt"
 trading run-once
 
 /*Policies*/
@@ -91,12 +95,12 @@ trading trades --open
 trading trades --closed --last 50
 
 /*Manual executions*/
-trading sync-assets
 trading build-universe --top 200
 trading show-universe --limit 20
 trading plan
 trading show-intents --run-id X
 trading execute --run-id X --submit
+trading sync-assets
 trading sync-orders
 trading sync-positions
 /**********************/
