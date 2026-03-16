@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import sqlite3
+import time
 import hashlib
 import os
 import json
@@ -13,6 +15,13 @@ from .cooldown import set_cooldown
 from .broker.factory import make_broker
 
 log = logging.getLogger("trading")
+
+def _is_locked_error(exc: BaseException) -> bool:
+    try:
+        return "database is locked" in str(exc).lower()
+    except Exception:
+        return False
+
 
 def execute_run(
     *,
@@ -36,6 +45,11 @@ def execute_run(
       - paper-gated via is_paper_submit_allowed()
       - safety rails: daily trade cap, open-order protection, cooldown (planner + execution backup)
       - NEW: execution-layer risk gating (PAUSE_BUYS / SELL_ONLY / HALT_ALL)
+
+    Locking note:
+      - keep SQLite write transactions short
+      - never hold a DB transaction open across broker/network calls
+      - write cooldowns only after the order submit DB transaction is closed
     """
     from .cooldown import is_in_cooldown, set_cooldown  # local import ok
     from .market_calendar import today_ny_str
@@ -117,6 +131,40 @@ def execute_run(
             out[str(r["k"])] = float(r["notional"] or 0.0)
         return out
 
+    def _db_call(
+        fn,
+        *,
+        write: bool = False,
+        retries: int = 10,
+        base_delay: float = 0.35,
+        max_delay: float = 2.5,
+    ):
+        last_err = None
+        for attempt in range(retries):
+            try:
+                with connect() as conn:
+                    if write:
+                        conn.execute("BEGIN IMMEDIATE;")
+                    out = fn(conn)
+                    if write:
+                        conn.commit()
+                    return out
+            except sqlite3.OperationalError as e:
+                last_err = e
+                if not _is_locked_error(e) or attempt == retries - 1:
+                    raise
+                delay = min(max_delay, base_delay * (2 ** attempt))
+                log.warning(
+                    "SQLite busy/locked during %s transaction (attempt %s/%s): %s",
+                    "write" if write else "read",
+                    attempt + 1,
+                    retries,
+                    e,
+                )
+                time.sleep(delay)
+        if last_err is not None:
+            raise last_err
+
     # ------- sizing knobs (env controlled) -------
     per_position_notional = _env_float("TRADING_PER_POSITION", 100.0)
     notional_haircut = _env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)
@@ -153,6 +201,7 @@ def execute_run(
         "cooldown_set": 0,
         "sell_cooldown_days": sell_cooldown_days,
         "sell_cooldown_set": 0,
+        "deferred_due_to_db_lock": 0,
     }
 
     # 1) Build + persist (idempotent) from intents
@@ -211,25 +260,20 @@ def execute_run(
     broker = make_broker()
     submitted = 0
 
-    with connect() as conn:
-        # Resolve asof_date for this run (used for cooldown)
+    def _load_run_context(conn):
         run_row = conn.execute(
             "SELECT asof_date FROM runs WHERE id=?;",
             (run_id,),
         ).fetchone()
-        asof = run_row["asof_date"] if run_row and run_row["asof_date"] else None
-
-        if not asof:
-            asof = today_ny_str()
+        asof_local = run_row["asof_date"] if run_row and run_row["asof_date"] else None
+        if not asof_local:
+            asof_local = today_ny_str()
             try:
-                conn.execute("UPDATE runs SET asof_date=? WHERE id=? AND asof_date IS NULL;", (asof, run_id))
+                conn.execute("UPDATE runs SET asof_date=? WHERE id=? AND asof_date IS NULL;", (asof_local, run_id))
             except Exception:
                 pass
 
-        summary["asof"] = asof
-
-        # 2) Submit ONLY DB-eligible orders (DB is source of truth)
-        db_orders = conn.execute(
+        db_orders_local = conn.execute(
             f"""
             SELECT
                 o.id, o.symbol, o.side, o.qty, o.reason, o.idempotency_key, o.status, o.intent_id,
@@ -249,20 +293,7 @@ def execute_run(
             (run_id, *eligible_statuses),
         ).fetchall()
 
-        # Exposure cap backstop (Phase 6): execution refuses BUYs that breach per-signal exposure cap.
-        cap_enabled = float(max_exposure_per_signal) > 0.0
-        current_exposure: dict[str, float] = {}
-        planned_exposure: dict[str, float] = {}
-        if cap_enabled:
-            current_exposure = _exposure_by_signal_key(conn)
-
-        if not db_orders:
-            log.info("No DB-eligible orders to submit (statuses=%s).", eligible_statuses)
-            log.info("Submitted total=0")
-            summary["submitted"] = 0
-            return summary
-
-        already = conn.execute(
+        already_local = conn.execute(
             """
             SELECT COUNT(*) AS c
             FROM orders
@@ -272,73 +303,68 @@ def execute_run(
             (run_id,),
         ).fetchone()["c"]
 
-        summary["already_submitted"] = int(already or 0)
+        exposure_local = _exposure_by_signal_key(conn) if float(max_exposure_per_signal) > 0.0 else {}
+        return asof_local, db_orders_local, int(already_local or 0), exposure_local
 
-        remaining = daily_cap - summary["already_submitted"]
-        if remaining <= 0:
-            summary["skipped_reason"] = "daily_trade_cap_reached"
-            log.info(
-                "Daily trade cap reached before submitting: cap=%s already_submitted=%s",
-                daily_cap,
-                summary["already_submitted"],
-            )
-            summary["submitted"] = 0
-            return summary
+    asof, db_orders, already, current_exposure = _db_call(_load_run_context)
+    summary["asof"] = asof
+    summary["already_submitted"] = already
 
-        for row in db_orders:
-            order_id = row["id"]
-            symbol = (row["symbol"] or "").upper().strip()
-            side = (row["side"] or "").lower().strip()
-            reason = row["reason"]
+    cap_enabled = float(max_exposure_per_signal) > 0.0
+    planned_exposure: dict[str, float] = {}
 
-            intent_notional = row["intent_notional"] if "intent_notional" in row.keys() else None
-            intent_signal_key = row["intent_signal_key"] if "intent_signal_key" in row.keys() else None
+    if not db_orders:
+        log.info("No DB-eligible orders to submit (statuses=%s).", eligible_statuses)
+        log.info("Submitted total=0")
+        summary["submitted"] = 0
+        return summary
 
-            if not symbol or side not in ("buy", "sell"):
-                log.info("Skip order id=%s: invalid symbol/side (symbol=%r side=%r)", order_id, symbol, side)
-                continue
+    remaining = daily_cap - summary["already_submitted"]
+    if remaining <= 0:
+        summary["skipped_reason"] = "daily_trade_cap_reached"
+        log.info(
+            "Daily trade cap reached before submitting: cap=%s already_submitted=%s",
+            daily_cap,
+            summary["already_submitted"],
+        )
+        summary["submitted"] = 0
+        return summary
 
-            # Atomically claim this DB order (prevents concurrent submits)
+    for row in db_orders:
+        order_id = row["id"]
+        symbol = (row["symbol"] or "").upper().strip()
+        side = (row["side"] or "").lower().strip()
+        reason = row["reason"]
+        intent_notional = row["intent_notional"] if "intent_notional" in row.keys() else None
+        intent_signal_key = row["intent_signal_key"] if "intent_signal_key" in row.keys() else None
+
+        if not symbol or side not in ("buy", "sell"):
+            log.info("Skip order id=%s: invalid symbol/side (symbol=%r side=%r)", order_id, symbol, side)
+            continue
+
+        def _claim_and_prepare(conn):
             cur = conn.execute(
                 f"UPDATE orders SET status='submitting' WHERE id=? AND status IN ({placeholders});",
                 (order_id, *eligible_statuses),
             )
             if cur.rowcount != 1:
-                log.info("Skip %s %s: could not claim order (already handled)", side.upper(), symbol)
-                continue
+                return {"action": "already_handled"}
 
-            # NEW: execution-layer risk gate (hard backstop)
             if side == "buy" and not bool(allow_buys):
                 msg = f"risk_gate_buy_blocked state={risk_state or 'UNKNOWN'}"
                 conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
-                summary["skipped_due_to_risk_buys"] += 1
-                log.info("Skip BUY %s (order_id=%s): %s", symbol, order_id, msg)
-                continue
+                return {"action": "skipped", "skip_type": "risk_buy", "message": msg}
 
             if side == "sell" and not bool(allow_sells):
                 msg = f"risk_gate_sell_blocked state={risk_state or 'UNKNOWN'}"
                 conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
-                summary["skipped_due_to_risk_sells"] += 1
-                log.info("Skip SELL %s (order_id=%s): %s", symbol, order_id, msg)
-                continue
+                return {"action": "skipped", "skip_type": "risk_sell", "message": msg}
 
-            # Enforce daily trade cap (after claim for concurrency safety)
             if submitted >= remaining:
-                conn.execute(
-                    "UPDATE orders SET status='skipped', reason=? WHERE id=?;",
-                    (f"daily_trade_cap_reached cap={daily_cap}", order_id),
-                )
-                summary["skipped_due_to_cap"] += 1
-                log.info(
-                    "Skip order id=%s due to daily trade cap (cap=%s already=%s submitted_now=%s)",
-                    order_id,
-                    daily_cap,
-                    summary["already_submitted"],
-                    submitted,
-                )
-                continue
+                msg = f"daily_trade_cap_reached cap={daily_cap}"
+                conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
+                return {"action": "skipped", "skip_type": "daily_cap", "message": msg}
 
-            # Open-order protection
             other = _find_open_order_for_symbol(conn, symbol, exclude_order_id=order_id)
             if other is not None:
                 msg = (
@@ -346,19 +372,8 @@ def execute_run(
                     f"other_status={other['status']} other_broker_order_id={other.get('broker_order_id')}"
                 )
                 conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
-                summary["skipped_due_to_open_order"] += 1
-                log.info("Skip %s %s (order_id=%s): %s", side.upper(), symbol, order_id, msg)
-                continue
+                return {"action": "skipped", "skip_type": "open_order", "message": msg}
 
-            # Execution-side cooldown (backup safety)
-            if side == "buy" and cooldown_days > 0 and asof and is_in_cooldown(symbol, asof):
-                msg = f"cooldown_active asof={asof}"
-                conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
-                summary["skipped_due_to_cooldown"] += 1
-                log.info("Skip BUY %s due to cooldown (order_id=%s)", symbol, order_id)
-                continue
-
-            # Exposure cap backstop (BUY only)
             if side == "buy" and cap_enabled:
                 key = (str(intent_signal_key).strip() if intent_signal_key is not None else "").strip() or "UNKNOWN"
                 try:
@@ -367,7 +382,6 @@ def execute_run(
                     base_notional = float(per_position_notional)
 
                 intended = float(base_notional) * float(notional_haircut)
-
                 curr = float(current_exposure.get(key, 0.0))
                 planned = float(planned_exposure.get(key, 0.0))
 
@@ -377,117 +391,196 @@ def execute_run(
                         f"curr={curr:.2f} planned={planned:.2f} intended={intended:.2f}"
                     )
                     conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id))
-                    summary["skipped_due_to_exposure"] += 1
-                    log.info("Skip BUY %s (order_id=%s): %s", symbol, order_id, msg)
-                    continue
+                    return {"action": "skipped", "skip_type": "exposure", "message": msg}
 
                 planned_exposure[key] = planned + intended
 
-            try:
-                qty_for_execution_row: float = 0.0
+            if side == "buy":
+                close = _last_close(conn, symbol)
+                if close is None or close <= 0:
+                    raise RuntimeError(f"No close price available to size BUY for {symbol}")
 
-                if side == "buy":
-                    close = _last_close(conn, symbol)
-                    if close is None or close <= 0:
-                        raise RuntimeError(f"No close price available to size BUY for {symbol}")
+                base_notional = intent_notional if intent_notional is not None else per_position_notional
+                try:
+                    base_notional = float(base_notional)
+                except Exception:
+                    base_notional = float(per_position_notional)
 
-                    base_notional = intent_notional if intent_notional is not None else per_position_notional
-                    try:
-                        base_notional = float(base_notional)
-                    except Exception:
-                        base_notional = float(per_position_notional)
-
-                    target = float(base_notional) * float(notional_haircut)
-
-                    raw_qty = target / close
-                    scale = 10 ** frac_decimals
-                    est_qty = math.floor(raw_qty * scale) / scale
-                    if est_qty <= 0:
-                        raise RuntimeError(
-                            f"Computed BUY qty too small for {symbol}: close={close} target={target} raw_qty={raw_qty}"
-                        )
-
-                    qty_for_execution_row = float(est_qty)
-
-                    log.info(
-                        "ORDER BUY %s target_notional=$%.2f close=%.4f -> est_qty=%.6f | %s",
-                        symbol,
-                        target,
-                        close,
-                        est_qty,
-                        reason,
+                target = float(base_notional) * float(notional_haircut)
+                raw_qty = target / close
+                scale = 10 ** frac_decimals
+                est_qty = math.floor(raw_qty * scale) / scale
+                if est_qty <= 0:
+                    raise RuntimeError(
+                        f"Computed BUY qty too small for {symbol}: close={close} target={target} raw_qty={raw_qty}"
                     )
 
-                    bo = broker.place_market_order(symbol, "buy", notional=float(target))
-
-                    try:
-                        conn.execute("UPDATE orders SET qty=? WHERE id=?;", (float(est_qty), order_id))
-                    except Exception:
-                        pass
-
-                else:  # sell
-                    pos_qty = _position_qty(conn, symbol)
-                    if pos_qty <= 0:
-                        raise RuntimeError(f"No position qty to SELL for {symbol} (pos_qty={pos_qty})")
-
-                    qty_to_send = float(pos_qty)
-                    qty_for_execution_row = qty_to_send
-
-                    conn.execute("UPDATE orders SET qty=? WHERE id=?;", (qty_to_send, order_id))
-                    log.info("ORDER SELL %s qty=%.6f | %s", symbol, qty_to_send, reason)
-
-                    bo = broker.place_market_order(symbol, "sell", qty=float(qty_to_send))
-
-                broker_order_id = str(getattr(bo, "id", None))
-
-                conn.execute(
-                    "UPDATE orders SET status='submitted', broker_order_id=? WHERE id=?;",
-                    (broker_order_id, order_id),
-                )
-
-                if side == "buy" and broker_order_id and cooldown_days > 0 and asof:
-                    until = set_cooldown(
-                        symbol=symbol,
-                        asof=asof,
-                        days=cooldown_days,
-                        reason="buy_submitted",
-                    )
-                    summary["cooldown_set"] += 1
-                    log.info("Cooldown set: %s until=%s (days=%s)", symbol, until, cooldown_days)
-
-                if side == "sell" and broker_order_id and sell_cooldown_days > 0 and asof:
-                    until = set_cooldown(
-                        symbol=symbol,
-                        asof=asof,
-                        days=sell_cooldown_days,
-                        reason="sell_submitted",
-                    )
-                    summary["sell_cooldown_set"] += 1
-                    log.info("SELL cooldown set: %s until=%s (days=%s)", symbol, until, sell_cooldown_days)
-
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        "alpaca",
-                        broker_order_id,
-                        symbol,
-                        side,
-                        float(qty_for_execution_row),
-                        json.dumps(bo.model_dump(), default=str),
+                return {
+                    "action": "submit",
+                    "side": side,
+                    "symbol": symbol,
+                    "reason": reason,
+                    "qty_for_execution_row": float(est_qty),
+                    "qty_to_persist": float(est_qty),
+                    "broker_kwargs": {"symbol": symbol, "side": "buy", "notional": float(target)},
+                    "log_msg": (
+                        f"ORDER BUY {symbol} target_notional=${target:.2f} close={close:.4f} "
+                        f"-> est_qty={est_qty:.6f} | {reason}"
                     ),
+                }
+
+            pos_qty = _position_qty(conn, symbol)
+            if pos_qty <= 0:
+                raise RuntimeError(f"No position qty to SELL for {symbol} (pos_qty={pos_qty})")
+
+            qty_to_send = float(pos_qty)
+            return {
+                "action": "submit",
+                "side": side,
+                "symbol": symbol,
+                "reason": reason,
+                "qty_for_execution_row": qty_to_send,
+                "qty_to_persist": qty_to_send,
+                "broker_kwargs": {"symbol": symbol, "side": "sell", "qty": qty_to_send},
+                "log_msg": f"ORDER SELL {symbol} qty={qty_to_send:.6f} | {reason}",
+            }
+
+        try:
+            prep = _db_call(_claim_and_prepare, write=True)
+        except Exception as e:
+            if _is_locked_error(e):
+                summary["deferred_due_to_db_lock"] += 1
+                log.warning(
+                    "Deferred %s %s (order_id=%s): SQLite remained locked during claim/prepare after retries",
+                    side.upper(),
+                    symbol,
+                    order_id,
                 )
+                continue
+            try:
+                _db_call(
+                    lambda conn: conn.execute(
+                        "UPDATE orders SET status='failed', reason=? WHERE id=?;",
+                        (str(e), order_id),
+                    ),
+                    write=True,
+                )
+            except Exception as write_err:
+                log.warning("Could not persist prepare failure for order_id=%s: %s", order_id, write_err)
+            log.info("FAILED preparing %s %s: %s", side.upper(), symbol, e)
+            continue
 
-                submitted += 1
-                log.info("Submitted %s %s -> broker_order_id=%s", side.upper(), symbol, broker_order_id)
+        if prep["action"] == "already_handled":
+            log.info("Skip %s %s: could not claim order (already handled)", side.upper(), symbol)
+            continue
 
-            except Exception as e:
-                conn.execute("UPDATE orders SET status='failed', reason=? WHERE id=?;", (str(e), order_id))
-                log.info("FAILED submitting %s %s: %s", side.upper(), symbol, e)
+        if prep["action"] == "skipped":
+            skip_type = prep.get("skip_type")
+            if skip_type == "risk_buy":
+                summary["skipped_due_to_risk_buys"] += 1
+            elif skip_type == "risk_sell":
+                summary["skipped_due_to_risk_sells"] += 1
+            elif skip_type == "daily_cap":
+                summary["skipped_due_to_cap"] += 1
+            elif skip_type == "open_order":
+                summary["skipped_due_to_open_order"] += 1
+            elif skip_type == "exposure":
+                summary["skipped_due_to_exposure"] += 1
+            log.info("Skip %s %s (order_id=%s): %s", side.upper(), symbol, order_id, prep.get("message"))
+            continue
 
-        summary["submitted"] = submitted
+        if side == "buy" and cooldown_days > 0 and asof and is_in_cooldown(symbol, asof):
+            msg = f"cooldown_active asof={asof}"
+            _db_call(lambda conn: conn.execute("UPDATE orders SET status='skipped', reason=? WHERE id=?;", (msg, order_id)), write=True)
+            summary["skipped_due_to_cooldown"] += 1
+            log.info("Skip BUY %s due to cooldown (order_id=%s)", symbol, order_id)
+            continue
+
+        log.info(prep["log_msg"])
+
+        try:
+            if prep["side"] == "buy":
+                bo = broker.place_market_order(
+                    prep["broker_kwargs"]["symbol"],
+                    prep["broker_kwargs"]["side"],
+                    notional=float(prep["broker_kwargs"]["notional"]),
+                )
+            else:
+                bo = broker.place_market_order(
+                    prep["broker_kwargs"]["symbol"],
+                    prep["broker_kwargs"]["side"],
+                    qty=float(prep["broker_kwargs"]["qty"]),
+                )
+        except Exception as e:
+            try:
+                _db_call(
+                    lambda conn: conn.execute(
+                        "UPDATE orders SET status='failed', reason=? WHERE id=?;",
+                        (str(e), order_id),
+                    ),
+                    write=True,
+                )
+            except Exception as write_err:
+                log.warning("Could not persist submit failure for order_id=%s: %s", order_id, write_err)
+            log.info("FAILED submitting %s %s: %s", side.upper(), symbol, e)
+            continue
+
+        broker_order_id = str(getattr(bo, "id", None))
+
+        def _persist_submission(conn):
+            conn.execute("UPDATE orders SET qty=? WHERE id=?;", (float(prep["qty_to_persist"]), order_id))
+            conn.execute(
+                "UPDATE orders SET status='submitted', broker_order_id=? WHERE id=?;",
+                (broker_order_id, order_id),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO executions(broker, broker_order_id, symbol, side, qty, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    "alpaca",
+                    broker_order_id,
+                    symbol,
+                    side,
+                    float(prep["qty_for_execution_row"]),
+                    json.dumps(bo.model_dump(), default=str),
+                ),
+            )
+
+        try:
+            _db_call(_persist_submission, write=True, retries=14, base_delay=0.50, max_delay=3.0)
+        except Exception as e:
+            log.exception("Order submitted to broker but DB persistence failed for order_id=%s broker_order_id=%s: %s", order_id, broker_order_id, e)
+            raise
+
+        try:
+            if side == "buy" and broker_order_id and cooldown_days > 0 and asof:
+                until = set_cooldown(
+                    symbol=symbol,
+                    asof=asof,
+                    days=cooldown_days,
+                    reason="buy_submitted",
+                )
+                summary["cooldown_set"] += 1
+                log.info("Cooldown set: %s until=%s (days=%s)", symbol, until, cooldown_days)
+
+            if side == "sell" and broker_order_id and sell_cooldown_days > 0 and asof:
+                until = set_cooldown(
+                    symbol=symbol,
+                    asof=asof,
+                    days=int(sell_cooldown_days),
+                    reason="sell_submitted",
+                )
+                summary["sell_cooldown_set"] += 1
+                log.info("Cooldown set (post-sell): %s until=%s (days=%s)", symbol, until, sell_cooldown_days)
+        except Exception as e:
+            log.warning("Cooldown write failed for %s %s after submission: %s", side.upper(), symbol, e)
+
+        submitted += 1
+        log.info("Submitted %s %s -> broker_order_id=%s", side.upper(), symbol, broker_order_id)
+
+    summary["submitted"] = submitted
 
     log.info(
         "Submitted total=%s | skipped_risk_buys=%s skipped_risk_sells=%s",
