@@ -88,6 +88,10 @@ case "$JOB" in
       echo "[$(date '+%F %T')] Preflight blocked; skipping exits/run-once." | tee -a "$log"
       exit 0
     }
+    # IMPORTANT: sync broker truth BEFORE crash-guard + emit intents
+    run "$PY" -m trading sync-orders
+    run "$PY" -m trading sync-positions
+    run "$PY" -m trading sync-assets
     run "$PY" -m trading exits --emit-intents
     run "$PY" -m trading run-once --execute
     ;;

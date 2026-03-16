@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .db import connect, init_db
 from .cooldown import is_in_cooldown
-from .lock import acquire_lock, release_lock, read_lock_info
+from .lock import acquire_lock as shared_acquire_lock, release_lock as shared_release_lock, read_lock_info
 from trading.policy.loader import load_latest_policy, format_policy_summary
 from trading.risk.state import seed_risk_defaults, get_effective_state
 from trading.risk.circuit_breaker import evaluate_and_apply
@@ -85,27 +85,12 @@ def _lock_path() -> str:
 
 
 def acquire_lock() -> tuple[bool, str]:
-    """
-    Uses O_EXCL create for atomic lock.
-    Returns (acquired, path).
-    """
-    path = _lock_path()
-    owner = f"{socket.gethostname()} pid={os.getpid()} utc={datetime.now(timezone.utc).isoformat()}"
-
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w") as f:
-            f.write(owner + "\n")
-        return True, path
-    except FileExistsError:
-        return False, path
+    """Use the shared lock implementation so all writer entrypoints honor the same lock file."""
+    return shared_acquire_lock(_lock_path())
 
 
 def release_lock(path: str) -> None:
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
+    shared_release_lock(path)
 
 
 def _is_weekend(yyyy_mm_dd: str) -> bool:
@@ -295,6 +280,8 @@ def run_once(
                 return default
             return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
+        defer_post_sync_after_execute = _env_bool("TRADING_DEFER_POST_SYNC_AFTER_EXECUTE", True)
+
         def _calendar_gate() -> dict:
             ignore = _env_bool("TRADING_IGNORE_MARKET_CALENDAR", False)
             require_after_close = _env_bool("TRADING_REQUIRE_AFTER_CLOSE", False)
@@ -448,8 +435,25 @@ def run_once(
         step("execute", _execute)
 
         # 7) Final sync
-        step("sync_orders_post", lambda: vars(sync_orders(limit=200)))
-        step("sync_positions_post", lambda: {"positions_synced": sync_positions(broker)})
+        exec_out = summary["steps"].get("execute", {}) or {}
+        post_sync_deferred = bool(defer_post_sync_after_execute and int(exec_out.get("submitted", 0) or 0) > 0)
+        summary["steps"]["post_sync_deferred"] = {
+            "enabled": bool(defer_post_sync_after_execute),
+            "deferred": post_sync_deferred,
+            "submitted": int(exec_out.get("submitted", 0) or 0),
+        }
+
+        if post_sync_deferred:
+            log.info(
+                "Deferring post-execution order/position sync for run_id=%s because submitted=%s and TRADING_DEFER_POST_SYNC_AFTER_EXECUTE=true",
+                run_id,
+                exec_out.get("submitted", 0),
+            )
+            summary["steps"]["sync_orders_post"] = {"deferred": True}
+            summary["steps"]["sync_positions_post"] = {"deferred": True}
+        else:
+            step("sync_orders_post", lambda: vars(sync_orders(limit=200)))
+            step("sync_positions_post", lambda: {"positions_synced": sync_positions(broker)})
 
         # 7.5) Phase 3: Apply lots from executions (idempotent)
         def _apply_lots():

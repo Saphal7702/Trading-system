@@ -681,6 +681,296 @@ def emit_sell_intents(
     dry_run: bool = False,
     policy: Any | None = None,
 ) -> dict[str, Any]:
+    """
+    Emit SELL intents derived from evaluate_exit_advice(), with an optional crash-guard
+    that temporarily halts SELL intent emission on major down days.
+
+    Crash guard inputs:
+      - SPY day return (best-effort; may be None intraday if you don't have today's close)
+      - Portfolio day return (preferred): broker equity vs broker last_equity (yesterday close)
+        fallback: equity snapshots table (requires EOD snapshots)
+        fallback: positions-only MTM close-to-close using positions + bars_daily
+
+    Notes on your current issue:
+      - Portfolio was "wrong" because equity snapshots were taken intraday (not EOD), so the
+        prev-day baseline wasn't yesterday close. Using broker.last_equity fixes that.
+      - SPY can become NaN if today's bar close is NaN/None. We treat NaN as missing.
+    """
+    import os
+    import logging
+    from .broker.factory import make_broker
+    from .market_calendar import today_ny_str
+
+    log = logging.getLogger("trading")
+
+    def _env_float(name: str, default: float) -> float:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return float(default)
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _env_bool(name: str, default: bool) -> bool:
+        v = os.getenv(name)
+        if v is None or str(v).strip() == "":
+            return bool(default)
+        return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
+    def _prev_trading_day_from_bars(conn, symbol: str, day: str) -> str | None:
+        r = conn.execute(
+            """
+            SELECT MAX(t) AS t
+            FROM bars_daily
+            WHERE UPPER(symbol)=UPPER(?)
+              AND t < ?
+            """,
+            (symbol, day),
+        ).fetchone()
+        return str(r["t"]) if r and r["t"] else None
+
+    def _close_on(conn, symbol: str, day: str) -> float | None:
+        r = conn.execute(
+            """
+            SELECT c
+            FROM bars_daily
+            WHERE UPPER(symbol)=UPPER(?)
+              AND t = ?
+            LIMIT 1;
+            """,
+            (symbol, day),
+        ).fetchone()
+        if not r or r["c"] is None:
+            return None
+        try:
+            return float(r["c"])
+        except Exception:
+            return None
+
+    def _spy_day_return_pct(conn, day: str, *, broker=None) -> float | None:
+        """
+        Intraday-safe SPY day return using Alpaca market data when possible.
+
+        Priority:
+        1) Use Alpaca latest price + previous close from Alpaca snapshot/bar
+        2) Fallback to previous close from bars_daily + Alpaca latest price
+        3) Fallback to bars_daily close-to-close if today's close exists
+        """
+        import math
+
+        def _sf(x) -> float | None:
+            try:
+                if x is None:
+                    return None
+                f = float(x)
+                if not math.isfinite(f) or f <= 0:
+                    return None
+                return f
+            except Exception:
+                return None
+
+        # --- 1) Try direct broker/alpaca methods first ---
+        if broker is not None:
+            # If your broker wrapper exposes a dedicated helper, use it first.
+            for meth in ("get_spy_day_return_pct",):
+                fn = getattr(broker, meth, None)
+                if callable(fn):
+                    try:
+                        v = _sf(fn())
+                        if v is not None:
+                            return v
+                    except Exception:
+                        pass
+
+            # Try generic latest/prev-close helpers if your wrapper has them
+            last_px = None
+            prev_close = None
+
+            for meth in ("get_latest_price", "get_last_price", "last_price", "get_latest_trade_price", "get_last_trade_price"):
+                fn = getattr(broker, meth, None)
+                if callable(fn):
+                    try:
+                        last_px = _sf(fn("SPY"))
+                        if last_px is not None:
+                            break
+                    except Exception:
+                        pass
+
+            for meth in ("get_prev_close", "get_previous_close", "previous_close"):
+                fn = getattr(broker, meth, None)
+                if callable(fn):
+                    try:
+                        prev_close = _sf(fn("SPY"))
+                        if prev_close is not None:
+                            break
+                    except Exception:
+                        pass
+
+            if last_px is not None and prev_close is not None and prev_close > 0:
+                return ((last_px / prev_close) - 1.0) * 100.0
+
+        # --- 2) Fallback: previous close from bars_daily + live price from broker ---
+        prev = _prev_trading_day_from_bars(conn, "SPY", day)
+        prev_close = _close_on(conn, "SPY", prev) if prev else None
+
+        if broker is not None and prev_close is not None and prev_close > 0:
+            last_px = None
+            for meth in ("get_latest_price", "get_last_price", "last_price", "get_latest_trade_price", "get_last_trade_price"):
+                fn = getattr(broker, meth, None)
+                if callable(fn):
+                    try:
+                        last_px = _sf(fn("SPY"))
+                        if last_px is not None:
+                            break
+                    except Exception:
+                        pass
+
+            if last_px is not None and last_px > 0:
+                return ((last_px / prev_close) - 1.0) * 100.0
+
+        # --- 3) Final fallback: bars_daily close-to-close (EOD only) ---
+        if prev:
+            c0 = _close_on(conn, "SPY", prev)
+            c1 = _close_on(conn, "SPY", day)
+            if c0 is not None and c1 is not None and c0 > 0:
+                return ((c1 / c0) - 1.0) * 100.0
+
+        return None
+
+    def _snapshot_account_into_db(conn, *, broker, day: str, run_id: int | None) -> dict[str, Any]:
+        a = broker.get_account()
+
+        def _f(x):
+            try:
+                return None if x is None else float(x)
+            except Exception:
+                return None
+
+        cash = _f(getattr(a, "cash", None))
+        equity = _f(getattr(a, "equity", None))
+        buying_power = _f(getattr(a, "buying_power", None))
+        long_mv = _f(getattr(a, "long_market_value", None))
+
+        if equity is None:
+            return {"skipped": True, "reason": "account_missing_equity"}
+
+        if cash is None:
+            cash = 0.0
+
+        conn.execute(
+            """
+            INSERT INTO account_snapshots_daily(asof_date, cash, equity, buying_power, long_market_value, run_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asof_date) DO UPDATE SET
+              cash=excluded.cash,
+              equity=excluded.equity,
+              buying_power=excluded.buying_power,
+              long_market_value=excluded.long_market_value,
+              run_id=excluded.run_id,
+              created_at=datetime('now');
+            """,
+            (day, cash, equity, buying_power, long_mv, run_id),
+        )
+        return {"asof": day, "cash": cash, "equity": equity, "buying_power": buying_power, "long_mv": long_mv}
+
+    def _prev_snapshot_day(conn, day: str) -> str | None:
+        # Prefer the previous day for which we actually have an equity snapshot (robust, universe-agnostic).
+        r = conn.execute(
+            """
+            SELECT MAX(asof_date) AS d
+            FROM account_snapshots_daily
+            WHERE asof_date < ?;
+            """,
+            (day,),
+        ).fetchone()
+        return str(r["d"]) if r and r["d"] else None
+
+    def _portfolio_day_return_from_equity_snapshots(conn, day: str) -> tuple[float | None, str | None]:
+        """
+        Intraday-safe portfolio return:
+          equity(today) vs equity(prev snapshot day)
+        """
+        prev = _prev_snapshot_day(conn, day)
+        if not prev:
+            return None, None
+
+        r0 = conn.execute(
+            "SELECT equity FROM account_snapshots_daily WHERE asof_date=?;",
+            (prev,),
+        ).fetchone()
+        r1 = conn.execute(
+            "SELECT equity FROM account_snapshots_daily WHERE asof_date=?;",
+            (day,),
+        ).fetchone()
+        if not r0 or not r1:
+            return None, None
+
+        try:
+            e0 = float(r0["equity"])
+            e1 = float(r1["equity"])
+        except Exception:
+            return None, None
+        if e0 <= 0:
+            return None, None
+
+        return ((e1 / e0) - 1.0) * 100.0, f"equity_snapshots prev={prev} day={day}"
+
+    def _portfolio_positions_day_return_pct(conn, day: str) -> tuple[float | None, str | None]:
+        """
+        EOD-ish fallback: positions-only MTM using closes in bars_daily.
+        Will NOT match intraday UI unless you store intraday prices in DB.
+        """
+        pos = conn.execute(
+            """
+            SELECT UPPER(symbol) AS symbol, qty
+            FROM positions
+            WHERE COALESCE(qty,0) > 0.000001;
+            """
+        ).fetchall()
+        if not pos:
+            return None, None
+
+        # Need a prev day; use SPY bars if present; else use bars_daily max<day for any symbol as best-effort.
+        prev = _prev_trading_day_from_bars(conn, "SPY", day)
+        if not prev:
+            r = conn.execute("SELECT MAX(t) AS t FROM bars_daily WHERE t < ?;", (day,)).fetchone()
+            prev = str(r["t"]) if r and r["t"] else None
+        if not prev:
+            return None, None
+
+        mv0 = 0.0
+        mv1 = 0.0
+        used = 0
+
+        for r in pos:
+            sym = str(r["symbol"] or "").upper().strip()
+            try:
+                qty = float(r["qty"] or 0.0)
+            except Exception:
+                qty = 0.0
+            if not sym or qty <= 0:
+                continue
+
+            c0 = _close_on(conn, sym, prev)
+            c1 = _close_on(conn, sym, day)
+            if c0 is None or c1 is None or c0 <= 0 or c1 <= 0:
+                continue
+
+            mv0 += qty * c0
+            mv1 += qty * c1
+            used += 1
+
+        if used == 0 or mv0 <= 0:
+            return None, None
+
+        return ((mv1 / mv0) - 1.0) * 100.0, f"positions_mtm_fallback prev={prev} day={day} used={used}"
+
+    # --- Crash guard knobs ---
+    enable_guard = _env_bool("TRADING_CRASH_GUARD_ENABLE", True)
+    require_both = _env_bool("TRADING_CRASH_GUARD_REQUIRE_BOTH", False)
+    spy_halt_pct = _env_float("TRADING_CRASH_GUARD_SPY_HALT_PCT", 2.5)
+    port_halt_pct = _env_float("TRADING_CRASH_GUARD_PORTFOLIO_HALT_PCT", 2.5)
 
     cfg = cfg or exit_rule_config_from_env()
     rows = evaluate_exit_advice(asof=asof, cfg=cfg)
@@ -694,13 +984,80 @@ def emit_sell_intents(
         "inserted": 0,
         "would_insert": 0,
         "skipped_existing": 0,
+        "enable_guard": enable_guard,
+        "sell_halted": False,
+        "sell_halt_reason": None,
+        "spy_day_ret_pct": None,
+        "portfolio_day_ret_pct": None,
+        "portfolio_day_ret_source": None,
+        "account_snapshot": None,
     }
 
     with connect() as conn:
-        resolved_asof = asof or _resolve_asof_date(conn)
-        run_id = _pick_run_id_for_asof(conn, resolved_asof)
+        # IMPORTANT: use *today* for crash-guard/equity snapshot, not bars_daily MAX(t)
+        guard_day = today_ny_str()
+        summary["asof"] = guard_day
+
+        run_id = _pick_run_id_for_asof(conn, guard_day) or _pick_run_id_for_asof(conn, asof or _resolve_asof_date(conn))
         summary["run_id"] = run_id
 
+        # Snapshot broker equity for *today* so portfolio return is intraday-correct
+        try:
+            broker = make_broker()
+            snap = _snapshot_account_into_db(conn, broker=broker, day=guard_day, run_id=run_id)
+            summary["account_snapshot"] = snap
+        except Exception as e:
+            summary["account_snapshot"] = {"skipped": True, "reason": f"snapshot_failed: {e}"}
+
+        # Compute guard metrics even if there are no sell rows (so you can test)
+        #spy_ret = _spy_day_return_pct(conn, guard_day) if enable_guard else None
+        spy_ret = _spy_day_return_pct(conn, asof, broker=broker) if enable_guard else None
+        summary["spy_day_ret_pct"] = spy_ret
+
+        port_ret = None
+        port_src = None
+        if enable_guard:
+            port_ret, port_src = _portfolio_day_return_from_equity_snapshots(conn, guard_day)
+            if port_ret is None:
+                port_ret, port_src = _portfolio_positions_day_return_pct(conn, guard_day)
+
+        summary["portfolio_day_ret_pct"] = port_ret
+        summary["portfolio_day_ret_source"] = port_src
+
+        crash_spy = (spy_ret is not None and spy_ret <= -abs(spy_halt_pct))
+        crash_port = (port_ret is not None and port_ret <= -abs(port_halt_pct))
+
+        crash = False
+        if enable_guard:
+            crash = (crash_spy and crash_port) if require_both else (crash_spy or crash_port)
+
+        # Always log one line so you can see it in cron logs
+        log.info(
+            "CRASH_GUARD enabled=%s spy=%s port=%s src=%s halted=%s",
+            enable_guard,
+            ("None" if spy_ret is None else f"{spy_ret:.2f}"),
+            ("None" if port_ret is None else f"{port_ret:.2f}"),
+            port_src,
+            crash,
+        )
+
+        if crash:
+            reasons: list[str] = []
+            if crash_spy:
+                reasons.append(f"SPY_day={spy_ret:.2f}% <= -{abs(spy_halt_pct):.2f}%")
+            if crash_port:
+                reasons.append(f"PORT_day={port_ret:.2f}% <= -{abs(port_halt_pct):.2f}% src={port_src}")
+            if require_both:
+                reasons.append("mode=require_both")
+
+            summary["sell_halted"] = True
+            summary["sell_halt_reason"] = " | ".join(reasons) if reasons else "crash_guard_triggered"
+            summary["would_insert"] = len(sell_rows)
+
+            log.info("CRASH_GUARD HALT REASON: %s", summary["sell_halt_reason"])
+            return summary
+
+        # No sells? return after we’ve still computed + reported guard metrics
         if not sell_rows:
             return summary
 
@@ -712,12 +1069,10 @@ def emit_sell_intents(
         skipped = 0
 
         for r in sell_rows:
-            symbol = r["symbol"]
-            signal_key = r["exit_signal_key"]
+            symbol = str(r["symbol"] or "").upper().strip()
+            signal_key = str(r["exit_signal_key"] or "").strip()
+            reason = f"{signal_key}: {r.get('rationale') or ''}"
 
-            reason = f"{signal_key}: {r['rationale']}"
-
-            # ---- policy advisory annotation (read-only) ----
             note = _format_policy_exit_annotation(
                 policy,
                 entry_key=r.get("entry_signal_key"),
@@ -726,30 +1081,26 @@ def emit_sell_intents(
             if note:
                 reason = f"{reason} | {note}"
 
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO intents(run_id, symbol, action, strength, reason, signal_key)
-                    VALUES (?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        run_id,
-                        symbol,
-                        "sell",
-                        None,
-                        reason,
-                        signal_key,
-                    ),
-                )
+            if dry_run:
+                would_insert += 1
+                continue
+
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO intents(run_id, symbol, action, strength, reason, signal_key)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (run_id, symbol, "sell", None, reason, signal_key),
+            )
+            if cur.rowcount == 1:
                 inserted += 1
-            except Exception:
+            else:
                 skipped += 1
 
         summary["inserted"] = inserted
         summary["would_insert"] = would_insert
         summary["skipped_existing"] = skipped
 
-        # Explicit commit when writing (nice for clarity)
         if not dry_run:
             conn.commit()
 
