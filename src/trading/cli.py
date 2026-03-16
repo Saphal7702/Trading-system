@@ -1668,9 +1668,7 @@ def main() -> int:
     p_ex = sub.add_parser("exits", help="Exit advisor: ranked SELL/WATCH/HOLD recommendations (no orders placed)")
     p_ex.add_argument("--dry-run", action="store_true", help="With --emit-intents: do not write to DB; only show what would be inserted")
     p_ex.add_argument("--asof", default=None, help="As-of date (YYYY-MM-DD). Default: latest bars_daily date")
-    p_ex.add_argument("--emit-intents", action="store_true",
-                  help=
-                  "Write SELL intents for advisor SELL rows (no orders placed)")
+    p_ex.add_argument("--emit-intents", action="store_true", help="Write SELL intents for advisor SELL rows (no orders placed)")
 
     p_ex.add_argument("--no-sma", action="store_true", help="Disable SMA20/50 reversal rule")
 
@@ -2124,20 +2122,19 @@ def main() -> int:
             )
 
         if args.emit_intents:
-                summary = emit_sell_intents(asof=args.asof, cfg=cfg, dry_run=args.dry_run, policy=policy)
-                if args.dry_run:
-                    log.info(
-                        "EXITS emit-intents (dry-run): run_id=%s asof=%s | advisor_rows=%s sell_rows=%s | would_insert=%s skipped_existing=%s",
-                        summary["run_id"], summary["asof"], summary["advisor_rows"], summary["sell_rows"],
-                        summary["would_insert"], summary["skipped_existing"],
-                    )
-                else:
-                    log.info(
-                        "EXITS emit-intents: run_id=%s asof=%s | advisor_rows=%s sell_rows=%s | inserted=%s skipped_existing=%s",
-                        summary["run_id"], summary["asof"], summary["advisor_rows"], summary["sell_rows"],
-                        summary["inserted"], summary["skipped_existing"],
-                    )
-
+            summary = emit_sell_intents(asof=args.asof, cfg=cfg, dry_run=args.dry_run, policy=policy)
+            if args.dry_run:
+                log.info(
+                    "EXITS emit-intents (dry-run): run_id=%s asof=%s | advisor_rows=%s sell_rows=%s | would_insert=%s skipped_existing=%s",
+                    summary["run_id"], summary["asof"], summary["advisor_rows"], summary["sell_rows"],
+                    summary["would_insert"], summary["skipped_existing"],
+                )
+            else:
+                log.info(
+                    "EXITS emit-intents: run_id=%s asof=%s | advisor_rows=%s sell_rows=%s | inserted=%s skipped_existing=%s",
+                    summary["run_id"], summary["asof"], summary["advisor_rows"], summary["sell_rows"],
+                    summary["inserted"], summary["skipped_existing"],
+                )
         return 0
 
     
@@ -2253,7 +2250,8 @@ def main() -> int:
             return cmd_risk_set(args.state, args.reason, args.expires_minutes)
         if args.risk_cmd == "clear":
             from .risk.events import emit_event
-            s = get_settings(); env = getattr(s, 'env', 'paper')
+            s = get_settings() 
+            env = getattr(s, 'env', 'paper')
             emit_event(env=env, event_type='OVERRIDE_CLEAR_NOTE', prev_state=None, new_state=None, metrics={}, reason=args.reason, actor='operator')
             return cmd_risk_clear()
         if args.risk_cmd == "reset-peak":
