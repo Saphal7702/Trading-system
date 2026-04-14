@@ -343,11 +343,12 @@ def run_once(
         from .strategy_sma import generate_signals_sma
         from .strategy_mrit import generate_signals_mrit  # NEW
         from .planner import plan_intents, save_intents
+        from .regime import detect_regime
 
         def _plan():
             entry_mode = os.getenv("TRADING_ENTRY_MODE", "sma").strip().lower()
             # options: sma | mrit | both
-
+            regime = detect_regime(asof)
             if entry_mode == "mrit":
                 signals = generate_signals_mrit(universe=universe, asof=asof)
             elif entry_mode == "both":
@@ -368,7 +369,15 @@ def run_once(
             else:
                 signals = generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof)
 
-            intents = plan_intents(signals, policy=policy, allow_buys=bool(risk["allow_buys"]),risk_state=risk["state"])
+            intents = plan_intents(
+                signals,
+                policy=policy,
+                allow_buys=bool(risk["allow_buys"]),
+                risk_state=risk["state"],
+                blocked_buy_signal_keys=set(regime.blocked_signal_keys),
+                buy_notional_mult=float(regime.buy_notional_mult),
+                exposure_cap_mult=float(regime.exposure_cap_mult),
+            )
 
             risk_blocked = 0
             if not allow_buys:
@@ -406,6 +415,7 @@ def run_once(
                 "risk_state": risk.get("state") if isinstance(risk, dict) else None,
                 "cooldown_days": cooldown_days,
                 "entry_mode": entry_mode,
+                "regime": regime.to_dict(),
             }
 
 

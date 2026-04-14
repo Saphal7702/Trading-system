@@ -18,21 +18,21 @@ class Intent:
     target_notional: float | None = None
     signal_key: str | None = None
 
-    # Phase 5 (read-only): policy overlay
+    # (read-only): policy overlay
     policy_path: str | None = None
     policy_asof: str | None = None
     policy_rec: str | None = None
     policy_score: float | None = None
     policy_best_exits: str | None = None
 
-    # Phase 5 (advisory): sizing recommendation (NOT enforced)
+    # (advisory): sizing recommendation (NOT enforced)
     policy_trades: int | None = None
     policy_enforceable: bool = False
     policy_mult: float | None = None
     policy_reco_notional: float | None = None
     policy_would_skip: bool = False
 
-    # Phase 6: policy utilization (still safe by default)
+    # policy utilization (still safe by default)
     policy_mode: str | None = None              # off|reduce_only|allow_boost
     base_rank: float | None = None              # signal-only rank (usually strength)
     policy_rank_adj: float | None = None        # +/- adjustment from policy
@@ -158,13 +158,16 @@ def plan_intents(
     policy=None,
     allow_buys: bool = True,
     risk_state: str | None = None,
+    blocked_buy_signal_keys: set[str] | None = None,
+    buy_notional_mult: float = 1.0,
+    exposure_cap_mult: float = 1.0,
 ) -> list[Intent]:
     """
     Planner enforces:
       - compliance (min hold before sell)
       - budget realism for small accounts
       - max positions cap
-      - Phase 6: max exposure per entry signal_key (non-negotiable)
+      - max exposure per entry signal_key (non-negotiable)
 
     Defaults controlled by env:
       TRADING_MAX_POSITIONS (default 5)
@@ -181,6 +184,7 @@ def plan_intents(
     per_position_notional = (
         per_position_notional if per_position_notional is not None else _env_float("TRADING_PER_POSITION", 100.0)
     )
+    per_position_notional = float(per_position_notional) * float(buy_notional_mult)
     cash_buffer = cash_buffer if cash_buffer is not None else _env_float("TRADING_CASH_BUFFER", 25.0)
 
     # Policy utilization knobs
@@ -188,12 +192,12 @@ def plan_intents(
     if policy_mode not in ("off", "reduce_only", "allow_boost"):
         policy_mode = "reduce_only"
 
-    # Phase 5 sizing knobs (kept for backward compatibility)
+    # sizing knobs (kept for backward compatibility)
     pol_min_trades_env = _env_int("TRADING_POLICY_MIN_TRADES_ENFORCE", 20)
     pol_boost_mult_env = _env_float("TRADING_POLICY_BOOST_MULT", 1.25)
     pol_reduce_mult_env = _env_float("TRADING_POLICY_REDUCE_MULT", 0.50)
 
-    # Phase 6 clamps + ranking knobs
+    # clamps + ranking knobs
     pol_max_mult = _env_float("TRADING_POLICY_MAX_MULT", 1.25)
     pol_min_mult = _env_float("TRADING_POLICY_MIN_MULT", 0.50)
 
@@ -205,6 +209,22 @@ def plan_intents(
     # Clamp multipliers so policy cannot silently explode sizing.
     pol_boost_mult = min(float(pol_boost_mult_env), float(pol_max_mult))
     pol_reduce_mult = max(float(pol_reduce_mult_env), float(pol_min_mult))
+
+    blocked_buy_signal_keys = set(blocked_buy_signal_keys or set())
+
+    try:
+        buy_notional_mult = float(buy_notional_mult)
+    except Exception:
+        buy_notional_mult = 1.0
+    if buy_notional_mult <= 0:
+        buy_notional_mult = 1.0
+
+    try:
+        exposure_cap_mult = float(exposure_cap_mult)
+    except Exception:
+        exposure_cap_mult = 1.0
+    if exposure_cap_mult <= 0:
+        exposure_cap_mult = 1.0
 
     def _policy_enforce_threshold() -> int:
         """
@@ -301,8 +321,8 @@ def plan_intents(
         except Exception:
             return out
 
-    # ---- Phase 6 Exposure Cap state ----
-    max_exposure = _env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 300.0)
+    # ---- Exposure Cap state ----
+    max_exposure = _env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 300.0) * float(exposure_cap_mult)
     exposure = _exposure_by_signal_key()  # current open exposure by entry_signal_key
     planned_exposure: dict[str, float] = {}  # exposure added by buys picked in THIS planning run
     blocked_by_exposure: set[str] = set()
@@ -358,7 +378,18 @@ def plan_intents(
                     intents.append(Intent(sym, "hold", f"Buy blocked by risk state: {rs}", sig.strength))
                     risk_buys_blocked += 1
                 else:
-                    buy_candidates.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
+                    signal_key = _signal_key_for("buy", sig.reason)
+                    if signal_key and signal_key in blocked_buy_signal_keys:
+                        intents.append(
+                            Intent(
+                                sym,
+                                "hold",
+                                f"Buy blocked by market regime for signal: {signal_key}",
+                                sig.strength,
+                            )
+                        )
+                    else:
+                        buy_candidates.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
 
         else:
             intents.append(Intent(sym, "hold", sig.reason, sig.strength))
@@ -372,7 +403,7 @@ def plan_intents(
             dedup[sym] = s
     buy_candidates = list(dedup.values())
 
-    # 2) Policy-aware BUY ranking + budget-aware selection (Phase 6)
+    # 2) Policy-aware BUY ranking + budget-aware selection
     def _boost_gate(trades: int | None, score: float | None) -> bool:
         if trades is None or trades < pol_min_trades_boost:
             return False
@@ -471,7 +502,7 @@ def plan_intents(
         if remaining_cash < eff:
             continue
 
-        # ---- Exposure cap check (Phase 6, non-negotiable) ----
+        # ---- Exposure cap check ----
         curr = float(exposure.get(entry_key, 0.0))
         planned = float(planned_exposure.get(entry_key, 0.0))
         if (curr + planned + eff) > float(max_exposure):
@@ -576,19 +607,8 @@ def plan_intents(
     return intents
 
 def save_intents(run_id: int, intents: list[Intent]) -> int:
-    """
-    Persist intents.
-
-    We support three DB generations:
-      - Phase 1: base intent columns only
-      - Phase 5: policy overlay columns
-      - Phase 6: policy utilization columns (rank + effective sizing)
-
-    Insert falls back gracefully so older DBs don't brick.
-    """
     import sqlite3
 
-    # Newest schema (Phase 6)
     rows_p6 = [
         (
             run_id,
@@ -599,7 +619,7 @@ def save_intents(run_id: int, intents: list[Intent]) -> int:
             i.signal_key,
             i.target_notional,
 
-            # Phase 5: policy overlay
+            # policy overlay
             i.policy_path,
             i.policy_asof,
             i.policy_rec,
@@ -611,7 +631,7 @@ def save_intents(run_id: int, intents: list[Intent]) -> int:
             1 if getattr(i, "policy_would_skip", False) else 0,
             i.policy_best_exits,
 
-            # Phase 6: utilization / decision fields
+            # utilization / decision fields
             i.policy_mode,
             i.base_rank,
             i.policy_rank_adj,
@@ -622,7 +642,7 @@ def save_intents(run_id: int, intents: list[Intent]) -> int:
         for i in intents
     ]
 
-    # Phase 5 schema
+
     rows_p5 = [
         (
             run_id,
