@@ -82,12 +82,19 @@ def fetch_and_store_for_universe(
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
 
+    #SPY symbol for SP500 crash detection
+    reference_symbols = {"SPY"}
+
     with connect() as conn:
         rows = conn.execute(
             "SELECT symbol FROM universe_membership WHERE universe=? ORDER BY symbol;",
             (universe,),
         ).fetchall()
         syms = [r["symbol"] for r in rows]
+
+    syms = {r["symbol"] for r in rows}
+    syms |= reference_symbols
+    syms = sorted(syms)
 
     if limit and limit > 0:
         syms = syms[:limit]
