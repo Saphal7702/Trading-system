@@ -22,7 +22,6 @@ def _is_locked_error(exc: BaseException) -> bool:
     except Exception:
         return False
 
-
 def execute_run(
     *,
     run_id: int,
@@ -249,9 +248,14 @@ def execute_run(
         log.info("Dry-run only. Use submit=True to send orders (paper-gated).")
         return summary
 
-    if not is_paper_submit_allowed():
-        summary["skipped_reason"] = "paper_gated"
-        log.info("Submission blocked: set TRADING_ALLOW_PAPER_ORDERS=true in .env to allow paper submissions.")
+    trading_mode = os.getenv("TRADING_ENV", "paper").strip().lower()
+    if not is_submit_allowed(trading_mode):
+        if trading_mode == 'paper':
+            summary["skipped_reason"] = "paper_gated"
+            log.info("Submission blocked: set TRADING_ALLOW_PAPER_ORDERS=true in .env to allow paper submissions.")
+        elif trading_mode == 'live':
+            summary["skipped_reason"] = "live_gated"
+            log.info("Submission blocked: set TRADING_ALLOW_LIVE_ORDERS=true in .env to allow live submissions.")
         return summary
 
     eligible_statuses = ("created", "failed") if retry_failed else ("created",)
@@ -771,6 +775,10 @@ def persist_orders(run_id: int, orders: list[ProposedOrder]) -> int:
                     )
     return inserted
 
-
-def is_paper_submit_allowed() -> bool:
-    return os.getenv("TRADING_ALLOW_PAPER_ORDERS", "false").strip().lower() in ("1", "true", "yes", "y")
+def is_submit_allowed(env: str) -> bool:
+    env = (env or "").strip().lower()
+    if env == "paper":
+        return os.getenv("TRADING_ALLOW_PAPER_ORDERS", "false").strip().lower() in ("1", "true", "yes", "y")
+    if env == "live":
+        return os.getenv("TRADING_ALLOW_LIVE_ORDERS", "false").strip().lower() in ("1", "true", "yes", "y")
+    return False
