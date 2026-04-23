@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 from ..db import connect
+from ..utils import env_int, parse_dt
 from .limits import get_limits
 from .state import (
     get_effective_state,
@@ -55,35 +56,6 @@ def compute_peak_and_dd(*, env: str, equity: float | None) -> tuple[float, float
 
     dd = max(0.0, (peak - float(equity)) / peak)
     return (peak, dd)
-
-
-def _env_int(name: str, default: int) -> int:
-    import os
-
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return int(default)
-    try:
-        return int(float(v))
-    except Exception:
-        return int(default)
-
-
-def _parse_dt(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    s = str(s).strip()
-    # SQLite datetime('now') -> "YYYY-MM-DD HH:MM:SS"
-    try:
-        if "T" in s:
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return datetime.fromisoformat(s.replace(" ", "T") + "+00:00")
-    except Exception:
-        try:
-            # last resort: best-effort, assume UTC
-            return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
 
 
 def _severity(state: str) -> int:
@@ -179,11 +151,11 @@ def explain_risk_status(
     reset_th = float(limits["hysteresis_reset_pct"])
 
     # knobs (same as breaker)
-    pause_streak_days = _env_int("TRADING_DD_PAUSE_STREAK_DAYS", 1)
-    sell_streak_days = _env_int("TRADING_DD_SELL_STREAK_DAYS", 2)
-    halt_streak_days = _env_int("TRADING_DD_HALT_STREAK_DAYS", 2)
-    clear_streak_days = _env_int("TRADING_DD_CLEAR_STREAK_DAYS", 3)
-    min_hold_minutes = _env_int("TRADING_RISK_MIN_HOLD_MINUTES", 240)
+    pause_streak_days = env_int("TRADING_DD_PAUSE_STREAK_DAYS", 1)
+    sell_streak_days = env_int("TRADING_DD_SELL_STREAK_DAYS", 2)
+    halt_streak_days = env_int("TRADING_DD_HALT_STREAK_DAYS", 2)
+    clear_streak_days = env_int("TRADING_DD_CLEAR_STREAK_DAYS", 3)
+    min_hold_minutes = env_int("TRADING_RISK_MIN_HOLD_MINUTES", 240)
 
     instant_state = _dd_to_state(dd=drawdown_pct, pause_th=pause_th, sell_th=sell_th, halt_th=halt_th)
 
@@ -206,7 +178,7 @@ def explain_risk_status(
 
     # held_ok (min hold before loosening)
     held_ok = True
-    set_at = _parse_dt(effective_state.get("set_at"))
+    set_at = parse_dt(effective_state.get("set_at"))
     if set_at and min_hold_minutes > 0:
         held_ok = (datetime.now(timezone.utc) - set_at) >= timedelta(minutes=int(min_hold_minutes))
 
@@ -358,15 +330,15 @@ def evaluate_and_apply(*, env: str, broker, asof: str | None) -> dict:
 
     # --- New institutional knobs (env based) ---
     # Escalate if DD persists
-    pause_streak_days = _env_int("TRADING_DD_PAUSE_STREAK_DAYS", 1)
-    sell_streak_days = _env_int("TRADING_DD_SELL_STREAK_DAYS", 2)
-    halt_streak_days = _env_int("TRADING_DD_HALT_STREAK_DAYS", 2)
+    pause_streak_days = env_int("TRADING_DD_PAUSE_STREAK_DAYS", 1)
+    sell_streak_days = env_int("TRADING_DD_SELL_STREAK_DAYS", 2)
+    halt_streak_days = env_int("TRADING_DD_HALT_STREAK_DAYS", 2)
 
     # De-escalate only after sustained recovery
-    clear_streak_days = _env_int("TRADING_DD_CLEAR_STREAK_DAYS", 3)
+    clear_streak_days = env_int("TRADING_DD_CLEAR_STREAK_DAYS", 3)
 
     # Prevent rapid state flipping (minutes)
-    min_hold_minutes = _env_int("TRADING_RISK_MIN_HOLD_MINUTES", 240)
+    min_hold_minutes = env_int("TRADING_RISK_MIN_HOLD_MINUTES", 240)
 
     # Compute instant desired from today's dd
     instant = _dd_to_state(dd=dd, pause_th=pause_th, sell_th=sell_th, halt_th=halt_th)
@@ -419,7 +391,7 @@ def evaluate_and_apply(*, env: str, broker, asof: str | None) -> dict:
     # De-escalation guard: only allow loosening under sustained recovery
     # and only after holding current state for some minimum time.
     held_ok = True
-    set_at = _parse_dt(st.get("set_at"))
+    set_at = parse_dt(st.get("set_at"))
     if set_at and min_hold_minutes > 0:
         held_ok = (datetime.now(timezone.utc) - set_at) >= timedelta(minutes=int(min_hold_minutes))
 
