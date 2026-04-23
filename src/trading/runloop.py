@@ -122,6 +122,9 @@ def run_once(
 
     policy = None
 
+    from trading.broker.factory import make_broker
+    broker = make_broker()
+
     got_lock, lock_path = acquire_lock()
     info = read_lock_info(lock_path)
     if not got_lock:
@@ -167,18 +170,18 @@ def run_once(
                     reason="stale_bars",
                 )
 
-            if require_latest and staleness > 0:
-                log.warning(
-                    "Latest bars not available: asof=%s today=%s",
-                    asof, today_ny
-                )
-                finish_run(run_id, status="skipped")
-                return RunResult(
-                    run_id=run_id,
-                    status="skipped",
-                    asof=asof,
-                    reason="bars_not_latest",
-                )
+            if require_latest:
+                from .market_calendar import last_completed_trading_day
+                last_trade_day = last_completed_trading_day(broker)
+                if asof_date < last_trade_day:
+                    log.warning(
+                        "Latest bars not available: asof=%s last_trade_day=%s",
+                        asof, last_trade_day
+                    )
+                    finish_run(run_id, status="skipped")
+                    return RunResult(
+                        run_id=run_id, status="skipped", asof=asof, reason="bars_not_latest"
+                    )
 
             # weekend gating MVP (holidays later via Alpaca calendar)
             if _is_weekend(asof):
@@ -244,7 +247,6 @@ def run_once(
         step("policy_load", _policy_load)
 
         # 2) Broker check + account snapshot
-        from trading.broker.factory import make_broker
         from trading.broker.sync import upsert_account, sync_positions
         from .broker.orders_sync import sync_orders
 
@@ -253,8 +255,6 @@ def run_once(
             finish_run(run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')
             log.warning('RUN SKIPPED run_id=%s reason=HALT_ALL (broker blocked)', run_id)
             return RunResult(run_id=run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')
-
-        broker = make_broker()
 
         def _brokercheck():
             upsert_account(broker)
