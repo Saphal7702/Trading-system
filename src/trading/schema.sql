@@ -115,9 +115,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency
 ON orders(idempotency_key)
 WHERE idempotency_key IS NOT NULL;
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_executions_broker_order
-ON executions(broker, broker_order_id);
-
 CREATE INDEX IF NOT EXISTS ix_orders_run_id ON orders(run_id);
 
 -- Candidate list: universe membership (e.g., SP500)

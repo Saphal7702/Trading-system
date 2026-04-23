@@ -6,6 +6,7 @@ import os
 import math
 
 from .db import connect
+from .utils import env_float_opt, env_int_opt, env_bool_opt, env_float, env_bool
 
 def _format_policy_exit_annotation(
     policy: Any | None,
@@ -408,33 +409,6 @@ def _rule_priority(signal_key: str) -> int:
     return 0
 
 
-def _env_float_full(name: str) -> float | None:
-    v = os.getenv(name, "").strip()
-    if not v:
-        return None
-    try:
-        return float(v)
-    except Exception:
-        return None
-
-
-def _env_int_full(name: str) -> int | None:
-    v = os.getenv(name, "").strip()
-    if not v:
-        return None
-    try:
-        return int(float(v))
-    except Exception:
-        return None
-
-
-def _env_bool_full(name: str) -> bool | None:
-    v = os.getenv(name, "").strip()
-    if not v:
-        return None
-    return v.lower() in ("1", "true", "t", "yes", "y", "on")
-
-
 def _exit_profile_name(entry_signal_key: str) -> str:
     """Map entry signal to an exit profile name."""
     k = (entry_signal_key or "").lower()
@@ -457,22 +431,22 @@ def _apply_profile_overrides(base: ExitRuleConfig, profile: str) -> ExitRuleConf
 
     pfx = f"TRADING_EXIT_PROFILE_{profile.upper()}_"
 
-    stop_loss = _env_float_full(pfx + "STOP_LOSS_PCT")
-    early_days = _env_int_full(pfx + "EARLY_FAIL_DAYS")
-    early_max = _env_float_full(pfx + "EARLY_FAIL_MAX_RET_PCT")
+    stop_loss = env_float_opt(pfx + "STOP_LOSS_PCT")
+    early_days = env_int_opt(pfx + "EARLY_FAIL_DAYS")
+    early_max = env_float_opt(pfx + "EARLY_FAIL_MAX_RET_PCT")
 
-    trail_peak = _env_float_full(pfx + "TRAIL_PEAK_PCT")
-    trail_dd = _env_float_full(pfx + "TRAIL_DD_PCT")
+    trail_peak = env_float_opt(pfx + "TRAIL_PEAK_PCT")
+    trail_dd = env_float_opt(pfx + "TRAIL_DD_PCT")
 
-    be_peak = _env_float_full(pfx + "BREAKEVEN_PEAK_PCT")
-    be_floor = _env_float_full(pfx + "BREAKEVEN_FLOOR_PCT")
+    be_peak = env_float_opt(pfx + "BREAKEVEN_PEAK_PCT")
+    be_floor = env_float_opt(pfx + "BREAKEVEN_FLOOR_PCT")
 
-    take_profit = _env_float_full(pfx + "TAKE_PROFIT_PCT")
+    take_profit = env_float_opt(pfx + "TAKE_PROFIT_PCT")
 
-    time_days = _env_int_full(pfx + "TIME_STOP_DAYS")
-    time_min = _env_float_full(pfx + "TIME_STOP_MIN_RET_PCT")
+    time_days = env_int_opt(pfx + "TIME_STOP_DAYS")
+    time_min = env_float_opt(pfx + "TIME_STOP_MIN_RET_PCT")
 
-    enable_sma = _env_bool_full(pfx + "ENABLE_SMA_REVERSAL")
+    enable_sma = env_bool_opt(pfx + "ENABLE_SMA_REVERSAL")
 
     return ExitRuleConfig(
         stop_loss_pct=stop_loss if stop_loss is not None else base.stop_loss_pct,
@@ -523,9 +497,9 @@ def evaluate_exit_advice(
             #   TRADING_EXIT_PROFILE_MRIT_ATR_PERIOD=14
             #   TRADING_EXIT_PROFILE_MRIT_TP_ATR_MULT=1.0
             #   TRADING_EXIT_PROFILE_MRIT_SL_ATR_MULT=1.5
-            atr_period = _env_int_full(f"TRADING_EXIT_PROFILE_{profile.upper()}_ATR_PERIOD") or 14
-            tp_atr_mult = _env_float_full(f"TRADING_EXIT_PROFILE_{profile.upper()}_TP_ATR_MULT")
-            sl_atr_mult = _env_float_full(f"TRADING_EXIT_PROFILE_{profile.upper()}_SL_ATR_MULT")
+            atr_period = env_int_opt(f"TRADING_EXIT_PROFILE_{profile.upper()}_ATR_PERIOD") or 14
+            tp_atr_mult = env_float_opt(f"TRADING_EXIT_PROFILE_{profile.upper()}_TP_ATR_MULT")
+            sl_atr_mult = env_float_opt(f"TRADING_EXIT_PROFILE_{profile.upper()}_SL_ATR_MULT")
 
             last_close = float(m["last_close"]) if m.get("last_close") is not None else None
             vwap_entry = float(m["vwap_entry"]) if m.get("vwap_entry") is not None else None
@@ -702,21 +676,6 @@ def emit_sell_intents(
     from .market_calendar import today_ny_str
 
     log = logging.getLogger("trading")
-
-    def _env_float(name: str, default: float) -> float:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return float(default)
-        try:
-            return float(v)
-        except Exception:
-            return float(default)
-
-    def _env_bool(name: str, default: bool) -> bool:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return bool(default)
-        return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
     def _prev_trading_day_from_bars(conn, symbol: str, day: str) -> str | None:
         r = conn.execute(
@@ -967,10 +926,10 @@ def emit_sell_intents(
         return ((mv1 / mv0) - 1.0) * 100.0, f"positions_mtm_fallback prev={prev} day={day} used={used}"
 
     # --- Crash guard knobs ---
-    enable_guard = _env_bool("TRADING_CRASH_GUARD_ENABLE", True)
-    require_both = _env_bool("TRADING_CRASH_GUARD_REQUIRE_BOTH", False)
-    spy_halt_pct = _env_float("TRADING_CRASH_GUARD_SPY_HALT_PCT", 2.5)
-    port_halt_pct = _env_float("TRADING_CRASH_GUARD_PORTFOLIO_HALT_PCT", 2.5)
+    enable_guard = env_bool("TRADING_CRASH_GUARD_ENABLE", True)
+    require_both = env_bool("TRADING_CRASH_GUARD_REQUIRE_BOTH", False)
+    spy_halt_pct = env_float("TRADING_CRASH_GUARD_SPY_HALT_PCT", 2.5)
+    port_halt_pct = env_float("TRADING_CRASH_GUARD_PORTFOLIO_HALT_PCT", 2.5)
 
     cfg = cfg or exit_rule_config_from_env()
     rows = evaluate_exit_advice(asof=asof, cfg=cfg)

@@ -32,3 +32,5 @@ TradingData/
 *.db
 
 *.json
+
+*.codex
