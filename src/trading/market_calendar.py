@@ -10,7 +10,6 @@ log = logging.getLogger("trading")
 
 NY = ZoneInfo("America/New_York")
 
-
 @dataclass(frozen=True)
 class MarketDay:
     date: str          # YYYY-MM-DD
@@ -46,3 +45,36 @@ def is_trading_day(broker, day: str) -> tuple[bool, MarketDay | None]:
         # fail-safe behavior: if calendar call fails, do NOT trade unless explicitly overridden
         log.exception("Calendar check failed for day=%s: %s", day, e)
         return (False, None)
+
+
+def last_completed_trading_day(broker, *, reference: date | None = None) -> date:
+    """
+    Returns the most recent fully completed US trading day,
+    using Alpaca's calendar as the authoritative source.
+
+    Handles weekends, holidays, and early closes correctly.
+    Falls back to up to 7 days lookback (covers long weekends).
+    """
+    from datetime import timedelta
+    ref = reference or datetime.now(tz=NY).date()
+
+    # Look back up to 7 days to cover holidays + weekends
+    start = (ref - timedelta(days=7)).isoformat()
+    end = (ref - timedelta(days=1)).isoformat()  # never include today
+
+    try:
+        cal = broker.get_calendar(start=start, end=end)
+        if not cal:
+            raise RuntimeError("Empty calendar response")
+
+        # Alpaca returns days in ascending order — take the last one
+        last = cal[-1]
+        return date.fromisoformat(str(getattr(last, "date", end)))
+
+    except Exception as e:
+        log.warning("last_completed_trading_day fallback: %s", e)
+        # Safe fallback: walk back from yesterday
+        d = ref - timedelta(days=1)
+        while d.weekday() >= 5:  # 5=Sat, 6=Sun
+            d -= timedelta(days=1)
+        return d

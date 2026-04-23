@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import os
 
 from .db import connect
 from .compliance import can_sell
 from .strategy_sma import Signal
-
+from .utils import env_int, env_float
+import os
 
 @dataclass(frozen=True)
 class Intent:
@@ -129,26 +129,6 @@ def _get_buying_power_fallback(default: float = 0.0) -> float:
         return float(default)
 
 
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    try:
-        return float(v)
-    except ValueError:
-        return float(default)
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return int(default)
-    try:
-        return int(v)
-    except ValueError:
-        return int(default)
-
-
 def plan_intents(
     signals: list[Signal],
     *,
@@ -180,12 +160,12 @@ def plan_intents(
     pos = _current_positions()
     now = datetime.now(timezone.utc)
 
-    max_positions = max_positions if max_positions is not None else _env_int("TRADING_MAX_POSITIONS", 5)
+    max_positions = max_positions if max_positions is not None else env_int("TRADING_MAX_POSITIONS", 5)
     per_position_notional = (
-        per_position_notional if per_position_notional is not None else _env_float("TRADING_PER_POSITION", 100.0)
+        per_position_notional if per_position_notional is not None else env_float("TRADING_PER_POSITION", 100.0)
     )
     per_position_notional = float(per_position_notional) * float(buy_notional_mult)
-    cash_buffer = cash_buffer if cash_buffer is not None else _env_float("TRADING_CASH_BUFFER", 25.0)
+    cash_buffer = cash_buffer if cash_buffer is not None else env_float("TRADING_CASH_BUFFER", 25.0)
 
     # Policy utilization knobs
     policy_mode = os.getenv("TRADING_POLICY_MODE", "reduce_only").strip().lower()
@@ -193,18 +173,18 @@ def plan_intents(
         policy_mode = "reduce_only"
 
     # sizing knobs (kept for backward compatibility)
-    pol_min_trades_env = _env_int("TRADING_POLICY_MIN_TRADES_ENFORCE", 20)
-    pol_boost_mult_env = _env_float("TRADING_POLICY_BOOST_MULT", 1.25)
-    pol_reduce_mult_env = _env_float("TRADING_POLICY_REDUCE_MULT", 0.50)
+    pol_min_trades_env = env_int("TRADING_POLICY_MIN_TRADES_ENFORCE", 20)
+    pol_boost_mult_env = env_float("TRADING_POLICY_BOOST_MULT", 1.25)
+    pol_reduce_mult_env = env_float("TRADING_POLICY_REDUCE_MULT", 0.50)
 
     # clamps + ranking knobs
-    pol_max_mult = _env_float("TRADING_POLICY_MAX_MULT", 1.25)
-    pol_min_mult = _env_float("TRADING_POLICY_MIN_MULT", 0.50)
+    pol_max_mult = env_float("TRADING_POLICY_MAX_MULT", 1.25)
+    pol_min_mult = env_float("TRADING_POLICY_MIN_MULT", 0.50)
 
-    pol_min_trades_boost = _env_int("TRADING_POLICY_MIN_TRADES_BOOST", 30)
-    pol_min_score_boost = _env_float("TRADING_POLICY_MIN_SCORE_BOOST", 0.55)
-    pol_reduce_rank_penalty = _env_float("TRADING_POLICY_REDUCE_RANK_PENALTY", 0.15)
-    pol_boost_rank_bonus = _env_float("TRADING_POLICY_BOOST_RANK_BONUS", 0.10)
+    pol_min_trades_boost = env_int("TRADING_POLICY_MIN_TRADES_BOOST", 30)
+    pol_min_score_boost = env_float("TRADING_POLICY_MIN_SCORE_BOOST", 0.55)
+    pol_reduce_rank_penalty = env_float("TRADING_POLICY_REDUCE_RANK_PENALTY", 0.15)
+    pol_boost_rank_bonus = env_float("TRADING_POLICY_BOOST_RANK_BONUS", 0.10)
 
     # Clamp multipliers so policy cannot silently explode sizing.
     pol_boost_mult = min(float(pol_boost_mult_env), float(pol_max_mult))
@@ -245,7 +225,7 @@ def plan_intents(
     enforce_thr = _policy_enforce_threshold()
     policy_path = getattr(policy, "path", None) if policy else None
 
-    assumed_bp = _env_float("TRADING_ASSUMED_BP", 0.0)
+    assumed_bp = env_float("TRADING_ASSUMED_BP", 0.0)
     buying_power = _get_buying_power_fallback(default=assumed_bp)
 
     # Count currently held positions (>0 qty)
@@ -322,7 +302,7 @@ def plan_intents(
             return out
 
     # ---- Exposure Cap state ----
-    max_exposure = _env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 300.0) * float(exposure_cap_mult)
+    max_exposure = env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 300.0) * float(exposure_cap_mult)
     exposure = _exposure_by_signal_key()  # current open exposure by entry_signal_key
     planned_exposure: dict[str, float] = {}  # exposure added by buys picked in THIS planning run
     blocked_by_exposure: set[str] = set()

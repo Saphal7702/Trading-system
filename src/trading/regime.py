@@ -5,6 +5,7 @@ from typing import Any
 import os
 
 from .db import connect
+from .utils import env_int, env_float
 
 @dataclass(frozen=True)
 class RegimeState:
@@ -44,26 +45,6 @@ class RegimeState:
             "notes": list(self.notes),
         }
 
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    try:
-        return float(v)
-    except ValueError:
-        return float(default)
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return int(default)
-    try:
-        return int(v)
-    except ValueError:
-        return int(default)
-
-
 def _fetch_recent_closes(symbol: str, asof: str, lookback: int) -> list[float]:
     with connect() as conn:
         rows = conn.execute(
@@ -101,11 +82,11 @@ def detect_regime(asof: str) -> RegimeState:
       TRADING_REGIME_CRASH_20D_DD_PCT=-0.080
     """
     proxy = os.getenv("TRADING_REGIME_PROXY", "SPY").strip().upper() or "SPY"
-    lookback = _env_int("TRADING_REGIME_LOOKBACK", 220)
+    lookback = env_int("TRADING_REGIME_LOOKBACK", 220)
 
-    pullback_day_pct = _env_float("TRADING_REGIME_PULLBACK_DAY_PCT", -0.010)
-    crash_day_pct = _env_float("TRADING_REGIME_CRASH_DAY_PCT", -0.020)
-    crash_20d_dd_pct = _env_float("TRADING_REGIME_CRASH_20D_DD_PCT", -0.080)
+    pullback_day_pct = env_float("TRADING_REGIME_PULLBACK_DAY_PCT", -0.010)
+    crash_day_pct = env_float("TRADING_REGIME_CRASH_DAY_PCT", -0.020)
+    crash_20d_dd_pct = env_float("TRADING_REGIME_CRASH_20D_DD_PCT", -0.080)
 
     closes = _fetch_recent_closes(proxy, asof, lookback)
 

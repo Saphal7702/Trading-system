@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -8,6 +7,7 @@ from zoneinfo import ZoneInfo
 from .db import connect
 from .asof import resolve_asof_date
 from .market_calendar import today_ny_str, is_trading_day
+from .utils import env_int, env_float, env_bool
 
 NY = ZoneInfo("America/New_York")
 
@@ -34,32 +34,6 @@ class PreflightResult:
     notes: str | None = None
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return int(default)
-    try:
-        return int(float(v))
-    except Exception:
-        return int(default)
-
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return float(default)
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
-
 
 def run_preflight(*, universe: str = "sp500") -> PreflightResult:
     # 1) DB asof + staleness
@@ -79,7 +53,7 @@ def run_preflight(*, universe: str = "sp500") -> PreflightResult:
     acct = broker.get_account()
 
     trade_day = today_ny_str()
-    ignore_cal = _env_bool("TRADING_IGNORE_MARKET_CALENDAR", False)
+    ignore_cal = env_bool("TRADING_IGNORE_MARKET_CALENDAR", False)
     if ignore_cal:
         market_open_day = True
         market_reason = "ignored"
@@ -132,18 +106,18 @@ def run_preflight(*, universe: str = "sp500") -> PreflightResult:
         except Exception:
             already_submitted_today = 0
 
-    daily_cap = _env_int("TRADING_DAILY_TRADE_CAP", 999999)
+    daily_cap = env_int("TRADING_DAILY_TRADE_CAP", 999999)
     cap_remaining = max(0, int(daily_cap) - int(already_submitted_today or 0))
 
     # 4) Existing "ok" (data + trading day)
-    max_stale = _env_int("TRADING_MAX_BAR_STALENESS_DAYS", 2)
+    max_stale = env_int("TRADING_MAX_BAR_STALENESS_DAYS", 2)
     ok = (staleness_days <= max_stale) and market_open_day
 
     # 5) Execution-safe evaluation
     exec_blockers: list[str] = []
 
     # Paper gate (execution would be blocked)
-    if not _env_bool("TRADING_ALLOW_PAPER_ORDERS", False):
+    if not env_bool("TRADING_ALLOW_PAPER_ORDERS", False):
         exec_blockers.append("paper_gated(TRADING_ALLOW_PAPER_ORDERS=false)")
 
     # Cap remaining
@@ -155,9 +129,9 @@ def run_preflight(*, universe: str = "sp500") -> PreflightResult:
         exec_blockers.append(f"open_internal_orders({int(open_orders)})")
 
     # Buying power realism
-    per_position = _env_float("TRADING_PER_POSITION", 100.0)
-    haircut = _env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)
-    cash_buffer = _env_float("TRADING_CASH_BUFFER", 0.0)
+    per_position = env_float("TRADING_PER_POSITION", 100.0)
+    haircut = env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)
+    cash_buffer = env_float("TRADING_CASH_BUFFER", 0.0)
     min_bp_required = float(per_position) * float(haircut) + float(cash_buffer)
 
     if buying_power is None:

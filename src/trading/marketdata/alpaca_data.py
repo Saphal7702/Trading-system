@@ -79,8 +79,20 @@ def fetch_and_store_for_universe(
     """
     md = AlpacaMarketData()
 
-    end = datetime.now(timezone.utc)
+    from ..market_calendar import last_completed_trading_day
+    from ..broker.alpaca_broker import AlpacaBroker
+
+    broker = AlpacaBroker()
+
+    last_trade_date = last_completed_trading_day(broker)
+    end = datetime(last_trade_date.year, last_trade_date.month, last_trade_date.day,
+                   23, 59, 59, tzinfo=timezone.utc)
     start = end - timedelta(days=days)
+
+    # end = datetime.now(timezone.utc)
+    # yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    # end = datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59, tzinfo=timezone.utc)
+    # start = end - timedelta(days=days)
 
     #SPY symbol for SP500 crash detection
     reference_symbols = {"SPY"}

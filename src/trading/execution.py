@@ -13,6 +13,7 @@ from typing import Any
 from .db import connect
 from .cooldown import set_cooldown
 from .broker.factory import make_broker
+from .utils import env_int, env_float
 
 log = logging.getLogger("trading")
 
@@ -52,24 +53,6 @@ def execute_run(
     """
     from .cooldown import is_in_cooldown, set_cooldown  # local import ok
     from .market_calendar import today_ny_str
-
-    def _env_float(name: str, default: float) -> float:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return float(default)
-        try:
-            return float(v)
-        except Exception:
-            return float(default)
-
-    def _env_int(name: str, default: int) -> int:
-        v = os.getenv(name)
-        if v is None or str(v).strip() == "":
-            return int(default)
-        try:
-            return int(float(v))
-        except Exception:
-            return int(default)
 
     def _last_close(conn, symbol: str) -> float | None:
         r = conn.execute(
@@ -165,15 +148,15 @@ def execute_run(
             raise last_err
 
     # ------- sizing knobs (env controlled) -------
-    per_position_notional = _env_float("TRADING_PER_POSITION", 100.0)
-    notional_haircut = _env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)
-    frac_decimals = int(_env_float("TRADING_FRACTIONAL_DECIMALS", 6.0))
+    per_position_notional = env_float("TRADING_PER_POSITION", 100.0)
+    notional_haircut = env_float("TRADING_NOTIONAL_HAIRCUT", 0.98)
+    frac_decimals = int(env_float("TRADING_FRACTIONAL_DECIMALS", 6.0))
 
     # ------- safety knobs -------
-    daily_cap = _env_int("TRADING_DAILY_TRADE_CAP", 999999)
-    cooldown_days = _env_int("TRADING_SYMBOL_COOLDOWN_DAYS", 0)
-    sell_cooldown_days = _env_int("TRADING_SELL_COOLDOWN_DAYS", 0)
-    max_exposure_per_signal = _env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 0.0)
+    daily_cap = env_int("TRADING_DAILY_TRADE_CAP", 999999)
+    cooldown_days = env_int("TRADING_SYMBOL_COOLDOWN_DAYS", 0)
+    sell_cooldown_days = env_int("TRADING_SELL_COOLDOWN_DAYS", 0)
+    max_exposure_per_signal = env_float("TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY", 0.0)
 
     summary: dict[str, Any] = {
         "run_id": run_id,
@@ -207,7 +190,7 @@ def execute_run(
     # Phase 6: intent-queue execution (execute pending intents across runs)
     # Toggle with TRADING_EXECUTION_MODE=run|queue (default queue).
     exec_mode = os.getenv("TRADING_EXECUTION_MODE", "queue").strip().lower()
-    lookback_days = _env_int("TRADING_INTENT_QUEUE_LOOKBACK_DAYS", 7)
+    lookback_days = env_int("TRADING_INTENT_QUEUE_LOOKBACK_DAYS", 7)
 
     if exec_mode == "run":
         proposed = build_orders_from_intents(run_id=run_id, default_qty=qty_default)
