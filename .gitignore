@@ -19,6 +19,11 @@ venv/
 .vscode/
 .idea/
 
+# Vim swap files
+*.swp
+*.swo
+*~
+
 # Logs
 *.log
 logs/
