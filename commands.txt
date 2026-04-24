@@ -103,13 +103,42 @@ trading execute --run-id X --submit
 trading sync-assets
 trading sync-orders
 trading sync-positions
-/**********************/
 
 /**Testing**/
 python -m pytest tests/ -v
 python -m pytest
 python -m pytest tests/test_circuit_breaker.py
-/***********************/
+
+/**Back Testing**/
+Basic usage:                                                                                                                                                                                                                                            
+  trading backtest --strategy sma --start 2025-01-01 --end 2025-12-31                                                                                                                                                                                     
+  trading backtest --strategy mrit --start 2025-01-01 --end 2025-12-31
+                                                                                                                                                                                                                                                          
+All options:                                              
+  --strategy {sma,mrit}     Which strategy to backtest (required)                                                                                                                                                                                         
+  --start YYYY-MM-DD         Start date (required)                                                                                                                                                                                                        
+  --end YYYY-MM-DD           End date (required)  
+  --universe sp500           Universe of symbols (default: sp500)                                                                                                                                                                                         
+  --initial-capital 100000   Starting cash (default: $100,000)                                                                                                                                                                                            
+  --max-positions 20         Max open positions at once (default: 20)
+  --per-position 5000        Notional per trade (default: capital / max-positions)                                                                                                                                                                        
+  --fast 20                  SMA fast period for SMA strategy (default: 20)       
+  --slow 50                  SMA slow period for SMA strategy (default: 50)                                                                                                                                                                               
+  --db backtest.sqlite       Where to save results (default: backtest.sqlite) 
+
+Example with custom sizing:                                                                                                                                                                                                                             
+  trading backtest --strategy sma \                         
+    --start 2025-01-01 \                                                                                                                                                                                                                                  
+    --end 2025-12-31 \                                      
+    --initial-capital 50000 \                                                                                                                                                                                                                             
+    --max-positions 10 \     
+    --per-position 5000                                                                                                                                                                                                                                   
+                                                            
+Before running MRIT, fetch enough historical data first (needs 200+ days of SPY for the market gate):                                                                                                                                                   
+  trading fetch-bars --days 600                                                                                                                                                                                                                           
+  trading backtest --strategy mrit --start 2025-10-01 --end 2026-04-01                                                                                                                                                                                    
+                                                                                                                                                                                                                                                          
+Results are saved to backtest.sqlite and a performance report is printed to the terminal showing total return, Sharpe ratio, max drawdown, win rate, and the top trades by P&L.  
 
 /**************************************************************************************************************/
 

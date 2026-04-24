@@ -1788,6 +1788,18 @@ def main() -> int:
     p_seed.add_argument("--action", choices=["buy", "sell"], required=True)
     p_seed.add_argument("--reason", default="manual test")
 
+    p_bt = sub.add_parser("backtest", help="Backtest a strategy on historical data (no live orders).")
+    p_bt.add_argument("--strategy", required=True, choices=["sma", "mrit"], help="Strategy to backtest")
+    p_bt.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
+    p_bt.add_argument("--end", required=True, help="End date YYYY-MM-DD")
+    p_bt.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
+    p_bt.add_argument("--initial-capital", type=float, default=100_000.0, help="Starting capital (default: 100000)")
+    p_bt.add_argument("--max-positions", type=int, default=20, help="Max simultaneous positions (default: 20)")
+    p_bt.add_argument("--per-position", type=float, default=None, help="Notional per position (default: capital/max-positions)")
+    p_bt.add_argument("--fast", type=int, default=20, help="SMA fast period (SMA strategy, default: 20)")
+    p_bt.add_argument("--slow", type=int, default=50, help="SMA slow period (SMA strategy, default: 50)")
+    p_bt.add_argument("--db", default=None, help="Path to backtest DB (default: backtest.sqlite)")
+
     args = p.parse_args()
 
     if args.cmd == "healthcheck":
@@ -1841,7 +1853,29 @@ def main() -> int:
 
     if args.cmd == "seed-intent":
         return cmd_seed_intent(args.run_id, args.symbol, args.action, args.reason)
-    
+
+    if args.cmd == "backtest":
+        from .backtest.engine import run_backtest
+        from .backtest.report import print_report
+        log.info(
+            "BACKTEST starting strategy=%s start=%s end=%s universe=%s capital=%.2f",
+            args.strategy, args.start, args.end, args.universe, args.initial_capital,
+        )
+        summary = run_backtest(
+            strategy=args.strategy,
+            start=args.start,
+            end=args.end,
+            universe=args.universe,
+            initial_capital=args.initial_capital,
+            max_positions=args.max_positions,
+            per_position_notional=args.per_position,
+            backtest_db_path=args.db,
+            fast=args.fast,
+            slow=args.slow,
+        )
+        print_report(summary, strategy=args.strategy, start=args.start, end=args.end)
+        return 0
+
     if args.cmd == "sync-orders":
         return cmd_sync_orders(args.limit)
     
