@@ -32,3 +32,18 @@ CREATE TABLE IF NOT EXISTS backtest_equity_curve (
     cash    REAL    NOT NULL,
     PRIMARY KEY (run_id, date)
 );
+
+CREATE TABLE IF NOT EXISTS bars_daily (
+    symbol  TEXT    NOT NULL,
+    t       TEXT    NOT NULL,   -- YYYY-MM-DD
+    o       REAL,
+    h       REAL,
+    l       REAL,
+    c       REAL    NOT NULL,
+    v       REAL,
+    source  TEXT    NOT NULL DEFAULT 'yfinance',
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (symbol, t)
+);
+ 
+CREATE INDEX IF NOT EXISTS idx_bars_daily_symbol_t ON bars_daily (symbol, t);

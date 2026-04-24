@@ -1570,6 +1570,76 @@ def cmd_policy_recommend(
     print("NOTE: This command is advisory only. No trading behavior is changed.")
     return 0
 
+def cmd_backtest_fetch_bars(
+    start: str,
+    end: str,
+    universe: str = "sp500",
+    symbols: list[str] | None = None,
+    db: str | None = None,
+    batch: int = 50,
+    sleep_ms: int = 100,
+) -> int:
+    """
+    Fetch split-adjusted daily bars from yfinance into the backtest DB.
+ 
+    Examples:
+        # Fetch all S&P 500 symbols for a 2-year backtest window
+        trading backtest-fetch-bars --start 2023-01-01 --end 2025-12-31
+ 
+        # Fetch specific symbols only
+        trading backtest-fetch-bars --start 2023-01-01 --end 2025-12-31 --symbols AAPL MSFT SPY
+ 
+        # Use a custom backtest DB path
+        trading backtest-fetch-bars --start 2023-01-01 --end 2025-12-31 --db /data/bt.sqlite
+    """
+    import logging
+    log = logging.getLogger("trading")
+ 
+    from .backtest.yf_loader import fetch_bars_yfinance, symbols_from_universe, bar_coverage_summary
+ 
+    # Resolve symbol list
+    if symbols:
+        sym_list = [s.strip().upper() for s in symbols]
+        # Always include SPY for the market gate
+        if "SPY" not in sym_list:
+            sym_list.append("SPY")
+        log.info("Fetching %d explicit symbols", len(sym_list))
+    else:
+        sym_list = symbols_from_universe(universe)
+        log.info("Fetching %d symbols from universe '%s'", len(sym_list), universe)
+ 
+    log.info("Date range: %s → %s", start, end)
+ 
+    result = fetch_bars_yfinance(
+        symbols=sym_list,
+        start=start,
+        end=end,
+        backtest_db_path=db,
+        sleep_ms=sleep_ms,
+        batch_size=batch,
+    )
+ 
+    # Print summary
+    print(f"\n=== Backtest Bar Fetch Complete ===")
+    print(f"  Symbols requested : {result['total_symbols']}")
+    print(f"  Symbols OK        : {result['ok']}")
+    print(f"  Bars stored       : {result['bars_stored']:,}")
+    if result["failed"]:
+        print(f"  Failed ({len(result['failed'])})        : {', '.join(result['failed'][:20])}")
+        if len(result["failed"]) > 20:
+            print(f"                      ... and {len(result['failed']) - 20} more")
+    if result["skipped"]:
+        print(f"  Skipped ({len(result['skipped'])})       : {', '.join(result['skipped'][:20])}")
+ 
+    # Show current DB coverage
+    cov = bar_coverage_summary(db)
+    print(f"\n=== Backtest DB Coverage ===")
+    print(f"  Symbols with data : {cov['symbol_count']}")
+    print(f"  Date range        : {cov['min_date']} → {cov['max_date']}")
+    print(f"  Total bar rows    : {cov['total_rows']:,}")
+    print()
+ 
+    return 0 if not result["failed"] else 1
 
 def main() -> int:
     setup_logging()
@@ -1800,6 +1870,21 @@ def main() -> int:
     p_bt.add_argument("--slow", type=int, default=50, help="SMA slow period (SMA strategy, default: 50)")
     p_bt.add_argument("--db", default=None, help="Path to backtest DB (default: backtest.sqlite)")
 
+    p_btfb = sub.add_parser(
+        "backtest-fetch-bars",
+        help="Fetch split-adjusted daily bars into the backtest DB via yfinance.",
+    )
+    p_btfb.add_argument("--start",    required=True,  help="Start date YYYY-MM-DD (fetch from)")
+    p_btfb.add_argument("--end",      required=True,  help="End date YYYY-MM-DD (fetch to)")
+    p_btfb.add_argument("--universe", default="sp500", help="Universe to fetch (default: sp500)")
+    p_btfb.add_argument("--symbols",  nargs="+", default=None,
+                        help="Override with specific symbols instead of universe")
+    p_btfb.add_argument("--db",       default=None,   help="Backtest DB path (default: backtest.sqlite)")
+    p_btfb.add_argument("--batch",    type=int, default=50,
+                        help="Symbols per yfinance batch download (default: 50)")
+    p_btfb.add_argument("--sleep-ms", type=int, default=100,
+                        help="Sleep between batches in ms (default: 100)")
+
     args = p.parse_args()
 
     if args.cmd == "healthcheck":
@@ -1875,6 +1960,17 @@ def main() -> int:
         )
         print_report(summary, strategy=args.strategy, start=args.start, end=args.end)
         return 0
+    
+    if args.cmd == "backtest-fetch-bars":
+        return cmd_backtest_fetch_bars(
+            start=args.start,
+            end=args.end,
+            universe=args.universe,
+            symbols=args.symbols,
+            db=args.db,
+            batch=args.batch,
+            sleep_ms=args.sleep_ms,
+        )
 
     if args.cmd == "sync-orders":
         return cmd_sync_orders(args.limit)

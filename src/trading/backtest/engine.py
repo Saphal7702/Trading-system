@@ -382,53 +382,83 @@ def run_backtest(
     init_backtest_db(backtest_db_path)
 
     # -----------------------------------------------------------------------
-    # Load all data from trading.sqlite into memory
+    # Load universe from trading.sqlite, bars from backtest.sqlite (yfinance)
     # -----------------------------------------------------------------------
     lookback_start = (
         datetime.strptime(start, "%Y-%m-%d") - timedelta(days=400)
     ).strftime("%Y-%m-%d")
 
-    with connect() as live_conn:
+    from .db import connect_backtest
+    from ..db import connect as live_connect
+ 
+    # Universe membership (which symbols to trade) — from live trading DB
+    with live_connect() as live_conn:
         sym_rows = live_conn.execute(
             "SELECT DISTINCT symbol FROM universe_membership WHERE universe=?",
             (universe,),
         ).fetchall()
-        symbols = [r["symbol"] for r in sym_rows]
-        if not symbols:
-            raise RuntimeError(f"No symbols in universe '{universe}'. Load universe first.")
-
-        day_rows = live_conn.execute(
-            "SELECT DISTINCT t FROM bars_daily WHERE t >= ? AND t <= ? ORDER BY t ASC",
+    symbols = [r["symbol"] for r in sym_rows]
+    if not symbols:
+        raise RuntimeError(
+            f"No symbols in universe '{universe}'. "
+            "Run: trading load-universe --file data/sp500.csv"
+        )
+ 
+    # All price data from backtest DB (yfinance, split-adjusted, isolated)
+    with connect_backtest(backtest_db_path) as bt_conn:
+        day_rows = bt_conn.execute(
+            """
+            SELECT DISTINCT t FROM bars_daily
+            WHERE t >= ? AND t <= ? AND c IS NOT NULL
+            ORDER BY t ASC
+            """,
             (start, end),
         ).fetchall()
         trading_days: list[str] = [r["t"] for r in day_rows]
+ 
         if not trading_days:
-            raise RuntimeError(f"No bars_daily data found for {start} to {end}.")
-
-        bar_rows = live_conn.execute(
-            """
-            SELECT b.symbol, b.t, b.c
-            FROM bars_daily b
-            JOIN universe_membership um ON um.symbol = b.symbol AND um.universe = ?
-            WHERE b.t >= ? AND b.c IS NOT NULL
-            ORDER BY b.symbol, b.t ASC
+            raise RuntimeError(
+                f"No bars found in backtest DB for {start} to {end}.\n"
+                f"Fetch split-adjusted data first:\n"
+                f"  trading backtest fetch-bars --start {lookback_start} --end {end}"
+            )
+ 
+        sym_placeholders = ",".join("?" * len(symbols))
+        bar_rows = bt_conn.execute(
+            f"""
+            SELECT symbol, t, c
+            FROM bars_daily
+            WHERE symbol IN ({sym_placeholders})
+              AND t >= ?
+              AND c IS NOT NULL
+            ORDER BY symbol, t ASC
             """,
-            (universe, lookback_start),
+            (*symbols, lookback_start),
         ).fetchall()
-
-        spy_rows = live_conn.execute(
-            "SELECT t, c FROM bars_daily WHERE symbol='SPY' AND t >= ? AND c IS NOT NULL ORDER BY t ASC",
+ 
+        spy_rows = bt_conn.execute(
+            """
+            SELECT t, c FROM bars_daily
+            WHERE symbol = 'SPY' AND t >= ? AND c IS NOT NULL
+            ORDER BY t ASC
+            """,
             (lookback_start,),
         ).fetchall()
-
+ 
+    if not bar_rows:
+        raise RuntimeError(
+            f"Backtest DB has no price data for universe symbols.\n"
+            f"Run: trading backtest fetch-bars --start {lookback_start} --end {end}"
+        )
+ 
     bars_by_sym: dict[str, list[tuple[str, float]]] = defaultdict(list)
     for r in bar_rows:
         bars_by_sym[r["symbol"]].append((r["t"], float(r["c"])))
-
+ 
     dates_by_sym: dict[str, list[str]] = {
         sym: [b[0] for b in bars] for sym, bars in bars_by_sym.items()
     }
-
+ 
     spy_bars = [(r["t"], float(r["c"])) for r in spy_rows]
     spy_dates = [b[0] for b in spy_bars]
 
