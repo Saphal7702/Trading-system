@@ -110,6 +110,7 @@ python -m pytest
 python -m pytest tests/test_circuit_breaker.py
 
 /**Back Testing**/
+trading backtest-fetch-bars --start 2023-01-01 --end 2025-12-31
 Basic usage:                                                                                                                                                                                                                                            
   trading backtest --strategy sma --start 2025-01-01 --end 2025-12-31                                                                                                                                                                                     
   trading backtest --strategy mrit --start 2025-01-01 --end 2025-12-31
@@ -127,7 +128,7 @@ All options:
   --db backtest.sqlite       Where to save results (default: backtest.sqlite) 
 
 Example with custom sizing:                                                                                                                                                                                                                             
-  trading backtest --strategy sma \                         
+trading backtest --strategy sma \                         
     --start 2025-01-01 \                                                                                                                                                                                                                                  
     --end 2025-12-31 \                                      
     --initial-capital 50000 \                                                                                                                                                                                                                             
