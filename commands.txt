@@ -105,6 +105,12 @@ trading sync-orders
 trading sync-positions
 /**********************/
 
+/**Testing**/
+python -m pytest tests/ -v
+python -m pytest
+python -m pytest tests/test_circuit_breaker.py
+/***********************/
+
 /**************************************************************************************************************/
 
 
