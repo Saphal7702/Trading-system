@@ -1868,7 +1868,14 @@ def main() -> int:
     p_bt.add_argument("--per-position", type=float, default=None, help="Notional per position (default: capital/max-positions)")
     p_bt.add_argument("--fast", type=int, default=20, help="SMA fast period (SMA strategy, default: 20)")
     p_bt.add_argument("--slow", type=int, default=50, help="SMA slow period (SMA strategy, default: 50)")
+    p_bt.add_argument("--market-sma", type=int, default=50, help="SPY regime gate SMA period (SMA strategy, default: 50)")
+    p_bt.add_argument("--cooldown-days", type=int, default=0, help="Calendar days to block re-entry after a sell (default: 0 = disabled)")
     p_bt.add_argument("--db", default=None, help="Path to backtest DB (default: backtest.sqlite)")
+
+    p_bt.add_argument("--early-fail-days", type=int, default=5,
+                    help="Days before early_fail fires (default: 5, use 999 to disable)")
+    p_bt.add_argument("--early-fail-max-ret", type=float, default=0.0,
+                    help="Max return%% to trigger early_fail (default: 0.0, e.g. -3.0 to only cut real losers)")
 
     p_btfb = sub.add_parser(
         "backtest-fetch-bars",
@@ -1957,6 +1964,10 @@ def main() -> int:
             backtest_db_path=args.db,
             fast=args.fast,
             slow=args.slow,
+            market_sma=args.market_sma,
+            cooldown_days=args.cooldown_days,
+            early_fail_days=args.early_fail_days,
+            early_fail_max_ret=args.early_fail_max_ret,
         )
         print_report(summary, strategy=args.strategy, start=args.start, end=args.end)
         return 0

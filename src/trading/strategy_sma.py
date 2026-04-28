@@ -1,8 +1,11 @@
 from __future__ import annotations
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 from .db import connect
+
+log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Signal:
@@ -30,6 +33,7 @@ def generate_signals_sma(
     lookback_min: int = 120,
     universe: str = "sp500",
     asof: str | None = None,
+    market_sma: int = 50,
 ) -> list[Signal]:
     """
     SMA crossover strategy evaluated on a specific trading day.
@@ -53,6 +57,20 @@ def generate_signals_sma(
 
     signals: list[Signal] = []
     with connect() as conn:
+        spy_rows = conn.execute(
+            "SELECT c FROM bars_daily WHERE symbol='SPY' AND t <= ? AND c IS NOT NULL ORDER BY t ASC",
+            (asof,),
+        ).fetchall()
+        spy_closes = [float(r["c"]) for r in spy_rows]
+        market_bullish = False
+        if len(spy_closes) >= market_sma + 1:
+            spy_sma_vals = _sma(spy_closes, market_sma)
+            si = len(spy_closes) - 1
+            if spy_sma_vals[si] is not None and spy_closes[si] > float(spy_sma_vals[si]):
+                market_bullish = True
+        if not market_bullish:
+            log.info("SPY regime gate: SPY below SMA%d, suppressing new buy signals", market_sma)
+
         for sym in syms:
             rows = conn.execute(
                 """
@@ -80,7 +98,8 @@ def generate_signals_sma(
                 continue
 
             if sma_fast[prev] <= sma_slow[prev] and sma_fast[i] > sma_slow[i]:
-                signals.append(Signal(sym, "buy", f"SMA{fast} crossed above SMA{slow}", abs(sma_fast[i] - sma_slow[i])))
+                if market_bullish:
+                    signals.append(Signal(sym, "buy", f"SMA{fast} crossed above SMA{slow}", abs(sma_fast[i] - sma_slow[i])))
             elif sma_fast[prev] >= sma_slow[prev] and sma_fast[i] < sma_slow[i]:
                 signals.append(Signal(sym, "sell", f"SMA{fast} crossed below SMA{slow}", abs(sma_fast[i] - sma_slow[i])))
             else:
