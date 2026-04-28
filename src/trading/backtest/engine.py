@@ -90,11 +90,23 @@ def _sma_signals(
     bars_by_sym: dict[str, list[tuple[str, float]]],
     dates_by_sym: dict[str, list[str]],
     asof: str,
+    spy_bars: list[tuple[str, float]],
+    spy_dates: list[str],
     *,
     fast: int = 20,
     slow: int = 50,
     lookback_min: int = 120,
+    market_sma: int = 50,
 ) -> list[dict]:
+    # Market regime gate: only allow buys when SPY close > SPY SMA(market_sma)
+    spy_closes = _closes_up_to(spy_bars, spy_dates, asof)
+    market_bullish = False
+    if len(spy_closes) >= market_sma + 1:
+        spy_sma_vals = _sma(spy_closes, market_sma)
+        si = len(spy_closes) - 1
+        if spy_sma_vals[si] is not None and spy_closes[si] > float(spy_sma_vals[si]):
+            market_bullish = True
+
     signals: list[dict] = []
     min_bars = max(slow + 2, lookback_min)
     for sym in symbols:
@@ -112,12 +124,13 @@ def _sma_signals(
         if None in (sma_f[i], sma_s[i], sma_f[p], sma_s[p]):
             continue
         if sma_f[p] <= sma_s[p] and sma_f[i] > sma_s[i]:
-            signals.append({
-                "symbol": sym,
-                "action": "buy",
-                "reason": f"SMA{fast} crossed above SMA{slow}",
-                "strength": abs(float(sma_f[i]) - float(sma_s[i])),
-            })
+            if market_bullish:
+                signals.append({
+                    "symbol": sym,
+                    "action": "buy",
+                    "reason": f"SMA{fast} crossed above SMA{slow}",
+                    "strength": abs(float(sma_f[i]) - float(sma_s[i])),
+                })
         elif sma_f[p] >= sma_s[p] and sma_f[i] < sma_s[i]:
             signals.append({
                 "symbol": sym,
@@ -363,6 +376,10 @@ def run_backtest(
     backtest_db_path: str | None = None,
     fast: int = 20,
     slow: int = 50,
+    market_sma: int = 50,
+    cooldown_days: int = 0,
+    early_fail_days: int = 5,         # ← add
+    early_fail_max_ret: float = 0.0,  # ← add
 ) -> dict:
     """
     Run a backtest for the given strategy over [start, end].
@@ -467,6 +484,7 @@ def run_backtest(
     # -----------------------------------------------------------------------
     broker = SimBroker(cash=initial_capital)
     holding_days: dict[str, int] = {}
+    cooldown_until: dict[str, str] = {}
     pending_orders: list[dict] = []
     trades: list[dict] = []
     equity_curve: list[dict] = []
@@ -509,6 +527,10 @@ def run_backtest(
                 })
                 holding_days.pop(sym, None)
                 filled_sells.add(sym)
+                if cooldown_days > 0 and "stop_loss" in order.get("reason", ""):
+                    cooldown_until[sym] = (
+                        datetime.strptime(day, "%Y-%m-%d") + timedelta(days=cooldown_days)
+                    ).strftime("%Y-%m-%d")
 
             elif order["action"] == "buy" and sym not in broker.positions and sym not in filled_buys:
                 qty = broker.fill_buy(sym, price, per_position_notional, day)
@@ -526,14 +548,14 @@ def run_backtest(
             holding_days[sym] = holding_days.get(sym, 0) + 1
 
         # 3. Check exit rules for open positions
-        exits = _check_exits(broker, prices, holding_days)
+        exits = _check_exits(broker, prices, holding_days, early_fail_days=early_fail_days, early_fail_max_ret=early_fail_max_ret,)
         exit_syms = {sym for sym, _ in exits}
         for sym, reason in exits:
             pending_orders.append({"action": "sell", "symbol": sym, "reason": reason})
 
         # 4. Generate signals based on today's close data
         if strategy == "sma":
-            raw_signals = _sma_signals(symbols, bars_by_sym, dates_by_sym, day, fast=fast, slow=slow)
+            raw_signals = _sma_signals(symbols, bars_by_sym, dates_by_sym, day, spy_bars, spy_dates, fast=fast, slow=slow, market_sma=market_sma)
         else:
             raw_signals = _mrit_signals(symbols, bars_by_sym, dates_by_sym, day, spy_bars, spy_dates)
 
@@ -555,6 +577,7 @@ def run_backtest(
             and s["symbol"] not in broker.positions
             and s["symbol"] not in pending_buy_syms
             and s["symbol"] not in exit_syms
+            and cooldown_until.get(s["symbol"], "") < day
         ]
         buy_candidates.sort(key=lambda s: float(s.get("strength") or 0.0), reverse=True)
 
