@@ -19,12 +19,18 @@ class RegimeState:
     drawdown_20d_pct: float | None
 
     regime: str  # bull | pullback | defensive | crash
-    allow_buys: bool = True
-    allow_mrit: bool = True
+
+    # Observable market facts — strategies use these to self-gate
+    trending_up: bool         # close > SMA200
+    momentum_positive: bool   # close > SMA50
+    five_day_return_pct: float | None  # (close / closes[-5]) - 1.0
+    is_crash: bool            # True when regime == "crash"
+
+    # Universal throttles (apply across all strategies)
+    allow_buys: bool = True   # False only in hard halt; reserved for future use
     buy_notional_mult: float = 1.0
     exposure_cap_mult: float = 1.0
 
-    blocked_signal_keys: tuple[str, ...] = field(default_factory=tuple)
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
@@ -37,11 +43,13 @@ class RegimeState:
             "day_return_pct": self.day_return_pct,
             "drawdown_20d_pct": self.drawdown_20d_pct,
             "regime": self.regime,
+            "trending_up": self.trending_up,
+            "momentum_positive": self.momentum_positive,
+            "five_day_return_pct": self.five_day_return_pct,
+            "is_crash": self.is_crash,
             "allow_buys": self.allow_buys,
-            "allow_mrit": self.allow_mrit,
             "buy_notional_mult": self.buy_notional_mult,
             "exposure_cap_mult": self.exposure_cap_mult,
-            "blocked_signal_keys": list(self.blocked_signal_keys),
             "notes": list(self.notes),
         }
 
@@ -91,6 +99,7 @@ def detect_regime(asof: str) -> RegimeState:
     closes = _fetch_recent_closes(proxy, asof, lookback)
 
     if len(closes) < 200:
+        five_day_pct = (closes[-1] / closes[-5]) - 1.0 if len(closes) >= 5 else None
         return RegimeState(
             asof=asof,
             proxy_symbol=proxy,
@@ -100,11 +109,13 @@ def detect_regime(asof: str) -> RegimeState:
             day_return_pct=None,
             drawdown_20d_pct=None,
             regime="defensive",
+            trending_up=False,
+            momentum_positive=False,
+            five_day_return_pct=five_day_pct,
+            is_crash=False,
             allow_buys=True,
-            allow_mrit=False,
             buy_notional_mult=0.75,
             exposure_cap_mult=0.75,
-            blocked_signal_keys=("mrit_rsi2_pullback_uptrend",),
             notes=("insufficient_proxy_history",),
         )
 
@@ -122,6 +133,10 @@ def detect_regime(asof: str) -> RegimeState:
     drawdown_20d_pct = None
     if peak20 and peak20 != 0:
         drawdown_20d_pct = (close / peak20) - 1.0
+
+    five_day_return_pct = (close / closes[-5]) - 1.0 if len(closes) >= 5 else None
+    trending_up = sma200 is not None and close > sma200
+    momentum_positive = sma50 is not None and close > sma50
 
     notes: list[str] = []
 
@@ -144,11 +159,13 @@ def detect_regime(asof: str) -> RegimeState:
             day_return_pct=day_return_pct,
             drawdown_20d_pct=drawdown_20d_pct,
             regime="crash",
-            allow_buys=True,   # keep trend entries possible; planner will block MRIT only
-            allow_mrit=False,
+            trending_up=trending_up,
+            momentum_positive=momentum_positive,
+            five_day_return_pct=five_day_return_pct,
+            is_crash=True,
+            allow_buys=True,
             buy_notional_mult=0.50,
             exposure_cap_mult=0.50,
-            blocked_signal_keys=("mrit_rsi2_pullback_uptrend",),
             notes=tuple(notes),
         )
 
@@ -164,11 +181,13 @@ def detect_regime(asof: str) -> RegimeState:
             day_return_pct=day_return_pct,
             drawdown_20d_pct=drawdown_20d_pct,
             regime="defensive",
+            trending_up=False,
+            momentum_positive=momentum_positive,
+            five_day_return_pct=five_day_return_pct,
+            is_crash=False,
             allow_buys=True,
-            allow_mrit=False,
             buy_notional_mult=0.75,
             exposure_cap_mult=0.75,
-            blocked_signal_keys=("mrit_rsi2_pullback_uptrend",),
             notes=tuple(notes),
         )
 
@@ -189,11 +208,13 @@ def detect_regime(asof: str) -> RegimeState:
             day_return_pct=day_return_pct,
             drawdown_20d_pct=drawdown_20d_pct,
             regime="pullback",
+            trending_up=True,
+            momentum_positive=False,
+            five_day_return_pct=five_day_return_pct,
+            is_crash=False,
             allow_buys=True,
-            allow_mrit=False,
             buy_notional_mult=0.85,
             exposure_cap_mult=0.85,
-            blocked_signal_keys=("mrit_rsi2_pullback_uptrend",),
             notes=tuple(notes),
         )
 
@@ -207,10 +228,12 @@ def detect_regime(asof: str) -> RegimeState:
         day_return_pct=day_return_pct,
         drawdown_20d_pct=drawdown_20d_pct,
         regime="bull",
+        trending_up=True,
+        momentum_positive=True,
+        five_day_return_pct=five_day_return_pct,
+        is_crash=False,
         allow_buys=True,
-        allow_mrit=True,
         buy_notional_mult=1.0,
         exposure_cap_mult=1.0,
-        blocked_signal_keys=(),
         notes=tuple(notes),
     )

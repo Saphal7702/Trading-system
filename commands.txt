@@ -110,10 +110,25 @@ python -m pytest
 python -m pytest tests/test_circuit_breaker.py
 
 /**Back Testing**/
-trading backtest-fetch-bars --start 2023-01-01 --end 2025-12-31
-Basic usage:                                                                                                                                                                                                                                            
-  trading backtest --strategy sma --start 2025-01-01 --end 2025-12-31                                                                                                                                                                                     
-  trading backtest --strategy mrit --start 2025-01-01 --end 2025-12-31
+
+Step 1 — Fetch historical bars (only needed once per date range):                                                                                                                                                                                       
+  trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31                                                                                                                                                                               
+                                                                                                                                                                                                                                                        
+Step 2 — Run the backtest:                                                                                                                                                                                                                              
+  # Default: both strategies, regime gates which signals fire each day                                                                                                                                                                                    
+  trading backtest --start 2020-01-01 --end 2024-12-31                                                                                                                                                                                          
+                                                                                                                                                                                                                                                          
+  # Restrict to a single strategy                                                                                                                                                                                                                         
+  trading backtest --start 2020-01-01 --end 2024-12-31 --strategy sma                                                                                                                                                                           
+  trading backtest --start 2020-01-01 --end 2024-12-31 --strategy mrit                                                                                                                                                                          
+                                                                                                                                                                                                                                                          
+  # Custom capital / position sizing                                                                                                                                                                                                                      
+  trading backtest --start 2020-01-01 --end 2024-12-31 --initial-capital 50000 --max-positions 10 --per-position 5000                                                                                                                                                                                        
+                                                                                                                                                                                                                                                          
+  # Tighten exit rules                                                                                                                                                                                                                                    
+  trading backtest --start 2020-01-01 --end 2024-12-31 --early-fail-days 5 --early-fail-max-ret -3.0 --cooldown-days 14 
+
+  trading backtest --start 2024-01-01 --end 2024-12-31 --initial-capital 500 --max-positions 5 --per-position 100 --early-fail-days 999 --cooldown-days 30
                                                                                                                                                                                                                                                           
 All options:                                              
   --strategy {sma,mrit}     Which strategy to backtest (required)                                                                                                                                                                                         
@@ -125,19 +140,7 @@ All options:
   --per-position 5000        Notional per trade (default: capital / max-positions)                                                                                                                                                                        
   --fast 20                  SMA fast period for SMA strategy (default: 20)       
   --slow 50                  SMA slow period for SMA strategy (default: 50)                                                                                                                                                                               
-  --db backtest.sqlite       Where to save results (default: backtest.sqlite) 
-
-Example with custom sizing:                                                                                                                                                                                                                             
-trading backtest --strategy sma \                         
-    --start 2025-01-01 \                                                                                                                                                                                                                                  
-    --end 2025-12-31 \                                      
-    --initial-capital 50000 \                                                                                                                                                                                                                             
-    --max-positions 10 \     
-    --per-position 5000                                                                                                                                                                                                                                   
-                                                            
-Before running MRIT, fetch enough historical data first (needs 200+ days of SPY for the market gate):                                                                                                                                                   
-  trading fetch-bars --days 600                                                                                                                                                                                                                           
-  trading backtest --strategy mrit --start 2025-10-01 --end 2026-04-01                                                                                                                                                                                    
+  --db backtest.sqlite       Where to save results (default: backtest.sqlite)                                                                                                                                                                                                  
                                                                                                                                                                                                                                                           
 Results are saved to backtest.sqlite and a performance report is printed to the terminal showing total return, Sharpe ratio, max drawdown, win rate, and the top trades by P&L.  
 

@@ -1859,7 +1859,7 @@ def main() -> int:
     p_seed.add_argument("--reason", default="manual test")
 
     p_bt = sub.add_parser("backtest", help="Backtest a strategy on historical data (no live orders).")
-    p_bt.add_argument("--strategy", required=True, choices=["sma", "mrit"], help="Strategy to backtest")
+    p_bt.add_argument("--strategy", default="both", choices=["sma", "mrit", "both"], help="Strategy to backtest (default: both; regime gates which signals fire each day)")
     p_bt.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
     p_bt.add_argument("--end", required=True, help="End date YYYY-MM-DD")
     p_bt.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
@@ -1868,7 +1868,6 @@ def main() -> int:
     p_bt.add_argument("--per-position", type=float, default=None, help="Notional per position (default: capital/max-positions)")
     p_bt.add_argument("--fast", type=int, default=20, help="SMA fast period (SMA strategy, default: 20)")
     p_bt.add_argument("--slow", type=int, default=50, help="SMA slow period (SMA strategy, default: 50)")
-    p_bt.add_argument("--market-sma", type=int, default=50, help="SPY regime gate SMA period (SMA strategy, default: 50)")
     p_bt.add_argument("--cooldown-days", type=int, default=0, help="Calendar days to block re-entry after a sell (default: 0 = disabled)")
     p_bt.add_argument("--db", default=None, help="Path to backtest DB (default: backtest.sqlite)")
 
@@ -1964,7 +1963,6 @@ def main() -> int:
             backtest_db_path=args.db,
             fast=args.fast,
             slow=args.slow,
-            market_sma=args.market_sma,
             cooldown_days=args.cooldown_days,
             early_fail_days=args.early_fail_days,
             early_fail_max_ret=args.early_fail_max_ret,

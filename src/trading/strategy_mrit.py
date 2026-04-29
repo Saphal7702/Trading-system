@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass
 import logging
 import os
 
 from .db import connect
 from .strategy_sma import Signal
+
+if TYPE_CHECKING:
+    from .regime import RegimeState
 
 log = logging.getLogger("trading")
 
@@ -108,11 +111,15 @@ def generate_signals_mrit(
     rsi_period: int = 2,
     rsi_max: float = 10.0,
     lookback_min: int = 120,
+    regime: "RegimeState | None" = None,
 ) -> list[Signal]:
     """
     Mean Reversion Inside Trend (daily bars).
       Trend: close > SMA(trend_sma)
       Trigger: RSI(rsi_period) <= rsi_max AND close < SMA(mean_sma)
+
+    When regime is passed, buy suppression is decided from RegimeState facts.
+    When regime is None, the internal _market_regime_gate() runs as fallback.
     """
     from .asof import resolve_asof_date
 
@@ -121,8 +128,19 @@ def generate_signals_mrit(
     with connect() as conn:
         asof = resolve_asof_date(conn, asof)
 
-        gate_ok, gate_note = _market_regime_gate(conn, asof=asof)
-        log.info("MRIT market gate | %s", gate_note)
+        # Determine gate from RegimeState when provided; fall back to internal check
+        if regime is not None:
+            if not regime.trending_up:
+                log.info("MRIT suppressed: market not trending up (regime=%s)", regime.regime)
+                gate_ok, gate_note = False, f"MRIT suppressed: market not trending up (regime={regime.regime})"
+            elif regime.is_crash:
+                log.info("MRIT suppressed: crash regime")
+                gate_ok, gate_note = False, "MRIT suppressed: crash regime"
+            else:
+                gate_ok, gate_note = True, "MRIT regime gate OK"
+        else:
+            gate_ok, gate_note = _market_regime_gate(conn, asof=asof)
+            log.info("MRIT market gate | %s", gate_note)
 
         rows = conn.execute(
             """

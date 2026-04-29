@@ -1,9 +1,12 @@
 from __future__ import annotations
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .db import connect
+
+if TYPE_CHECKING:
+    from .regime import RegimeState
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +37,14 @@ def generate_signals_sma(
     universe: str = "sp500",
     asof: str | None = None,
     market_sma: int = 50,
+    regime: "RegimeState | None" = None,
 ) -> list[Signal]:
     """
     SMA crossover strategy evaluated on a specific trading day.
+
+    When regime is passed, buy suppression uses regime facts: buys fire in bull
+    and pullback but not in defensive or crash. Sells always fire regardless of regime.
+    When regime is None, the internal SPY SMA gate runs as fallback.
     """
     from .asof import resolve_asof_date
 
@@ -57,19 +65,26 @@ def generate_signals_sma(
 
     signals: list[Signal] = []
     with connect() as conn:
-        spy_rows = conn.execute(
-            "SELECT c FROM bars_daily WHERE symbol='SPY' AND t <= ? AND c IS NOT NULL ORDER BY t ASC",
-            (asof,),
-        ).fetchall()
-        spy_closes = [float(r["c"]) for r in spy_rows]
-        market_bullish = False
-        if len(spy_closes) >= market_sma + 1:
-            spy_sma_vals = _sma(spy_closes, market_sma)
-            si = len(spy_closes) - 1
-            if spy_sma_vals[si] is not None and spy_closes[si] > float(spy_sma_vals[si]):
+        if regime is not None:
+            if regime.regime in ("defensive", "crash"):
+                market_bullish = False
+                log.info("SMA suppressed: regime=%s, only sells active", regime.regime)
+            else:
                 market_bullish = True
-        if not market_bullish:
-            log.info("SPY regime gate: SPY below SMA%d, suppressing new buy signals", market_sma)
+        else:
+            spy_rows = conn.execute(
+                "SELECT c FROM bars_daily WHERE symbol='SPY' AND t <= ? AND c IS NOT NULL ORDER BY t ASC",
+                (asof,),
+            ).fetchall()
+            spy_closes = [float(r["c"]) for r in spy_rows]
+            market_bullish = False
+            if len(spy_closes) >= market_sma + 1:
+                spy_sma_vals = _sma(spy_closes, market_sma)
+                si = len(spy_closes) - 1
+                if spy_sma_vals[si] is not None and spy_closes[si] > float(spy_sma_vals[si]):
+                    market_bullish = True
+            if not market_bullish:
+                log.info("SPY regime gate: SPY below SMA%d, suppressing new buy signals", market_sma)
 
         for sym in syms:
             rows = conn.execute(
