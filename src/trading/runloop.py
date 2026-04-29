@@ -49,15 +49,25 @@ def finish_run(
     asof: str | None = None,
     reason: str | None = None,
     summary: dict | None = None,
+    regime: dict | None = None,
 ) -> None:
     updates = ["finished_at = datetime('now')", "status = ?"]
     params: list = [status]
 
-    optional = {
+    optional: dict = {
         "asof_date": asof,
         "reason": reason,
         "summary_json": json.dumps(summary) if summary is not None else None,
     }
+
+    if regime is not None:
+        optional["regime"] = regime.get("regime")
+        tu = regime.get("trending_up")
+        optional["regime_trending_up"] = int(tu) if tu is not None else None
+        mp = regime.get("momentum_positive")
+        optional["regime_momentum_positive"] = int(mp) if mp is not None else None
+        optional["regime_buy_notional_mult"] = regime.get("buy_notional_mult")
+        optional["regime_exposure_cap_mult"] = regime.get("exposure_cap_mult")
 
     with connect() as conn:
         cols = conn.execute("PRAGMA table_info(runs);").fetchall()
@@ -346,35 +356,30 @@ def run_once(
         from .regime import detect_regime
 
         def _plan():
-            entry_mode = os.getenv("TRADING_ENTRY_MODE", "sma").strip().lower()
+            #entry_mode = os.getenv("TRADING_ENTRY_MODE", "sma").strip().lower()
             # options: sma | mrit | both
             regime = detect_regime(asof)
-            if entry_mode == "mrit":
-                signals = generate_signals_mrit(universe=universe, asof=asof)
-            elif entry_mode == "both":
-                signals = []
-                signals += generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof)
-                signals += generate_signals_mrit(universe=universe, asof=asof)
-                # optional: de-dup symbols so you don't double-buy same ticker
-                seen = set()
-                deduped = []
-                for s in sorted(signals, key=lambda x: (x.action != "buy", -(x.strength or 0.0))):
-                    # keep best BUY per symbol first; holds can be ignored
-                    if s.symbol in seen and s.action == "buy":
-                        continue
-                    if s.action == "buy":
-                        seen.add(s.symbol)
-                    deduped.append(s)
-                signals = deduped
-            else:
-                signals = generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof)
+            
+            signals = []
+            signals += generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof, regime=regime)
+            signals += generate_signals_mrit(universe=universe, asof=asof, regime=regime)
+            # de-dup symbols so that it don't double-buy same ticker
+            seen = set()
+            deduped = []
+            for s in sorted(signals, key=lambda x: (x.action != "buy", -(x.strength or 0.0))):
+                # keep best BUY per symbol first; holds can be ignored
+                if s.symbol in seen and s.action == "buy":
+                    continue
+                if s.action == "buy":
+                    seen.add(s.symbol)
+                deduped.append(s)
+            signals = deduped
 
             intents = plan_intents(
                 signals,
                 policy=policy,
                 allow_buys=bool(risk["allow_buys"]),
                 risk_state=risk["state"],
-                blocked_buy_signal_keys=set(regime.blocked_signal_keys),
                 buy_notional_mult=float(regime.buy_notional_mult),
                 exposure_cap_mult=float(regime.exposure_cap_mult),
             )
@@ -414,7 +419,6 @@ def run_once(
                 "risk_buys_blocked": risk_blocked,
                 "risk_state": risk.get("state") if isinstance(risk, dict) else None,
                 "cooldown_days": cooldown_days,
-                "entry_mode": entry_mode,
                 "regime": regime.to_dict(),
             }
 
@@ -530,7 +534,9 @@ def run_once(
             log.warning('risk_daily failed: %s', _e)
 
         # 8) Finish + one-line report
-        finish_run(run_id, status="success", asof=asof, summary=summary)
+        _plan_step = summary["steps"].get("plan") or {}
+        _regime_dict = _plan_step.get("regime") if isinstance(_plan_step, dict) else None
+        finish_run(run_id, status="success", asof=asof, summary=summary, regime=_regime_dict)
         one_line = (
             f"RUN OK run_id={run_id} asof={asof} "
             f"universe={universe} top={top} "

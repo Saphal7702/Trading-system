@@ -190,7 +190,8 @@ def plan_intents(
     pol_boost_mult = min(float(pol_boost_mult_env), float(pol_max_mult))
     pol_reduce_mult = max(float(pol_reduce_mult_env), float(pol_min_mult))
 
-    blocked_buy_signal_keys = set(blocked_buy_signal_keys or set())
+    # blocked_buy_signal_keys is kept for signature compatibility but no longer used;
+    # strategies self-gate via their regime parameter.
 
     try:
         buy_notional_mult = float(buy_notional_mult)
@@ -359,17 +360,7 @@ def plan_intents(
                     risk_buys_blocked += 1
                 else:
                     signal_key = _signal_key_for("buy", sig.reason)
-                    if signal_key and signal_key in blocked_buy_signal_keys:
-                        intents.append(
-                            Intent(
-                                sym,
-                                "hold",
-                                f"Buy blocked by market regime for signal: {signal_key}",
-                                sig.strength,
-                            )
-                        )
-                    else:
-                        buy_candidates.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
+                    buy_candidates.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
 
         else:
             intents.append(Intent(sym, "hold", sig.reason, sig.strength))

@@ -45,7 +45,12 @@ CREATE TABLE IF NOT EXISTS runs (
   policy_path TEXT,
   policy_asof TEXT,
   policy_loaded INTEGER DEFAULT 0,
-  policy_error TEXT
+  policy_error TEXT,
+  regime TEXT,                       -- bull | pullback | defensive | crash
+  regime_trending_up INTEGER,        -- 0/1  close > SMA200
+  regime_momentum_positive INTEGER,  -- 0/1  close > SMA50
+  regime_buy_notional_mult REAL,     -- sizing throttle applied this run
+  regime_exposure_cap_mult REAL      -- exposure cap throttle applied this run
 );
 
 CREATE TABLE IF NOT EXISTS broker_accounts (

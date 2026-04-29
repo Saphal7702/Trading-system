@@ -8,7 +8,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
-from ..db import connect
 from .db import connect_backtest, init_backtest_db
 from .sim_broker import SimBroker
 
@@ -82,7 +81,96 @@ def _price_on_or_before(
 
 
 # ---------------------------------------------------------------------------
-# Signal generators (SMA crossover and MRIT)
+# Regime detection from backtest bars (mirrors detect_regime() in regime.py)
+# ---------------------------------------------------------------------------
+
+def _compute_regime(
+    spy_closes: list[float],
+    *,
+    pullback_day_pct: float = -0.010,
+    crash_day_pct: float = -0.020,
+    crash_20d_dd_pct: float = -0.080,
+) -> dict:
+    """
+    Compute observable regime facts from a list of SPY closes.
+    Mirrors the logic in regime.detect_regime() so the backtest gates
+    strategies the same way the paper environment does.
+    """
+    if len(spy_closes) < 200:
+        return {
+            "regime": "defensive",
+            "trending_up": False,
+            "momentum_positive": False,
+            "is_crash": False,
+            "buy_notional_mult": 0.75,
+            "exposure_cap_mult": 0.75,
+        }
+
+    close = spy_closes[-1]
+    prev_close = spy_closes[-2] if len(spy_closes) >= 2 else None
+
+    sma50 = _sma(spy_closes, 50)[-1]
+    sma200 = _sma(spy_closes, 200)[-1]
+
+    day_return = ((close / prev_close) - 1.0) if prev_close and prev_close != 0 else None
+
+    trailing_20 = spy_closes[-20:]
+    peak20 = max(trailing_20) if trailing_20 else None
+    drawdown_20d = ((close / peak20) - 1.0) if peak20 and peak20 != 0 else None
+
+    trending_up = sma200 is not None and close > sma200
+    momentum_positive = sma50 is not None and close > sma50
+
+    is_crash = False
+    if day_return is not None and day_return <= crash_day_pct:
+        is_crash = True
+    if drawdown_20d is not None and drawdown_20d <= crash_20d_dd_pct:
+        is_crash = True
+
+    if is_crash:
+        return {
+            "regime": "crash",
+            "trending_up": trending_up,
+            "momentum_positive": momentum_positive,
+            "is_crash": True,
+            "buy_notional_mult": 0.50,
+            "exposure_cap_mult": 0.50,
+        }
+
+    if sma200 is not None and close < sma200:
+        return {
+            "regime": "defensive",
+            "trending_up": False,
+            "momentum_positive": momentum_positive,
+            "is_crash": False,
+            "buy_notional_mult": 0.75,
+            "exposure_cap_mult": 0.75,
+        }
+
+    if (sma50 is not None and close < sma50) or (
+        day_return is not None and day_return <= pullback_day_pct
+    ):
+        return {
+            "regime": "pullback",
+            "trending_up": True,
+            "momentum_positive": False,
+            "is_crash": False,
+            "buy_notional_mult": 0.85,
+            "exposure_cap_mult": 0.85,
+        }
+
+    return {
+        "regime": "bull",
+        "trending_up": True,
+        "momentum_positive": True,
+        "is_crash": False,
+        "buy_notional_mult": 1.0,
+        "exposure_cap_mult": 1.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Signal generators — gated by regime_facts, not internal SPY checks
 # ---------------------------------------------------------------------------
 
 def _sma_signals(
@@ -90,22 +178,17 @@ def _sma_signals(
     bars_by_sym: dict[str, list[tuple[str, float]]],
     dates_by_sym: dict[str, list[str]],
     asof: str,
-    spy_bars: list[tuple[str, float]],
-    spy_dates: list[str],
+    regime_facts: dict,
     *,
     fast: int = 20,
     slow: int = 50,
     lookback_min: int = 120,
-    market_sma: int = 50,
 ) -> list[dict]:
-    # Market regime gate: only allow buys when SPY close > SPY SMA(market_sma)
-    spy_closes = _closes_up_to(spy_bars, spy_dates, asof)
-    market_bullish = False
-    if len(spy_closes) >= market_sma + 1:
-        spy_sma_vals = _sma(spy_closes, market_sma)
-        si = len(spy_closes) - 1
-        if spy_sma_vals[si] is not None and spy_closes[si] > float(spy_sma_vals[si]):
-            market_bullish = True
+    """
+    SMA crossover signals. Buys suppressed in defensive/crash regime.
+    Sells always fire (we never suppress exits).
+    """
+    market_bullish = regime_facts["regime"] not in ("defensive", "crash")
 
     signals: list[dict] = []
     min_bars = max(slow + 2, lookback_min)
@@ -146,23 +229,18 @@ def _mrit_signals(
     bars_by_sym: dict[str, list[tuple[str, float]]],
     dates_by_sym: dict[str, list[str]],
     asof: str,
-    spy_bars: list[tuple[str, float]],
-    spy_dates: list[str],
+    regime_facts: dict,
     *,
     trend_sma: int = 50,
     mean_sma: int = 10,
     rsi_period: int = 2,
     rsi_max: float = 10.0,
     lookback_min: int = 120,
-    market_sma: int = 200,
 ) -> list[dict]:
-    # Market regime gate: SPY close > SPY SMA(market_sma)
-    spy_closes = _closes_up_to(spy_bars, spy_dates, asof)
-    if len(spy_closes) < market_sma + 5:
-        return []
-    spy_sma = _sma(spy_closes, market_sma)
-    si = len(spy_closes) - 1
-    if spy_sma[si] is None or spy_closes[si] <= float(spy_sma[si]):
+    """
+    MRIT signals. Suppressed entirely when market is not trending up or in crash.
+    """
+    if not regime_facts["trending_up"] or regime_facts["is_crash"]:
         return []
 
     signals: list[dict] = []
@@ -256,7 +334,6 @@ def _compute_metrics(
     years = n_days / 252.0
     ann_return = (((final_equity / initial_capital) ** (1.0 / max(years, 0.001))) - 1.0) * 100.0 if years > 0 else 0.0
 
-    # Daily returns for Sharpe
     daily_returns = []
     for i in range(1, len(equity_curve)):
         e0 = equity_curve[i - 1]["equity"]
@@ -271,7 +348,6 @@ def _compute_metrics(
         if std_r > 0:
             sharpe = (avg_r / std_r) * math.sqrt(252)
 
-    # Max drawdown
     max_dd = 0.0
     peak = equity_curve[0]["equity"]
     for row in equity_curve:
@@ -283,7 +359,6 @@ def _compute_metrics(
             if dd < max_dd:
                 max_dd = dd
 
-    # Trade stats
     closed = [t for t in trades if t.get("exit_reason") != "end_of_backtest"]
     wins = [t for t in closed if (t.get("realized_pnl") or 0.0) > 0]
     win_rate = len(wins) / len(closed) * 100.0 if closed else 0.0
@@ -366,7 +441,8 @@ def _save_results(
 # ---------------------------------------------------------------------------
 
 def run_backtest(
-    strategy: str,
+    strategy: str = "both",
+    *,
     start: str,
     end: str,
     universe: str = "sp500",
@@ -376,22 +452,21 @@ def run_backtest(
     backtest_db_path: str | None = None,
     fast: int = 20,
     slow: int = 50,
-    market_sma: int = 50,
     cooldown_days: int = 0,
-    early_fail_days: int = 5,         # ← add
-    early_fail_max_ret: float = 0.0,  # ← add
+    early_fail_days: int = 5,
+    early_fail_max_ret: float = 0.0,
 ) -> dict:
     """
-    Run a backtest for the given strategy over [start, end].
+    Run a backtest over [start, end].
+
+    strategy: "sma" | "mrit" | "both" (default "both").
+      Regime is computed each day from backtest SPY bars and gates which
+      strategies generate buy signals — mirroring the paper environment.
 
     Fills model: signals on day T are filled at day T+1's close.
-    Universe symbols are read from universe_membership in trading.sqlite.
-    Historical bars are read from bars_daily in trading.sqlite.
-
-    Returns a summary dict with performance metrics and run_id.
     """
-    if strategy not in ("sma", "mrit"):
-        raise ValueError(f"Unknown strategy: {strategy!r}. Use 'sma' or 'mrit'.")
+    if strategy not in ("sma", "mrit", "both"):
+        raise ValueError(f"Unknown strategy: {strategy!r}. Use 'sma', 'mrit', or 'both'.")
 
     if per_position_notional is None:
         per_position_notional = initial_capital / max_positions
@@ -399,7 +474,7 @@ def run_backtest(
     init_backtest_db(backtest_db_path)
 
     # -----------------------------------------------------------------------
-    # Load universe from trading.sqlite, bars from backtest.sqlite (yfinance)
+    # Load universe + bars
     # -----------------------------------------------------------------------
     lookback_start = (
         datetime.strptime(start, "%Y-%m-%d") - timedelta(days=400)
@@ -407,8 +482,7 @@ def run_backtest(
 
     from .db import connect_backtest
     from ..db import connect as live_connect
- 
-    # Universe membership (which symbols to trade) — from live trading DB
+
     with live_connect() as live_conn:
         sym_rows = live_conn.execute(
             "SELECT DISTINCT symbol FROM universe_membership WHERE universe=?",
@@ -420,8 +494,7 @@ def run_backtest(
             f"No symbols in universe '{universe}'. "
             "Run: trading load-universe --file data/sp500.csv"
         )
- 
-    # All price data from backtest DB (yfinance, split-adjusted, isolated)
+
     with connect_backtest(backtest_db_path) as bt_conn:
         day_rows = bt_conn.execute(
             """
@@ -432,14 +505,14 @@ def run_backtest(
             (start, end),
         ).fetchall()
         trading_days: list[str] = [r["t"] for r in day_rows]
- 
+
         if not trading_days:
             raise RuntimeError(
                 f"No bars found in backtest DB for {start} to {end}.\n"
                 f"Fetch split-adjusted data first:\n"
                 f"  trading backtest fetch-bars --start {lookback_start} --end {end}"
             )
- 
+
         sym_placeholders = ",".join("?" * len(symbols))
         bar_rows = bt_conn.execute(
             f"""
@@ -452,7 +525,7 @@ def run_backtest(
             """,
             (*symbols, lookback_start),
         ).fetchall()
- 
+
         spy_rows = bt_conn.execute(
             """
             SELECT t, c FROM bars_daily
@@ -461,21 +534,21 @@ def run_backtest(
             """,
             (lookback_start,),
         ).fetchall()
- 
+
     if not bar_rows:
         raise RuntimeError(
             f"Backtest DB has no price data for universe symbols.\n"
             f"Run: trading backtest fetch-bars --start {lookback_start} --end {end}"
         )
- 
+
     bars_by_sym: dict[str, list[tuple[str, float]]] = defaultdict(list)
     for r in bar_rows:
         bars_by_sym[r["symbol"]].append((r["t"], float(r["c"])))
- 
+
     dates_by_sym: dict[str, list[str]] = {
         sym: [b[0] for b in bars] for sym, bars in bars_by_sym.items()
     }
- 
+
     spy_bars = [(r["t"], float(r["c"])) for r in spy_rows]
     spy_dates = [b[0] for b in spy_bars]
 
@@ -490,7 +563,6 @@ def run_backtest(
     equity_curve: list[dict] = []
 
     for day in trading_days:
-        # Build current price map (last available close on or before this day)
         prices: dict[str, float] = {}
         for sym, bars in bars_by_sym.items():
             p = _price_on_or_before(bars, dates_by_sym[sym], day)
@@ -533,7 +605,7 @@ def run_backtest(
                     ).strftime("%Y-%m-%d")
 
             elif order["action"] == "buy" and sym not in broker.positions and sym not in filled_buys:
-                qty = broker.fill_buy(sym, price, per_position_notional, day)
+                qty = broker.fill_buy(sym, price, order.get("notional", per_position_notional), day)
                 if qty > 0:
                     holding_days[sym] = 0
                     filled_buys.add(sym)
@@ -548,18 +620,46 @@ def run_backtest(
             holding_days[sym] = holding_days.get(sym, 0) + 1
 
         # 3. Check exit rules for open positions
-        exits = _check_exits(broker, prices, holding_days, early_fail_days=early_fail_days, early_fail_max_ret=early_fail_max_ret,)
+        exits = _check_exits(
+            broker, prices, holding_days,
+            early_fail_days=early_fail_days,
+            early_fail_max_ret=early_fail_max_ret,
+        )
         exit_syms = {sym for sym, _ in exits}
         for sym, reason in exits:
             pending_orders.append({"action": "sell", "symbol": sym, "reason": reason})
 
-        # 4. Generate signals based on today's close data
-        if strategy == "sma":
-            raw_signals = _sma_signals(symbols, bars_by_sym, dates_by_sym, day, spy_bars, spy_dates, fast=fast, slow=slow, market_sma=market_sma)
-        else:
-            raw_signals = _mrit_signals(symbols, bars_by_sym, dates_by_sym, day, spy_bars, spy_dates)
+        # 4. Compute regime for today, then generate signals
+        spy_closes_today = _closes_up_to(spy_bars, spy_dates, day)
+        regime_facts = _compute_regime(spy_closes_today)
+        day_notional = per_position_notional * regime_facts["buy_notional_mult"]
 
-        # Queue sell signals for positions we hold (that exit advisor hasn't already caught)
+        raw_signals: list[dict] = []
+        if strategy in ("sma", "both"):
+            raw_signals += _sma_signals(
+                symbols, bars_by_sym, dates_by_sym, day, regime_facts,
+                fast=fast, slow=slow,
+            )
+        if strategy in ("mrit", "both"):
+            raw_signals += _mrit_signals(
+                symbols, bars_by_sym, dates_by_sym, day, regime_facts,
+            )
+
+        # Dedup: keep strongest buy per symbol (in "both" mode two strategies may fire)
+        if strategy == "both":
+            seen: dict[str, dict] = {}
+            deduped: list[dict] = []
+            for sig in sorted(raw_signals, key=lambda s: (s["action"] != "buy", -(s.get("strength") or 0.0))):
+                sym = sig["symbol"]
+                if sig["action"] == "buy":
+                    if sym not in seen:
+                        seen[sym] = sig
+                        deduped.append(sig)
+                else:
+                    deduped.append(sig)
+            raw_signals = deduped
+
+        # Queue sell signals for held positions not already captured by exit rules
         for sig in raw_signals:
             sym = sig["symbol"]
             if sig["action"] == "sell" and sym in broker.positions and sym not in exit_syms:
@@ -583,13 +683,18 @@ def run_backtest(
 
         notional_queued = 0.0
         for sig in buy_candidates[:slots]:
-            if broker.cash - notional_queued < per_position_notional * 0.5:
+            if broker.cash - notional_queued < day_notional * 0.5:
                 break
-            pending_orders.append({"action": "buy", "symbol": sig["symbol"], "reason": sig["reason"]})
+            pending_orders.append({
+                "action": "buy",
+                "symbol": sig["symbol"],
+                "reason": sig["reason"],
+                "notional": day_notional,
+            })
             pending_buy_syms.add(sig["symbol"])
-            notional_queued += per_position_notional
+            notional_queued += day_notional
 
-        # 6. Record daily equity snapshot (after fills, before queued orders)
+        # 6. Record daily equity snapshot
         equity_curve.append({"date": day, "equity": broker.equity(prices), "cash": broker.cash})
 
     # -----------------------------------------------------------------------
