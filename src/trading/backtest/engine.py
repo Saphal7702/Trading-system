@@ -3,6 +3,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import os
 import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -78,6 +79,46 @@ def _price_on_or_before(
 ) -> Optional[float]:
     idx = bisect.bisect_right(dates, asof) - 1
     return bars[idx][1] if idx >= 0 else None
+
+
+def _ohlcv_up_to(
+    ohlcv: list[tuple[str, float, float, float, float]],
+    dates: list[str],
+    asof: str,
+) -> list[tuple[str, float, float, float, float]]:
+    """Return OHLCV rows (date, o, h, l, c) where date <= asof."""
+    idx = bisect.bisect_right(dates, asof) - 1
+    if idx < 0:
+        return []
+    return ohlcv[: idx + 1]
+
+
+# ---------------------------------------------------------------------------
+# ATR computation (mirrors _fetch_atr in exits_advisor.py)
+# ---------------------------------------------------------------------------
+
+def _compute_atr(
+    ohlcv: list[tuple[str, float, float, float, float]],
+    period: int = 14,
+) -> float | None:
+    """
+    Compute ATR(period) from OHLCV rows: (date, open, high, low, close).
+    TR = max(H-L, |H-prevC|, |L-prevC|); ATR = SMA(TR, period).
+    """
+    if len(ohlcv) < period + 1:
+        return None
+    trs: list[float] = []
+    for i in range(1, len(ohlcv)):
+        _, _, h, l, _ = ohlcv[i]
+        prev_c = ohlcv[i - 1][4]
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        if tr <= 0 or math.isnan(tr):
+            continue
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[-period:]) / period
+    return None if (atr <= 0 or math.isnan(atr)) else atr
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +254,7 @@ def _sma_signals(
                     "action": "buy",
                     "reason": f"SMA{fast} crossed above SMA{slow}",
                     "strength": abs(float(sma_f[i]) - float(sma_s[i])),
+                    "signal_key": "sma20_cross_up_sma50",
                 })
         elif sma_f[p] >= sma_s[p] and sma_f[i] < sma_s[i]:
             signals.append({
@@ -269,19 +311,26 @@ def _mrit_signals(
                 "action": "buy",
                 "reason": f"MRIT: RSI{rsi_period}<={rsi_max} pullback in uptrend (c>SMA{trend_sma})",
                 "strength": max(0.0, float(strength)),
+                "signal_key": "mrit_rsi2_pullback_uptrend",
             })
     return signals
 
 
 # ---------------------------------------------------------------------------
-# Exit rule checks (in-memory, no DB)
+# Exit rule checks — priority chain matches exits_advisor.evaluate_exit_advice()
 # ---------------------------------------------------------------------------
 
 def _check_exits(
     broker: SimBroker,
     prices: dict[str, float],
     holding_days: dict[str, int],
+    bars_by_sym: dict[str, list[tuple[str, float]]],
+    dates_by_sym: dict[str, list[str]],
+    ohlcv_by_sym: dict[str, list[tuple[str, float, float, float, float]]],
+    ohlcv_dates_by_sym: dict[str, list[str]],
+    asof: str,
     *,
+    # DEFAULT profile parameters
     stop_loss_pct: float = 5.0,
     trail_activate_pct: float = 8.0,
     trail_dd_pct: float = 4.0,
@@ -290,8 +339,32 @@ def _check_exits(
     time_stop_min_ret: float = 2.0,
     early_fail_days: int = 5,
     early_fail_max_ret: float = 0.0,
+    enable_sma_reversal: bool = True,
+    break_even_peak_pct: float = 10.0,
+    break_even_floor_pct: float = 2.0,
+    # MRIT profile: ATR exits (fire before percentage rules)
+    mrit_atr_period: int = 14,
+    mrit_tp_atr_mult: float | None = None,
+    mrit_sl_atr_mult: float | None = None,
+    # MRIT profile: time/failure overrides
+    mrit_early_fail_days: int = 5,
+    mrit_early_fail_max_ret: float = 0.0,
+    mrit_time_stop_days: int = 30,
+    mrit_time_stop_min_ret: float = 2.0,
+    mrit_enable_sma_reversal: bool = True,
 ) -> list[tuple[str, str]]:
-    """Return list of (symbol, exit_reason) for positions that should be closed."""
+    """
+    Return (symbol, exit_reason) for positions that should be closed.
+    Priority chain mirrors exits_advisor.evaluate_exit_advice():
+      0) ATR stop-loss / take-profit  (MRIT profile only, if configured)
+      1) Hard stop loss
+      2) Trailing stop
+      3) Break-even floor
+      4) SMA reversal  (per-profile enable flag)
+      5) Early failure stop
+      6) Time stop
+      7) Take profit
+    """
     exits: list[tuple[str, str]] = []
     for sym, pos in broker.positions.items():
         price = prices.get(sym)
@@ -302,16 +375,67 @@ def _check_exits(
         dd = ((price - pos.peak_price) / pos.peak_price) * 100.0
         days = holding_days.get(sym, 0)
 
-        if ret <= -abs(stop_loss_pct):
-            exits.append((sym, f"stop_loss ret={ret:.2f}%"))
-        elif peak_gain >= trail_activate_pct and dd <= -abs(trail_dd_pct):
-            exits.append((sym, f"trailing_stop peak={peak_gain:.2f}% dd={dd:.2f}%"))
-        elif ret >= take_profit_pct:
-            exits.append((sym, f"take_profit ret={ret:.2f}%"))
-        elif days >= time_stop_days and ret < time_stop_min_ret:
-            exits.append((sym, f"time_stop days={days} ret={ret:.2f}%"))
-        elif days >= early_fail_days and ret <= early_fail_max_ret:
-            exits.append((sym, f"early_fail days={days} ret={ret:.2f}%"))
+        is_mrit = pos.signal_key.startswith("mrit_")
+        ef_days = mrit_early_fail_days if is_mrit else early_fail_days
+        ef_max = mrit_early_fail_max_ret if is_mrit else early_fail_max_ret
+        ts_days = mrit_time_stop_days if is_mrit else time_stop_days
+        ts_min = mrit_time_stop_min_ret if is_mrit else time_stop_min_ret
+        sma_rev = mrit_enable_sma_reversal if is_mrit else enable_sma_reversal
+
+        exit_reason: str | None = None
+
+        # 0) ATR exits (MRIT only, fires before percentage rules)
+        if is_mrit and (mrit_tp_atr_mult is not None or mrit_sl_atr_mult is not None):
+            ohlcv = _ohlcv_up_to(
+                ohlcv_by_sym.get(sym, []),
+                ohlcv_dates_by_sym.get(sym, []),
+                asof,
+            )
+            atr = _compute_atr(ohlcv, mrit_atr_period)
+            if atr is not None:
+                sl_px = (pos.entry_price - mrit_sl_atr_mult * atr) if mrit_sl_atr_mult is not None else None
+                tp_px = (pos.entry_price + mrit_tp_atr_mult * atr) if mrit_tp_atr_mult is not None else None
+                if sl_px is not None and price <= sl_px:
+                    exit_reason = f"atr_stop_loss ret={ret:.2f}%"
+                elif tp_px is not None and price >= tp_px:
+                    exit_reason = f"atr_take_profit ret={ret:.2f}%"
+
+        # 1) Hard stop loss
+        if exit_reason is None and ret <= -abs(stop_loss_pct):
+            exit_reason = f"stop_loss ret={ret:.2f}%"
+
+        # 2) Trailing stop
+        if exit_reason is None and peak_gain >= trail_activate_pct and dd <= -abs(trail_dd_pct):
+            exit_reason = f"trailing_stop peak={peak_gain:.2f}% dd={dd:.2f}%"
+
+        # 3) Break-even floor
+        if exit_reason is None and peak_gain >= break_even_peak_pct and ret < break_even_floor_pct:
+            exit_reason = f"break_even_floor ret={ret:.2f}%"
+
+        # 4) SMA reversal (per-profile enable flag)
+        if exit_reason is None and sma_rev:
+            closes = _closes_up_to(bars_by_sym.get(sym, []), dates_by_sym.get(sym, []), asof)
+            if len(closes) >= 50:
+                tail = closes[-50:]
+                sma20_v = sum(tail[-20:]) / 20.0
+                sma50_v = sum(tail) / 50.0
+                if sma20_v < sma50_v:
+                    exit_reason = f"sma_reversal sma20={sma20_v:.4f} sma50={sma50_v:.4f}"
+
+        # 5) Early failure stop
+        if exit_reason is None and days >= ef_days and ret <= ef_max:
+            exit_reason = f"early_fail days={days} ret={ret:.2f}%"
+
+        # 6) Time stop
+        if exit_reason is None and days >= ts_days and ret < ts_min:
+            exit_reason = f"time_stop days={days} ret={ret:.2f}%"
+
+        # 7) Take profit
+        if exit_reason is None and ret >= take_profit_pct:
+            exit_reason = f"take_profit ret={ret:.2f}%"
+
+        if exit_reason:
+            exits.append((sym, exit_reason))
     return exits
 
 
@@ -453,8 +577,29 @@ def run_backtest(
     fast: int = 20,
     slow: int = 50,
     cooldown_days: int = 0,
+    # DEFAULT profile exit params
+    stop_loss_pct: float = 5.0,
+    trail_activate_pct: float = 8.0,
+    trail_dd_pct: float = 4.0,
+    take_profit_pct: float = 15.0,
+    time_stop_days: int = 30,
+    time_stop_min_ret: float = 2.0,
     early_fail_days: int = 5,
     early_fail_max_ret: float = 0.0,
+    enable_sma_reversal: bool = True,
+    break_even_peak_pct: float = 10.0,
+    break_even_floor_pct: float = 2.0,
+    # MRIT profile exit params
+    mrit_atr_period: int = 14,
+    mrit_tp_atr_mult: float | None = None,
+    mrit_sl_atr_mult: float | None = None,
+    mrit_early_fail_days: int = 5,
+    mrit_early_fail_max_ret: float = 0.0,
+    mrit_time_stop_days: int = 30,
+    mrit_time_stop_min_ret: float = 2.0,
+    mrit_enable_sma_reversal: bool = False,  # matches live .env TRADING_EXIT_PROFILE_MRIT_ENABLE_SMA_REVERSAL=0
+    # Simulate-live mode
+    simulate_live: bool = False,
 ) -> dict:
     """
     Run a backtest over [start, end].
@@ -463,6 +608,10 @@ def run_backtest(
       Regime is computed each day from backtest SPY bars and gates which
       strategies generate buy signals — mirroring the paper environment.
 
+    simulate_live=True: Read all exit parameters from the same env vars the
+      live system uses (.env via dotenv), so results reflect what the live
+      system would have done with the current configuration.
+
     Fills model: signals on day T are filled at day T+1's close.
     """
     if strategy not in ("sma", "mrit", "both"):
@@ -470,6 +619,45 @@ def run_backtest(
 
     if per_position_notional is None:
         per_position_notional = initial_capital / max_positions
+
+    # -----------------------------------------------------------------------
+    # simulate_live: override all exit params from .env (same vars live uses)
+    # -----------------------------------------------------------------------
+    if simulate_live:
+        def _ef(k: str, d: float) -> float:
+            v = os.environ.get(k)
+            return float(v) if v is not None else d
+
+        def _ei(k: str, d: int) -> int:
+            v = os.environ.get(k)
+            return int(v) if v is not None else d
+
+        def _eb(k: str, d: bool) -> bool:
+            v = os.environ.get(k)
+            return v.strip() in ("1", "true", "t", "yes", "y", "on") if v is not None else d
+
+        stop_loss_pct = _ef("TRADING_EXIT_STOP_LOSS_PCT", stop_loss_pct)
+        take_profit_pct = _ef("TRADING_EXIT_TAKE_PROFIT_PCT", take_profit_pct)
+        trail_activate_pct = _ef("TRADING_EXIT_TRAIL_PEAK_PCT", trail_activate_pct)
+        trail_dd_pct = _ef("TRADING_EXIT_TRAIL_DD_PCT", trail_dd_pct)
+        break_even_peak_pct = _ef("TRADING_EXIT_BREAKEVEN_PEAK_PCT", break_even_peak_pct)
+        break_even_floor_pct = _ef("TRADING_EXIT_BREAKEVEN_FLOOR_PCT", break_even_floor_pct)
+        early_fail_days = _ei("TRADING_EXIT_EARLY_FAIL_DAYS", early_fail_days)
+        early_fail_max_ret = _ef("TRADING_EXIT_EARLY_FAIL_MAX_RET_PCT", early_fail_max_ret)
+        time_stop_days = _ei("TRADING_EXIT_TIME_STOP_DAYS", time_stop_days)
+        time_stop_min_ret = _ef("TRADING_EXIT_TIME_STOP_MIN_RET_PCT", time_stop_min_ret)
+        enable_sma_reversal = _eb("TRADING_EXIT_ENABLE_SMA_REVERSAL", enable_sma_reversal)
+
+        mrit_atr_period = _ei("TRADING_EXIT_PROFILE_MRIT_ATR_PERIOD", mrit_atr_period)
+        _tp = os.environ.get("TRADING_EXIT_PROFILE_MRIT_TP_ATR_MULT")
+        mrit_tp_atr_mult = float(_tp) if _tp is not None else mrit_tp_atr_mult
+        _sl = os.environ.get("TRADING_EXIT_PROFILE_MRIT_SL_ATR_MULT")
+        mrit_sl_atr_mult = float(_sl) if _sl is not None else mrit_sl_atr_mult
+        mrit_early_fail_days = _ei("TRADING_EXIT_PROFILE_MRIT_EARLY_FAIL_DAYS", mrit_early_fail_days)
+        mrit_early_fail_max_ret = _ef("TRADING_EXIT_PROFILE_MRIT_EARLY_FAIL_MAX_RET_PCT", mrit_early_fail_max_ret)
+        mrit_time_stop_days = _ei("TRADING_EXIT_PROFILE_MRIT_TIME_STOP_DAYS", mrit_time_stop_days)
+        mrit_time_stop_min_ret = _ef("TRADING_EXIT_PROFILE_MRIT_TIME_STOP_MIN_RET_PCT", mrit_time_stop_min_ret)
+        mrit_enable_sma_reversal = _eb("TRADING_EXIT_PROFILE_MRIT_ENABLE_SMA_REVERSAL", mrit_enable_sma_reversal)
 
     init_backtest_db(backtest_db_path)
 
@@ -516,7 +704,7 @@ def run_backtest(
         sym_placeholders = ",".join("?" * len(symbols))
         bar_rows = bt_conn.execute(
             f"""
-            SELECT symbol, t, c
+            SELECT symbol, t, o, h, l, c
             FROM bars_daily
             WHERE symbol IN ({sym_placeholders})
               AND t >= ?
@@ -541,12 +729,22 @@ def run_backtest(
             f"Run: trading backtest fetch-bars --start {lookback_start} --end {end}"
         )
 
+    # Build close-only bars (for signals/SMA) and OHLCV bars (for ATR) from one pass
     bars_by_sym: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    ohlcv_by_sym: dict[str, list[tuple[str, float, float, float, float]]] = defaultdict(list)
     for r in bar_rows:
-        bars_by_sym[r["symbol"]].append((r["t"], float(r["c"])))
+        c = float(r["c"])
+        bars_by_sym[r["symbol"]].append((r["t"], c))
+        o = float(r["o"]) if r["o"] is not None else c
+        h = float(r["h"]) if r["h"] is not None else c
+        l_ = float(r["l"]) if r["l"] is not None else c
+        ohlcv_by_sym[r["symbol"]].append((r["t"], o, h, l_, c))
 
     dates_by_sym: dict[str, list[str]] = {
         sym: [b[0] for b in bars] for sym, bars in bars_by_sym.items()
+    }
+    ohlcv_dates_by_sym: dict[str, list[str]] = {
+        sym: [b[0] for b in bars] for sym, bars in ohlcv_by_sym.items()
     }
 
     spy_bars = [(r["t"], float(r["c"])) for r in spy_rows]
@@ -605,7 +803,8 @@ def run_backtest(
                     ).strftime("%Y-%m-%d")
 
             elif order["action"] == "buy" and sym not in broker.positions and sym not in filled_buys:
-                qty = broker.fill_buy(sym, price, order.get("notional", per_position_notional), day)
+                sig_key = order.get("signal_key", "")
+                qty = broker.fill_buy(sym, price, order.get("notional", per_position_notional), day, signal_key=sig_key)
                 if qty > 0:
                     holding_days[sym] = 0
                     filled_buys.add(sym)
@@ -622,8 +821,28 @@ def run_backtest(
         # 3. Check exit rules for open positions
         exits = _check_exits(
             broker, prices, holding_days,
+            bars_by_sym, dates_by_sym,
+            ohlcv_by_sym, ohlcv_dates_by_sym,
+            day,
+            stop_loss_pct=stop_loss_pct,
+            trail_activate_pct=trail_activate_pct,
+            trail_dd_pct=trail_dd_pct,
+            take_profit_pct=take_profit_pct,
+            time_stop_days=time_stop_days,
+            time_stop_min_ret=time_stop_min_ret,
             early_fail_days=early_fail_days,
             early_fail_max_ret=early_fail_max_ret,
+            enable_sma_reversal=enable_sma_reversal,
+            break_even_peak_pct=break_even_peak_pct,
+            break_even_floor_pct=break_even_floor_pct,
+            mrit_atr_period=mrit_atr_period,
+            mrit_tp_atr_mult=mrit_tp_atr_mult,
+            mrit_sl_atr_mult=mrit_sl_atr_mult,
+            mrit_early_fail_days=mrit_early_fail_days,
+            mrit_early_fail_max_ret=mrit_early_fail_max_ret,
+            mrit_time_stop_days=mrit_time_stop_days,
+            mrit_time_stop_min_ret=mrit_time_stop_min_ret,
+            mrit_enable_sma_reversal=mrit_enable_sma_reversal,
         )
         exit_syms = {sym for sym, _ in exits}
         for sym, reason in exits:
@@ -685,11 +904,13 @@ def run_backtest(
         for sig in buy_candidates[:slots]:
             if broker.cash - notional_queued < day_notional * 0.5:
                 break
+            sig_key = sig.get("signal_key", "sma20_cross_up_sma50")
             pending_orders.append({
                 "action": "buy",
                 "symbol": sig["symbol"],
                 "reason": sig["reason"],
                 "notional": day_notional,
+                "signal_key": sig_key,
             })
             pending_buy_syms.add(sig["symbol"])
             notional_queued += day_notional

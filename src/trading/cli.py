@@ -1874,7 +1874,31 @@ def main() -> int:
     p_bt.add_argument("--early-fail-days", type=int, default=5,
                     help="Days before early_fail fires (default: 5, use 999 to disable)")
     p_bt.add_argument("--early-fail-max-ret", type=float, default=0.0,
-                    help="Max return%% to trigger early_fail (default: 0.0, e.g. -3.0 to only cut real losers)")
+                    help="Max return%% to trigger early_fail (default: 0.0)")
+    p_bt.add_argument("--break-even-peak", type=float, default=10.0,
+                    help="Peak gain %% to activate break-even floor (default: 10.0)")
+    p_bt.add_argument("--break-even-floor", type=float, default=2.0,
+                    help="Exit if ret falls below this %% after peak reached (default: 2.0)")
+    p_bt.add_argument("--mrit-tp-atr-mult", type=float, default=None,
+                    help="MRIT ATR take-profit multiplier (default: None = disabled)")
+    p_bt.add_argument("--mrit-sl-atr-mult", type=float, default=None,
+                    help="MRIT ATR stop-loss multiplier (default: None = disabled)")
+    p_bt.add_argument("--mrit-atr-period", type=int, default=14,
+                    help="ATR period for MRIT exits (default: 14)")
+    p_bt.add_argument("--mrit-early-fail-days", type=int, default=5,
+                    help="Early-fail days for MRIT profile (default: 5)")
+    p_bt.add_argument("--mrit-early-fail-max-ret", type=float, default=0.0,
+                    help="Early-fail max-ret for MRIT profile (default: 0.0)")
+    p_bt.add_argument("--mrit-time-stop-days", type=int, default=30,
+                    help="Time-stop days for MRIT profile (default: 30)")
+    p_bt.add_argument("--mrit-time-stop-min-ret", type=float, default=2.0,
+                    help="Time-stop min-ret%% for MRIT profile (default: 2.0)")
+    p_bt.add_argument("--mrit-enable-sma-reversal",
+                    type=lambda x: x.strip().lower() not in ("0", "false", "no", "off"),
+                    default=False, metavar="0/1",
+                    help="SMA reversal exit for MRIT profile (default: 0/disabled; matches live .env; pass 1 to enable)")
+    p_bt.add_argument("--simulate-live", action="store_true", default=False,
+                    help="Load all exit params from .env (same vars live system uses) for exact live simulation")
 
     p_btfb = sub.add_parser(
         "backtest-fetch-bars",
@@ -1966,6 +1990,17 @@ def main() -> int:
             cooldown_days=args.cooldown_days,
             early_fail_days=args.early_fail_days,
             early_fail_max_ret=args.early_fail_max_ret,
+            break_even_peak_pct=args.break_even_peak,
+            break_even_floor_pct=args.break_even_floor,
+            mrit_tp_atr_mult=args.mrit_tp_atr_mult,
+            mrit_sl_atr_mult=args.mrit_sl_atr_mult,
+            mrit_atr_period=args.mrit_atr_period,
+            mrit_early_fail_days=args.mrit_early_fail_days,
+            mrit_early_fail_max_ret=args.mrit_early_fail_max_ret,
+            mrit_time_stop_days=args.mrit_time_stop_days,
+            mrit_time_stop_min_ret=args.mrit_time_stop_min_ret,
+            mrit_enable_sma_reversal=args.mrit_enable_sma_reversal,
+            simulate_live=args.simulate_live,
         )
         print_report(summary, strategy=args.strategy, start=args.start, end=args.end)
         return 0
