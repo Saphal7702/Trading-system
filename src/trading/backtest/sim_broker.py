@@ -11,6 +11,7 @@ class SimPosition:
     entry_date: str
     peak_price: float
     entry_notional: float
+    signal_key: str = ""
 
 
 class SimBroker:
@@ -18,7 +19,7 @@ class SimBroker:
         self.cash = float(cash)
         self.positions: dict[str, SimPosition] = {}
 
-    def fill_buy(self, symbol: str, price: float, notional: float, date: str) -> float:
+    def fill_buy(self, symbol: str, price: float, notional: float, date: str, signal_key: str = "") -> float:
         """Buy at price with given notional. Returns qty filled (0 if insufficient cash)."""
         if price <= 0 or notional <= 0 or self.cash <= 0:
             return 0.0
@@ -37,6 +38,7 @@ class SimBroker:
                 entry_date=pos.entry_date,
                 peak_price=max(pos.peak_price, price),
                 entry_notional=pos.entry_notional + cost,
+                signal_key=pos.signal_key,
             )
         else:
             self.positions[symbol] = SimPosition(
@@ -46,6 +48,7 @@ class SimBroker:
                 entry_date=date,
                 peak_price=price,
                 entry_notional=cost,
+                signal_key=signal_key,
             )
         return qty
 
@@ -69,6 +72,7 @@ class SimBroker:
                 entry_date=pos.entry_date,
                 peak_price=price,
                 entry_notional=pos.entry_notional,
+                signal_key=pos.signal_key,
             )
 
     def equity(self, prices: dict[str, float]) -> float:
