@@ -34,6 +34,22 @@ def print_report(summary: dict, *, strategy: str, start: str, end: str) -> None:
         print(f"  Run ID (backtest.sqlite): {run_id}")
     print()
 
+    # Orders by signal type
+    orders_by_signal = summary.get("orders_by_signal", {})
+    if orders_by_signal:
+        print(f"  Orders by signal:")
+        for sk, stats in sorted(orders_by_signal.items()):
+            n = stats["orders"]
+            cl = stats["closed"]
+            w = stats["wins"]
+            pnl = stats["pnl"]
+            win_pct = (w / cl * 100.0) if cl else 0.0
+            print(
+                f"    {sk:<35s}  orders={n:3d}  closed={cl:3d}"
+                f"  win={win_pct:5.1f}%  pnl={pnl:+9.2f}"
+            )
+        print()
+
     # Top 10 trades by absolute P&L
     trades = summary.get("trades_detail", [])
     closed = [t for t in trades if t.get("exit_reason") != "end_of_backtest"]

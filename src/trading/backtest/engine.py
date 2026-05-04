@@ -488,6 +488,19 @@ def _compute_metrics(
     win_rate = len(wins) / len(closed) * 100.0 if closed else 0.0
     avg_ret = sum(t.get("return_pct") or 0.0 for t in closed) / len(closed) if closed else 0.0
 
+    # Order counts and P&L breakdown by signal_key (all trades, including open)
+    orders_by_signal: dict[str, dict] = {}
+    for t in trades:
+        sk = t.get("signal_key") or "unknown"
+        if sk not in orders_by_signal:
+            orders_by_signal[sk] = {"orders": 0, "closed": 0, "wins": 0, "pnl": 0.0}
+        orders_by_signal[sk]["orders"] += 1
+        if t.get("exit_reason") != "end_of_backtest":
+            orders_by_signal[sk]["closed"] += 1
+            if (t.get("realized_pnl") or 0.0) > 0:
+                orders_by_signal[sk]["wins"] += 1
+            orders_by_signal[sk]["pnl"] += t.get("realized_pnl") or 0.0
+
     return {
         "final_equity": round(final_equity, 2),
         "total_return_pct": round(total_return, 3),
@@ -499,6 +512,7 @@ def _compute_metrics(
         "wins": len(wins),
         "avg_trade_return_pct": round(avg_ret, 3),
         "trading_days": n_days,
+        "orders_by_signal": orders_by_signal,
     }
 
 
@@ -538,13 +552,14 @@ def _save_results(
             """
             INSERT INTO backtest_trades
                 (run_id, symbol, entry_date, exit_date, entry_price, exit_price,
-                 qty, realized_pnl, return_pct, exit_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 qty, realized_pnl, return_pct, exit_reason, signal_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (run_id, t["symbol"], t["entry_date"], t.get("exit_date"),
                  t["entry_price"], t.get("exit_price"), t["qty"],
-                 t.get("realized_pnl"), t.get("return_pct"), t.get("exit_reason"))
+                 t.get("realized_pnl"), t.get("return_pct"), t.get("exit_reason"),
+                 t.get("signal_key"))
                 for t in trades
             ],
         )
@@ -794,6 +809,7 @@ def run_backtest(
                     "realized_pnl": pnl,
                     "return_pct": ret_pct,
                     "exit_reason": order.get("reason", "signal"),
+                    "signal_key": pos.signal_key,
                 })
                 holding_days.pop(sym, None)
                 filled_sells.add(sym)
@@ -937,6 +953,7 @@ def run_backtest(
             "realized_pnl": pnl,
             "return_pct": ret_pct,
             "exit_reason": "end_of_backtest",
+            "signal_key": pos.signal_key,
         })
 
     # -----------------------------------------------------------------------

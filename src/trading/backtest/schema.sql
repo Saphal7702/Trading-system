@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
     qty          REAL    NOT NULL,
     realized_pnl REAL,
     return_pct   REAL,
-    exit_reason  TEXT
+    exit_reason  TEXT,
+    signal_key   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS backtest_equity_curve (
