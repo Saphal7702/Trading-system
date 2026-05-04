@@ -23,4 +23,9 @@ def init_backtest_db(db_path: str | None = None) -> None:
     schema = (Path(__file__).parent / "schema.sql").read_text()
     conn.executescript(schema)
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE backtest_trades ADD COLUMN signal_key TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
     conn.close()
