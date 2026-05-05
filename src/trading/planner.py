@@ -161,10 +161,27 @@ def plan_intents(
     now = datetime.now(timezone.utc)
 
     max_positions = max_positions if max_positions is not None else env_int("TRADING_MAX_POSITIONS", 5)
-    per_position_notional = (
+    base_per_position = (
         per_position_notional if per_position_notional is not None else env_float("TRADING_PER_POSITION", 100.0)
     )
-    per_position_notional = float(per_position_notional) * float(buy_notional_mult)
+    compound_sizing = os.getenv("TRADING_COMPOUND_SIZING", "false").strip().lower() in ("1", "true", "yes", "on", "y")
+    if compound_sizing:
+        assumed_bp_base = env_float("TRADING_ASSUMED_BP", 0.0)
+        if assumed_bp_base > 0:
+            position_pct = float(base_per_position) / assumed_bp_base
+            with connect() as _conn:
+                _row = _conn.execute(
+                    "SELECT equity FROM broker_accounts ORDER BY last_synced_at DESC LIMIT 1"
+                ).fetchone()
+            if _row and _row["equity"] and float(_row["equity"]) > 0:
+                per_position_notional = float(_row["equity"]) * position_pct
+            else:
+                per_position_notional = float(base_per_position)
+        else:
+            per_position_notional = float(base_per_position)
+    else:
+        per_position_notional = float(base_per_position)
+    per_position_notional = per_position_notional * float(buy_notional_mult)
     cash_buffer = cash_buffer if cash_buffer is not None else env_float("TRADING_CASH_BUFFER", 25.0)
 
     # Policy utilization knobs

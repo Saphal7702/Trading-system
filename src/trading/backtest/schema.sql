@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     initial_capital       REAL    NOT NULL,
     max_positions         INTEGER NOT NULL,
     per_position_notional REAL    NOT NULL,
+    compound              INTEGER NOT NULL DEFAULT 0,
     created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
     summary_json          TEXT
 );

@@ -530,6 +530,7 @@ def _save_results(
     initial_capital: float,
     max_positions: int,
     per_position_notional: float,
+    compound: bool,
     trades: list[dict],
     equity_curve: list[dict],
     summary: dict,
@@ -540,11 +541,11 @@ def _save_results(
             """
             INSERT INTO backtest_runs
                 (strategy, start_date, end_date, universe, initial_capital,
-                 max_positions, per_position_notional, summary_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 max_positions, per_position_notional, compound, summary_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (strategy, start, end, universe, initial_capital,
-             max_positions, per_position_notional, json.dumps(summary)),
+             max_positions, per_position_notional, int(compound), json.dumps(summary)),
         )
         run_id = cur.lastrowid
 
@@ -592,6 +593,7 @@ def run_backtest(
     fast: int = 20,
     slow: int = 50,
     cooldown_days: int = 0,
+    atr_stop_cooldown_days: int = 0,
     # DEFAULT profile exit params
     stop_loss_pct: float = 5.0,
     trail_activate_pct: float = 8.0,
@@ -615,6 +617,8 @@ def run_backtest(
     mrit_enable_sma_reversal: bool = False,  # matches live .env TRADING_EXIT_PROFILE_MRIT_ENABLE_SMA_REVERSAL=0
     # Simulate-live mode
     simulate_live: bool = False,
+    # Compound position sizing
+    compound: bool = False,
 ) -> dict:
     """
     Run a backtest over [start, end].
@@ -673,6 +677,10 @@ def run_backtest(
         mrit_time_stop_days = _ei("TRADING_EXIT_PROFILE_MRIT_TIME_STOP_DAYS", mrit_time_stop_days)
         mrit_time_stop_min_ret = _ef("TRADING_EXIT_PROFILE_MRIT_TIME_STOP_MIN_RET_PCT", mrit_time_stop_min_ret)
         mrit_enable_sma_reversal = _eb("TRADING_EXIT_PROFILE_MRIT_ENABLE_SMA_REVERSAL", mrit_enable_sma_reversal)
+        if not compound:  # CLI --compound takes priority; only override if not explicitly set
+            compound = _eb("TRADING_COMPOUND_SIZING", compound)
+        if atr_stop_cooldown_days == 0:
+            atr_stop_cooldown_days = _ei("TRADING_ATR_STOP_COOLDOWN_DAYS", atr_stop_cooldown_days)
 
     init_backtest_db(backtest_db_path)
 
@@ -817,6 +825,12 @@ def run_backtest(
                     cooldown_until[sym] = (
                         datetime.strptime(day, "%Y-%m-%d") + timedelta(days=cooldown_days)
                     ).strftime("%Y-%m-%d")
+                if atr_stop_cooldown_days > 0 and order.get("reason", "").startswith("atr_stop_loss"):
+                    atr_cd = (
+                        datetime.strptime(day, "%Y-%m-%d") + timedelta(days=atr_stop_cooldown_days)
+                    ).strftime("%Y-%m-%d")
+                    if atr_cd > cooldown_until.get(sym, ""):
+                        cooldown_until[sym] = atr_cd
 
             elif order["action"] == "buy" and sym not in broker.positions and sym not in filled_buys:
                 sig_key = order.get("signal_key", "")
@@ -867,7 +881,13 @@ def run_backtest(
         # 4. Compute regime for today, then generate signals
         spy_closes_today = _closes_up_to(spy_bars, spy_dates, day)
         regime_facts = _compute_regime(spy_closes_today)
-        day_notional = per_position_notional * regime_facts["buy_notional_mult"]
+        if compound:
+            position_pct = per_position_notional / initial_capital
+            current_equity = broker.equity(prices)
+            day_notional = current_equity * position_pct * regime_facts["buy_notional_mult"]
+        else:
+            day_notional = per_position_notional * regime_facts["buy_notional_mult"]
+        day_notional = max(1.0, day_notional)
 
         raw_signals: list[dict] = []
         if strategy in ("sma", "both"):
@@ -970,6 +990,7 @@ def run_backtest(
         initial_capital=initial_capital,
         max_positions=max_positions,
         per_position_notional=per_position_notional,
+        compound=compound,
         trades=trades,
         equity_curve=equity_curve,
         summary=summary,
