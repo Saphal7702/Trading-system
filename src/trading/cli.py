@@ -1899,6 +1899,10 @@ def main() -> int:
                     help="SMA reversal exit for MRIT profile (default: 0/disabled; matches live .env; pass 1 to enable)")
     p_bt.add_argument("--simulate-live", action="store_true", default=False,
                     help="Load all exit params from .env (same vars live system uses) for exact live simulation")
+    p_bt.add_argument("--compound", action="store_true", default=False,
+                    help="Compound position sizing: size each trade as a fixed %% of current equity (default: False = fixed notional)")
+    p_bt.add_argument("--atr-stop-cooldown-days", type=int, default=0,
+                    help="Days to block re-entry after an ATR stop loss exit (default: 0 = disabled; recommended: 20-30)")
 
     p_btfb = sub.add_parser(
         "backtest-fetch-bars",
@@ -2001,6 +2005,8 @@ def main() -> int:
             mrit_time_stop_min_ret=args.mrit_time_stop_min_ret,
             mrit_enable_sma_reversal=args.mrit_enable_sma_reversal,
             simulate_live=args.simulate_live,
+            compound=args.compound,
+            atr_stop_cooldown_days=args.atr_stop_cooldown_days,
         )
         print_report(summary, strategy=args.strategy, start=args.start, end=args.end)
         return 0
