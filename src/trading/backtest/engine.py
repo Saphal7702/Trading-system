@@ -699,7 +699,12 @@ def run_backtest(
             "SELECT DISTINCT symbol FROM universe_membership WHERE universe=?",
             (universe,),
         ).fetchall()
-    symbols = [r["symbol"] for r in sym_rows]
+    EXCLUDE_SYMBOLS = {
+        "AVB","BKNG","BWA","CI","COST","CRL","CRWD","DPRO","ENPH","EOG",
+        "EPAM","ERIE","FRT","HWM","IT","KHC","LH","MOH","PGR","PH",
+        "RF","RL","SYK","TECH","TFX","TXN","UAL","ULTA","VTRS",
+    }
+    symbols = [r["symbol"] for r in sym_rows if r["symbol"] not in EXCLUDE_SYMBOLS]
     if not symbols:
         raise RuntimeError(
             f"No symbols in universe '{universe}'. "
