@@ -396,6 +396,8 @@ def _rule_priority(signal_key: str) -> int:
         return 100
     if signal_key.startswith("exit_trailing"):
         return 90
+    if signal_key.startswith("exit_break_even_floor"):
+        return 85
     if signal_key.startswith("exit_sma_reversal"):
         return 80
     if signal_key.startswith("exit_early_failure"):
@@ -555,25 +557,31 @@ def evaluate_exit_advice(
                 action = "SELL"
                 rationale = f"Trailing stop: peak_gain={peak_gain:.2f}% and drawdown={dd:.2f}%"
 
-            # 3) SMA reversal
+            # 3) Break-even floor
+            elif action == "HOLD" and peak_gain >= cfg_eff.break_even_peak_gain_pct and ret < cfg_eff.break_even_floor_ret_pct:
+                exit_signal = f"exit_break_even_floor_{int(cfg_eff.break_even_peak_gain_pct)}pct_peak"
+                action = "SELL"
+                rationale = f"Break-even floor: peak_gain={peak_gain:.2f}% >= {cfg_eff.break_even_peak_gain_pct:.2f}% and ret={ret:.2f}% < {cfg_eff.break_even_floor_ret_pct:.2f}%"
+
+            # 4) SMA reversal
             elif action == "HOLD" and cfg_eff.enable_sma_reversal and sma20 is not None and sma50 is not None and sma20 < sma50:
                 exit_signal = "exit_sma_reversal_sma20_below_sma50"
                 action = "SELL"
                 rationale = f"Trend reversal: SMA20={sma20:.4f} < SMA50={sma50:.4f}"
 
-            # 4) Early failure stop
+            # 5) Early failure stop
             elif action == "HOLD" and days >= cfg_eff.early_fail_days and ret <= cfg_eff.early_fail_max_ret_pct:
                 exit_signal = f"exit_early_failure_{cfg_eff.early_fail_days}d"
                 action = "SELL"
                 rationale = f"Early failure: days={days} ret={ret:.2f}% <= {cfg_eff.early_fail_max_ret_pct:.2f}%"
 
-            # 5) Time stop
+            # 6) Time stop
             elif action == "HOLD" and days >= cfg_eff.time_stop_days and ret < cfg_eff.time_stop_min_ret_pct:
                 exit_signal = f"exit_time_stop_{cfg_eff.time_stop_days}d"
                 action = "SELL"
                 rationale = f"Time stop: days={days} ret={ret:.2f}% < {cfg_eff.time_stop_min_ret_pct:.2f}%"
 
-            # 6) Take profit (soft)
+            # 7) Take profit (soft)
             elif action == "HOLD" and ret >= cfg_eff.take_profit_pct:
                 exit_signal = f"exit_take_profit_{int(cfg_eff.take_profit_pct)}pct"
                 action = "SELL"
