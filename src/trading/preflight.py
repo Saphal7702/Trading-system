@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from .db import connect
 from .asof import resolve_asof_date
-from .market_calendar import today_ny_str, is_trading_day
+from .market_calendar import today_ny_str, is_trading_day, last_completed_trading_day
 from .utils import env_int, env_float, env_bool
 
 NY = ZoneInfo("America/New_York")
@@ -51,6 +51,9 @@ def run_preflight(*, universe: str = "sp500") -> PreflightResult:
     broker = _make_broker()
     upsert_account(broker)
     acct = broker.get_account()
+
+    last_trade_day = last_completed_trading_day(broker)
+    data_ok = (asof_date >= last_trade_day)
 
     trade_day = today_ny_str()
     ignore_cal = env_bool("TRADING_IGNORE_MARKET_CALENDAR", False)
@@ -110,8 +113,7 @@ def run_preflight(*, universe: str = "sp500") -> PreflightResult:
     cap_remaining = max(0, int(daily_cap) - int(already_submitted_today or 0))
 
     # 4) Existing "ok" (data + trading day)
-    max_stale = env_int("TRADING_MAX_BAR_STALENESS_DAYS", 2)
-    ok = (staleness_days <= max_stale) and market_open_day
+    ok = data_ok and market_open_day
 
     # 5) Execution-safe evaluation
     exec_blockers: list[str] = []

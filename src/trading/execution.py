@@ -409,7 +409,7 @@ def execute_run(
                     "reason": reason,
                     "qty_for_execution_row": float(est_qty),
                     "qty_to_persist": float(est_qty),
-                    "broker_kwargs": {"symbol": symbol, "side": "buy", "notional": float(target)},
+                    "broker_kwargs": {"symbol": symbol, "side": "buy", "notional": round(target, 2)},
                     "log_msg": (
                         f"ORDER BUY {symbol} target_notional=${target:.2f} close={close:.4f} "
                         f"-> est_qty={est_qty:.6f} | {reason}"

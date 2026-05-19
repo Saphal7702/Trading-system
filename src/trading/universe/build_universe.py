@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..asof import resolve_asof_date 
+from ..asof import resolve_asof_date
 from ..db import connect
 
 def build_universe_daily(

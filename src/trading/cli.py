@@ -660,6 +660,356 @@ def cmd_build_universe(universe: str, asof: str | None, top: int, min_adv20: flo
     return 0
 
 
+def cmd_exclude_symbol(args) -> int:
+    from .exclusions import add_exclusion
+    added = add_exclusion(
+        symbol=args.symbol,
+        reason_code=args.reason,
+        reason_note=args.note,
+        excluded_by="operator",
+        review_after=args.review_after,
+    )
+    status = "Added" if added else "Already excluded (note updated)"
+    print(f"{status}: {args.symbol.upper()} [{args.reason}]")
+    if args.note:
+        print(f"  Note: {args.note}")
+    if args.review_after:
+        print(f"  Review after: {args.review_after}")
+    return 0
+
+
+def cmd_reinstate_symbol(args) -> int:
+    from .exclusions import reinstate_symbol
+    ok = reinstate_symbol(args.symbol, note=args.note)
+    if ok:
+        print(f"Reinstated: {args.symbol.upper()}")
+        if args.note:
+            print(f"  Note: {args.note}")
+    else:
+        print(f"Not found or already active: {args.symbol.upper()}")
+    return 0
+
+
+def cmd_show_exclusions(args) -> int:
+    from .exclusions import list_exclusions
+    rows = list_exclusions(
+        reason_code=args.reason,
+        include_reinstated=args.all,
+        review_due=args.review_due,
+    )
+    if not rows:
+        print("No exclusions found matching criteria.")
+        return 0
+    print(f"\n{'Symbol':<8} {'Code':<16} {'Excluded':>12} {'Review':>12}  Note")
+    print("-" * 75)
+    for r in rows:
+        status = "" if r["reinstated_at"] is None else " [REINSTATED]"
+        review = r["review_after"] or "-"
+        note = (r["reason_note"] or "")[:40]
+        print(
+            f"{r['symbol']:<8} {r['reason_code']:<16} "
+            f"{r['excluded_at'][:10]:>12} {review:>12}  {note}{status}"
+        )
+    print(f"\nTotal: {len(rows)}")
+    return 0
+
+
+def cmd_migrate_exclusions(args) -> int:
+    from .exclusions import migrate_from_env
+    result = migrate_from_env(dry_run=args.dry_run)
+    prefix = "[DRY RUN] " if args.dry_run else ""
+    print(f"\n=== {prefix}Exclusion Migration ===")
+    print(f"  Migrated: {result['migrated']}")
+    print(f"  Skipped (already in DB): {result['skipped']}")
+    if result['symbols']:
+        print(f"  Symbols: {', '.join(result['symbols'])}")
+    if args.dry_run:
+        print("\n  Run without --dry-run to apply.")
+    else:
+        print("\n  Done. You can now remove TRADING_EXCLUDE_SYMBOLS from .env")
+        print("  (keep it as empty or delete the line — the DB is now the source of truth)")
+    return 0
+
+
+def cmd_update_universe_sp500(args) -> int:
+    from .universe.update_sp500 import update_sp500_universe
+
+    result = update_sp500_universe(
+        universe=args.universe,
+        source=args.source,
+        csv_path=getattr(args, "file", ""),
+        dry_run=args.dry_run,
+    )
+
+    prefix = "[DRY RUN] " if result["dry_run"] else ""
+    print(f"\n=== {prefix}S&P 500 Universe Update ===")
+    print(f"  Universe:              {result['universe']}")
+    print(f"  Current S&P 500:       {result['sp500_count']} symbols")
+    print(f"  Total in universe:     {result['current_count']} symbols")
+    print()
+
+    if result["added"]:
+        print(f"  Added ({len(result['added'])} new S&P members, source='sp500_new'):")
+        for sym in result["added"]:
+            print(f"    + {sym}")
+    else:
+        print(f"  Added: none")
+
+    if result.get("rejoined"):
+        print(f"  Rejoined ({len(result['rejoined'])} previously-removed members back in S&P, source 'sp500_rem' → 'sp500_new'):")
+        for sym in result["rejoined"]:
+            print(f"    ↑ {sym}")
+
+    if result["marked_removed"]:
+        print(f"\n  Marked source='sp500_rem' ({len(result['marked_removed'])} symbols):")
+        print(f"  These are no longer in the current S&P 500.")
+        print(f"  Rows are kept in universe_membership; use 'trading exclude-symbol'")
+        print(f"  if you want to stop trading any of them.")
+        for sym in result["marked_removed"]:
+            print(f"    ~ {sym}")
+    else:
+        print(f"\n  No removals detected.")
+
+    print()
+    if not result["dry_run"] and result["added"]:
+        print("  Next steps:")
+        print("    trading fetch-bars --universe sp500 --days 365")
+        print("    trading build-universe --universe sp500")
+        print("    trading backtest-fetch-bars --universe sp500 --start 2015-01-01 --end 2025-12-31")
+    return 0
+
+
+def cmd_build_custom_universe(args) -> int:
+    from .universe.universe_builder import build_custom_universe, BuilderConfig
+    cfg = BuilderConfig(
+        universe_name=args.universe_name,
+        source=args.source,
+        top=args.top,
+        min_adv20=args.min_adv20,
+        min_price=args.min_price,
+        min_pct_above_sma200=args.min_trend_pct,     # ← name mapping
+        max_gap_down_freq=args.max_gap_freq,          # ← name mapping
+        min_rsi2_recovery_rate=args.min_rsi2_rate,   # ← name mapping
+        lookback_days=args.lookback_days,
+        exclude_symbols=args.exclude_symbols.split(",") if args.exclude_symbols else [],
+        save_report=args.report,
+        use_backtest_db=args.use_backtest_db,
+    )
+    summary = build_custom_universe(cfg)
+
+    print()
+    print("=== Universe Builder Results ===")
+    print(f"Universe name:           {summary['universe_name']}")
+    print(f"Asof:                    {summary['asof']}")
+    print(f"Candidates screened:     {summary['candidates']}")
+    if summary["excluded"]:
+        print(f"Excluded by list:        {summary['excluded']}")
+    print(f"Passed liquidity:        {summary['passed_liquidity']}")
+    print(f"Passed trend:            {summary['passed_trend']}")
+    print(f"Passed gap filter:       {summary['passed_gap']}")
+    print(f"Passed RSI2 recovery:    {summary['passed_rsi2']}")
+    print(f"Final universe (top N):  {summary['final']}")
+    if summary.get("report_path"):
+        print(f"Report:                  {summary['report_path']}")
+
+    print()
+    print("Top 20 by composite score:")
+    print(f"  {'symbol':<8s}  {'rsi2_rate':>10s}  {'pct_sma200':>11s}  {'atr_pct':>8s}  {'score':>7s}")
+    for r in summary["top_n"]:
+        rsi = f"{r['rsi2_rate']:.3f}" if r["rsi2_rate"] is not None else "n/a"
+        pct = f"{r['pct_above_sma200']:.3f}" if r["pct_above_sma200"] is not None else "n/a"
+        atr = f"{r['atr_pct']:.4f}" if r["atr_pct"] is not None else "n/a"
+        sc = f"{r['score']:.4f}" if r["score"] is not None else "n/a"
+        print(f"  {r['symbol']:<8s}  {rsi:>10s}  {pct:>11s}  {atr:>8s}  {sc:>7s}")
+    return 0
+
+
+def cmd_audit_universe(args) -> int:
+    from .universe.universe_builder import audit_existing_universe, BuilderConfig
+
+    cfg = BuilderConfig.for_audit(
+        audit_mode=True,
+        audit_universe=args.universe,
+        source=args.source,
+        min_adv20=args.min_adv20,
+        min_price=args.min_price,
+        min_pct_above_sma200=args.min_trend_pct,
+        max_gap_down_freq=args.max_gap_freq,
+        min_rsi2_recovery_rate=args.min_rsi2_rate,
+        lookback_days=args.lookback_days,
+        exclude_symbols=args.exclude_symbols.split(",") if args.exclude_symbols else [],
+        save_report=args.report,
+        use_backtest_db=args.use_backtest_db,
+        remove_from_universe=args.remove_from_universe,
+        dry_run=args.dry_run,
+    )
+    summary = audit_existing_universe(cfg)
+
+    disabled_pct_sma200 = cfg.min_pct_above_sma200 <= 0.0
+    disabled_gap = cfg.max_gap_down_freq >= 1.0
+    disabled_rsi = cfg.min_rsi2_recovery_rate <= 0.0
+
+    mode_label = "DRY RUN" if summary["dry_run"] else "LIVE"
+    print()
+    print(f"=== Universe Audit: {summary['audit_universe']} (asof {summary['asof']}) ===")
+    print(f"Mode:                       {mode_label}")
+    print()
+    print("Filters active:")
+    print(f"  price >= ${cfg.min_price:.2f}")
+    print(f"  adv20 >= ${cfg.min_adv20:,.0f}")
+    print("  history >= 252 bars")
+    if disabled_gap:
+        print("  gap_down_freq:        DISABLED")
+    else:
+        struct_note = " (structural only)" if cfg.max_gap_down_freq >= 0.05 else ""
+        print(f"  gap_down_freq <= {cfg.max_gap_down_freq:.2f}{struct_note}")
+    if disabled_rsi:
+        print("  rsi2_recovery:        DISABLED")
+    else:
+        print(f"  rsi2_recovery >= {cfg.min_rsi2_recovery_rate:.2f} (3yr behavioral)")
+    if disabled_pct_sma200:
+        print("  pct_above_sma200:     DISABLED (regime-sensitive — use daily scoring)")
+    else:
+        print(f"  pct_above_sma200 >= {cfg.min_pct_above_sma200:.2f}")
+    print()
+    print(f"Symbols evaluated:          {summary['total_evaluated']}")
+    print(f"  Already excluded:         {summary['already_excluded_count']}")
+    print(f"  Previously reinstated:    {summary['previously_reinstated_count']}")
+    for sym, note in summary["reinstated_warnings"]:
+        print(f"    ↑ {sym} — would fail {note} (WARNING)")
+    print()
+    print(f"Layer 1 failures (data_anomaly): {summary['layer_1_failures']['count']}")
+    for sym, note in summary["layer_1_failures"]["symbols"]:
+        print(f"  {sym:<8s} {note}")
+    print()
+
+    all_l2a_disabled = disabled_pct_sma200 and disabled_gap and disabled_rsi
+    if all_l2a_disabled:
+        print(
+            "Layer 2a: all filters disabled — no chronic_loser exclusions "
+            "from behavioral checks this run."
+        )
+    else:
+        print(f"Layer 2a failures (chronic_loser): {summary['layer_2a_failures']['count']}")
+        if disabled_pct_sma200:
+            print(
+                "  [only showing gap_down_freq and rsi2_recovery failures; "
+                "pct_above_sma200 disabled]"
+            )
+        for sym, note in summary["layer_2a_failures"]["symbols"]:
+            print(f"  {sym:<8s} {note}")
+    print()
+    print(f"Passing:                    {summary['passing_count']}")
+    if summary["rsi2_no_events_kept_count"]:
+        print(f"  rsi2_no_events kept:      {summary['rsi2_no_events_kept_count']}")
+    print()
+
+    n_excl = (
+        summary["layer_1_failures"]["count"]
+        + summary["layer_2a_failures"]["count"]
+    )
+    if summary["dry_run"]:
+        print("Mode: DRY RUN — no changes written")
+    elif args.remove_from_universe:
+        print(f"Wrote {n_excl} exclusions to symbol_exclusions")
+        print(
+            f"Removed {summary['removed_from_universe']} symbols from "
+            f"universe_membership[{summary['audit_universe']}]"
+        )
+    else:
+        print(f"Wrote {n_excl} exclusions to symbol_exclusions")
+        print("(universe_membership unchanged — live system will skip them via exclusions)")
+
+    if summary.get("report_path"):
+        print(f"\nReport: {summary['report_path']}")
+    return 0
+
+
+def cmd_trim_universe(args) -> int:
+    from .universe.trim_universe import trim_universe, TrimConfig
+
+    cfg = TrimConfig(
+        backtest_run_id=args.backtest_run_id,
+        from_universe=args.from_universe,
+        min_entries_for_exclusion=args.min_entries_for_exclusion,
+        max_wr_chronic=args.max_wr_chronic,
+        min_net_pnl_consistent=args.min_net_pnl_consistent,
+        min_entries_consistent=args.min_entries_consistent,
+        min_years_traded_for_chronic=args.min_years_traded,
+        max_concentration_pct=args.max_concentration_pct,
+        exclude_no_trades=args.exclude_no_trades,
+        remove_from_universe=args.remove_from_universe,
+        dry_run=args.dry_run,
+        save_report=args.report,
+    )
+
+    r = trim_universe(cfg)
+    mode_label = "DRY RUN" if r["dry_run"] else "LIVE"
+
+    print(f"\n=== Trim Universe Audit: {r['from_universe']} ===")
+    print(
+        f"Backtest run:           #{r['backtest_run_id']} "
+        f"({r['run_period']}, universe={r['run_universe']})"
+    )
+    print(f"Mode:                   {mode_label}")
+    print()
+    print(f"Symbols evaluated:      {r['total_in']}")
+    print(f"  Already excluded:     {r['already_excluded_count']}   (skipped)")
+    print(f"  Previously reinstated: {r['previously_reinstated_count']}    (skipped)")
+    for sym, note in r["reinstated_warnings"]:
+        print(f"    ↑ {sym} — would now classify {note} (WARNING)")
+    print()
+    print(f"Excluded:")
+    print(f"  chronic_loser:        {r['chronic_losers']}")
+    for d in r["exclusions"]:
+        if d["reason"] == "chronic_loser":
+            print(f"    {d['symbol']:<8s} {d['reason_note']}")
+    print(f"  consistent_loser:     {r['consistent_losers']}")
+    for d in r["exclusions"]:
+        if d["reason"] == "consistent_loser":
+            print(f"    {d['symbol']:<8s} {d['reason_note']}")
+    if r["no_trades_excluded"]:
+        print(f"  no_trades:            {r['no_trades_excluded']}")
+        for d in r["exclusions"]:
+            if d["reason"] == "no_trades":
+                print(f"    {d['symbol']:<8s} {d['reason_note']}")
+    print()
+    print(
+        f"Single-year blowouts (kept, flagged for review):  "
+        f"{len(r['single_year_blowouts'])}"
+    )
+    for b in r["single_year_blowouts"]:
+        trades = b["year_trades"]
+        plural = "trade" if trades == 1 else "trades"
+        print(
+            f"  {b['symbol']:<8s} concentration={b['concentration_pct']:.0f}% "
+            f"({trades} {plural} in {b['year']} = ${b['year_pnl']:+.2f})"
+        )
+    print()
+    print(f"No-trades kept:         {r['no_trades_kept']}")
+    print(f"Passing:                {r['passing']}")
+    print()
+
+    if r["dry_run"]:
+        print("Mode: DRY RUN — no changes written")
+    else:
+        print(f"Wrote {r['excluded']} exclusions to symbol_exclusions")
+        if cfg.remove_from_universe:
+            print(
+                f"Removed {r['removed_from_universe']} symbols from "
+                f"universe_membership[{r['from_universe']}]"
+            )
+        else:
+            print(
+                "(universe_membership unchanged — live system will skip them "
+                "via exclusions)"
+            )
+
+    if r.get("report_path"):
+        print(f"\nReport: {r['report_path']}")
+    return 0
+
+
 def cmd_show_universe(universe: str, asof: str | None, limit: int) -> int:
     from .db import connect
 
@@ -1578,6 +1928,7 @@ def cmd_backtest_fetch_bars(
     db: str | None = None,
     batch: int = 50,
     sleep_ms: int = 100,
+    source_alpaca: bool = False,
 ) -> int:
     """
     Fetch split-adjusted daily bars from yfinance into the backtest DB.
@@ -1598,7 +1949,23 @@ def cmd_backtest_fetch_bars(
     from .backtest.yf_loader import fetch_bars_yfinance, symbols_from_universe, bar_coverage_summary
  
     # Resolve symbol list
-    if symbols:
+    if source_alpaca:
+        from .db import connect as live_connect
+        with live_connect() as conn:
+            rows = conn.execute(
+                """SELECT symbol FROM assets_cache
+                   WHERE tradable=1 AND fractionable=1
+                   AND exchange IN ('NYSE','NASDAQ','ARCA','BATS')
+                   AND length(symbol) BETWEEN 1 AND 5
+                   AND symbol NOT GLOB '*[0-9]*'
+                   AND symbol NOT LIKE '%.%'
+                   ORDER BY symbol"""
+            ).fetchall()
+        sym_list = [r["symbol"] for r in rows]
+        if "SPY" not in sym_list:
+            sym_list.append("SPY")
+        log.info("Sourced %d symbols from assets_cache", len(sym_list))
+    elif symbols:
         sym_list = [s.strip().upper() for s in symbols]
         # Always include SPY for the market gate
         if "SPY" not in sym_list:
@@ -1667,7 +2034,7 @@ def main() -> int:
     p_fb = sub.add_parser("fetch-bars", help="Fetch and store daily OHLCV bars for active symbols")
     p_fb.add_argument("--days", type=int, default=365, help="Lookback days (default 365)")
     p_fb.add_argument("--universe", type=str, default="sp500", help="Lookback universe (default sp500)")
-    p_fb.add_argument("--limit", type=int, default=500, help="Lookback limit (default 500)")
+    p_fb.add_argument("--limit", type=int, default=0, help="Lookback limit (default 500)")
     p_fb.add_argument("--sleep_ms", type=int, default=50, help="Lookback time (default 50ms)")
 
     # build-universe
@@ -1676,6 +2043,224 @@ def main() -> int:
     p_bu.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD), must exist in bars_daily")
     p_bu.add_argument("--top", type=int, default=200, help="Keep top N by score among included")
     p_bu.add_argument("--min-adv20", type=float, default=20_000_000.0, help="Minimum 20-day average dollar volume")
+
+    # update-universe-sp500 (safe quarterly refresh of S&P 500 membership)
+    p_usp = sub.add_parser(
+        "update-universe-sp500",
+        help=(
+            "Safe quarterly S&P 500 update: inserts new members as source='sp500_new', "
+            "marks departed members as source='sp500_rem'. Never deletes rows."
+        ),
+    )
+    p_usp.add_argument(
+        "--universe", default="sp500",
+        help="Universe name to update (default: sp500)",
+    )
+    p_usp.add_argument(
+        "--source", default="github", choices=["github", "file"],
+        help="Where to fetch current S&P 500: github (default) or local file",
+    )
+    p_usp.add_argument(
+        "--file", default="",
+        help="Path to local CSV file when --source=file",
+    )
+    p_usp.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Show what would change without making any changes",
+    )
+
+    # exclude-symbol — add to do-not-trade list (symbol_exclusions table)
+    p_excl = sub.add_parser(
+        "exclude-symbol",
+        help="Add a symbol to the do-not-trade exclusions list",
+    )
+    p_excl.add_argument("symbol", help="Ticker symbol to exclude (e.g. CRWD)")
+    p_excl.add_argument(
+        "--reason", default="manual",
+        choices=["chronic_loser", "sp500_removal", "data_anomaly",
+                 "manual", "gap_risk", "earnings_risk"],
+        help="Reason code (default: manual)",
+    )
+    p_excl.add_argument("--note", default="", help="Human-readable explanation")
+    p_excl.add_argument(
+        "--review-after", default=None, metavar="YYYY-MM-DD",
+        help="Optional date to re-evaluate this exclusion",
+    )
+
+    # reinstate-symbol — mark a previously excluded symbol as active again
+    p_rein = sub.add_parser(
+        "reinstate-symbol",
+        help="Reinstate a previously excluded symbol",
+    )
+    p_rein.add_argument("symbol", help="Ticker symbol to reinstate")
+    p_rein.add_argument("--note", default="", help="Reason for reinstatement")
+
+    # show-exclusions — list currently excluded symbols
+    p_sex = sub.add_parser(
+        "show-exclusions",
+        help="List currently excluded symbols",
+    )
+    p_sex.add_argument(
+        "--reason", default=None,
+        choices=["chronic_loser", "sp500_removal", "data_anomaly",
+                 "manual", "gap_risk", "earnings_risk"],
+        help="Filter by reason code",
+    )
+    p_sex.add_argument(
+        "--all", action="store_true", default=False,
+        help="Include reinstated (previously excluded) symbols",
+    )
+    p_sex.add_argument(
+        "--review-due", action="store_true", default=False,
+        help="Only show symbols whose review_after date has passed",
+    )
+
+    # migrate-exclusions — one-time import from TRADING_EXCLUDE_SYMBOLS env var
+    p_mex = sub.add_parser(
+        "migrate-exclusions",
+        help="One-time migration: import TRADING_EXCLUDE_SYMBOLS env var into symbol_exclusions table",
+    )
+    p_mex.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Show what would be migrated without writing",
+    )
+
+    # build-custom-universe (Phase 1: structural-fit screen for MRIT/SMA)
+    p_bcu = sub.add_parser(
+        "build-custom-universe",
+        help="Screen US stocks for MRIT/SMA structural fit and write a curated universe",
+    )
+    p_bcu.add_argument("--universe-name", default="custom", help="Universe name to write (default: custom)")
+    p_bcu.add_argument("--source", default="existing", choices=["existing", "alpaca"],
+                       help="Candidate pool: existing universe_membership rows, or assets_cache (alpaca)")
+    p_bcu.add_argument("--top", type=int, default=300, help="Keep top N by composite score (default: 300)")
+    p_bcu.add_argument("--min-adv20", type=float, default=1_000_000.0, help="Min 20-day avg dollar volume")
+    p_bcu.add_argument("--min-price", type=float, default=10.0, help="Min current close price")
+    p_bcu.add_argument("--min-trend-pct", type=float, default=0.55,
+                       help="Min fraction of last 252 days where close > SMA200")
+    p_bcu.add_argument("--max-gap-freq", type=float, default=0.03,
+                       help="Max fraction of last 252 days with open-gap-down > 5%%")
+    p_bcu.add_argument("--min-rsi2-rate", type=float, default=0.55,
+                       help="Min RSI2 recovery rate (oversold->50 within 15 days)")
+    p_bcu.add_argument("--lookback-days", type=int, default=756,
+                       help="Trading-day lookback for RSI2 recovery sampling (default: 756)")
+    p_bcu.add_argument("--exclude-symbols", default="",
+                       help="Comma-separated list of symbols to exclude (also reads TRADING_EXCLUDE_SYMBOLS)")
+    p_bcu.add_argument("--report", action="store_true",
+                       help="Save full per-symbol CSV report to reports/universe_build_<date>.csv")
+    p_bcu.add_argument("--use-backtest-db", action="store_true", default=False,
+                       help="Read bars from backtest.sqlite instead of trading.sqlite")
+
+    # audit-universe — run builder screen against an existing universe and write failures to exclusions
+    p_au = sub.add_parser(
+        "audit-universe",
+        help=(
+            "Run the structural-fit screen against an EXISTING universe. "
+            "Failures are written to symbol_exclusions. universe_membership "
+            "stays intact unless --remove-from-universe is set."
+        ),
+    )
+    p_au.add_argument("--universe", required=True,
+                      help="Universe in universe_membership to audit (e.g. sp500)")
+    p_au.add_argument("--source", default="existing", choices=["existing", "alpaca"],
+                      help="Reserved for symmetry with build-custom-universe; ignored in audit mode")
+    p_au.add_argument("--min-adv20", type=float, default=1_000_000.0,
+                      help=(
+                          "Min 20-day avg dollar volume. Default $1,000,000 for audit "
+                          "(appropriate floor for $100-1000 position sizes). Build mode "
+                          "default is $1,000,000 (same)."
+                      ))
+    p_au.add_argument("--min-price", type=float, default=10.0,
+                      help="Min current close price")
+    p_au.add_argument("--min-trend-pct", type=float, default=0.0,
+                      help=(
+                          "Min fraction of last 252 days where close > SMA200. Default "
+                          "0.0 for audit (DISABLED — regime-sensitive metric unsuitable "
+                          "for permanent exclusion; use build-custom-universe for "
+                          "forward-looking screening). Set to 0.55 to match build mode."
+                      ))
+    p_au.add_argument("--max-gap-freq", type=float, default=0.05,
+                      help=(
+                          "Max fraction of last 252 days with open-gap-down > 5%%. "
+                          "Default 0.05 for audit (structural gap problems only). "
+                          "Build mode default is 0.03."
+                      ))
+    p_au.add_argument("--min-rsi2-rate", type=float, default=0.55,
+                      help="Min RSI2 recovery rate (oversold->50 within 15 days) — 3yr behavioral metric")
+    p_au.add_argument("--lookback-days", type=int, default=756,
+                      help="Trading-day lookback for RSI2 recovery sampling (default: 756)")
+    p_au.add_argument("--exclude-symbols", default="",
+                      help="Comma-separated list of symbols to skip in audit")
+    p_au.add_argument("--remove-from-universe", action="store_true", default=False,
+                      help="Also DELETE failing symbols from universe_membership (default: keep rows, rely on exclusions)")
+    p_au.add_argument("--dry-run", action="store_true", default=False,
+                      help="Print decisions but do not write to symbol_exclusions or universe_membership")
+    p_au.add_argument("--report", action="store_true", default=False,
+                      help="Save per-symbol decision CSV to reports/universe_audit_<universe>_<date>.csv")
+    p_au.add_argument("--use-backtest-db", action="store_true", default=False,
+                      help="Read bars from backtest.sqlite instead of trading.sqlite")
+
+    # trim-universe — Layer 2b: write backtest chronic losers to symbol_exclusions
+    p_tu = sub.add_parser(
+        "trim-universe",
+        help=(
+            "Layer 2b: classify chronic losers from a backtest run and write "
+            "them to symbol_exclusions (with temporal safeguards against "
+            "single-year P&L blowouts). universe_membership is preserved "
+            "unless --remove-from-universe is set."
+        ),
+    )
+    p_tu.add_argument(
+        "--backtest-run-id", type=int, required=True,
+        help="run_id from backtest_runs to analyse",
+    )
+    p_tu.add_argument(
+        "--from-universe", default="sp500",
+        help="Universe to evaluate (default: sp500)",
+    )
+    p_tu.add_argument(
+        "--min-entries-for-exclusion", type=int, default=8,
+        help="Min entries before a symbol is eligible for chronic exclusion (default: 8)",
+    )
+    p_tu.add_argument(
+        "--max-wr-chronic", type=float, default=35.0,
+        help="WR%% below which a symbol is a chronic loser (default: 35)",
+    )
+    p_tu.add_argument(
+        "--min-net-pnl-consistent", type=float, default=-20.0,
+        help="Net P&L floor for consistent-loser exclusion (default: -20)",
+    )
+    p_tu.add_argument(
+        "--min-entries-consistent", type=int, default=8,
+        help="Min entries for consistent-loser check (default: 8)",
+    )
+    p_tu.add_argument(
+        "--min-years-traded", type=int, default=3,
+        help="Min distinct trading years before exclusion applies (default: 3)",
+    )
+    p_tu.add_argument(
+        "--max-concentration-pct", type=float, default=70.0,
+        help=(
+            "If one year's loss is >= this %% of total loss, label "
+            "single_year_blowout and KEEP (default: 70)"
+        ),
+    )
+    p_tu.add_argument(
+        "--exclude-no-trades", action="store_true", default=False,
+        help="Also exclude symbols that generated zero trades in the backtest",
+    )
+    p_tu.add_argument(
+        "--remove-from-universe", action="store_true", default=False,
+        help="Also DELETE excluded symbols from universe_membership[from_universe]",
+    )
+    p_tu.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Print decisions but do not write to symbol_exclusions or universe_membership",
+    )
+    p_tu.add_argument(
+        "--report", action="store_true", default=False,
+        help="Save per-symbol decision CSV to reports/trim_<universe>_<date>.csv",
+    )
 
     # show-universe
     p_su = sub.add_parser("show-universe", help="Show universe snapshot rows")
@@ -1918,6 +2503,9 @@ def main() -> int:
                         help="Symbols per yfinance batch download (default: 50)")
     p_btfb.add_argument("--sleep-ms", type=int, default=100,
                         help="Sleep between batches in ms (default: 100)")
+    p_btfb.add_argument("--source-alpaca", action="store_true", default=False,
+                        help="Fetch bars for all Alpaca tradeable NYSE/NASDAQ symbols "
+                             "instead of a universe or explicit symbol list")
 
     args = p.parse_args()
 
@@ -2020,6 +2608,7 @@ def main() -> int:
             db=args.db,
             batch=args.batch,
             sleep_ms=args.sleep_ms,
+            source_alpaca=args.source_alpaca,
         )
 
     if args.cmd == "sync-orders":
@@ -2039,6 +2628,30 @@ def main() -> int:
 
     if args.cmd == "build-universe":
         return cmd_build_universe(args.universe, args.asof, args.top, args.min_adv20)
+
+    if args.cmd == "update-universe-sp500":
+        return cmd_update_universe_sp500(args)
+
+    if args.cmd == "exclude-symbol":
+        return cmd_exclude_symbol(args)
+
+    if args.cmd == "reinstate-symbol":
+        return cmd_reinstate_symbol(args)
+
+    if args.cmd == "show-exclusions":
+        return cmd_show_exclusions(args)
+
+    if args.cmd == "migrate-exclusions":
+        return cmd_migrate_exclusions(args)
+
+    if args.cmd == "build-custom-universe":
+        return cmd_build_custom_universe(args)
+
+    if args.cmd == "audit-universe":
+        return cmd_audit_universe(args)
+
+    if args.cmd == "trim-universe":
+        return cmd_trim_universe(args)
 
     if args.cmd == "show-universe":
         return cmd_show_universe(args.universe, args.asof, args.limit)
