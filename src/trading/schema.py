@@ -5,6 +5,8 @@ def apply_schema(conn: sqlite3.Connection) -> None:
     sql = resources.files("trading").joinpath("schema.sql").read_text(encoding="utf-8")
     conn.executescript(sql)
     _migrate_runs_regime_cols(conn)
+    _migrate_symbol_exclusions(conn)
+    _migrate_universe_membership_source(conn)
 
 
 def _migrate_runs_regime_cols(conn: sqlite3.Connection) -> None:
@@ -18,3 +20,29 @@ def _migrate_runs_regime_cols(conn: sqlite3.Connection) -> None:
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ};")
+
+
+def _migrate_symbol_exclusions(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS symbol_exclusions (
+          symbol           TEXT PRIMARY KEY,
+          reason_code      TEXT NOT NULL,
+          reason_note      TEXT,
+          excluded_by      TEXT NOT NULL DEFAULT 'operator',
+          excluded_at      TEXT NOT NULL DEFAULT (datetime('now')),
+          review_after     TEXT,
+          reinstated_at    TEXT,
+          reinstated_note  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_symbol_exclusions_active
+        ON symbol_exclusions(symbol)
+        WHERE reinstated_at IS NULL;
+    """)
+
+
+def _migrate_universe_membership_source(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(universe_membership);").fetchall()}
+    if "source" not in existing:
+        conn.execute(
+            "ALTER TABLE universe_membership ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';"
+        )

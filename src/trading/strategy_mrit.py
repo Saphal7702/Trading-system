@@ -153,6 +153,14 @@ def generate_signals_mrit(
         ).fetchall()
 
         syms = [r["symbol"] for r in rows]
+
+        from .exclusions import get_active_exclusions
+        excluded = get_active_exclusions()
+        if excluded:
+            before = len(syms)
+            syms = [s for s in syms if s not in excluded]
+            log.info("MRIT exclusions filter: %d -> %d symbols", before, len(syms))
+
         signals: list[Signal] = []
 
         # If gated off, don't waste time computing indicators for every symbol

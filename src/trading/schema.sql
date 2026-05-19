@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS universe_membership (
   universe TEXT NOT NULL,          -- 'sp500'
   symbol   TEXT NOT NULL,
   added_at TEXT NOT NULL DEFAULT (datetime('now')),
+  source   TEXT NOT NULL DEFAULT 'manual',
+  -- 'manual' | 'sp500_new' (added by update-universe-sp500)
+  -- | 'sp500_rem' (no longer in S&P 500 per last update-universe-sp500)
   PRIMARY KEY (universe, symbol)
 );
 
@@ -293,6 +296,24 @@ CREATE TABLE IF NOT EXISTS risk_daily (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (env, date)
 );
+
+CREATE TABLE IF NOT EXISTS symbol_exclusions (
+  symbol           TEXT PRIMARY KEY,
+  reason_code      TEXT NOT NULL,
+  -- valid values: 'chronic_loser' | 'sp500_removal' | 'data_anomaly'
+  --               | 'manual' | 'gap_risk' | 'earnings_risk'
+  reason_note      TEXT,
+  excluded_by      TEXT NOT NULL DEFAULT 'operator',
+  -- 'system' (automated) | 'operator' (manual)
+  excluded_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  review_after     TEXT,        -- YYYY-MM-DD: re-evaluate after this date (nullable)
+  reinstated_at    TEXT,        -- set when reinstated, NULL = currently excluded
+  reinstated_note  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_symbol_exclusions_active
+ON symbol_exclusions(symbol)
+WHERE reinstated_at IS NULL;
 
 -- Default seeds (safe if already present)
 INSERT OR IGNORE INTO portfolio_state(env, state, reason, set_by, set_at, expires_at, allow_sells, allow_buys, allow_broker, updated_at)

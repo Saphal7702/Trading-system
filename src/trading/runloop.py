@@ -159,46 +159,30 @@ def run_once(
         with connect() as conn:
             asof = resolve_asof_date(conn, None)
 
-            max_stale = int(os.getenv("TRADING_MAX_BAR_STALENESS_DAYS", "2"))
-            require_latest = os.getenv("TRADING_REQUIRE_TODAY_OR_LAST_TRADING_DAY", "false").lower() in ("1", "true", "yes")
+        asof_date = date.fromisoformat(asof)
 
-            asof_date = date.fromisoformat(asof)
-            today_ny = datetime.now(tz=NY).date()
+        from .market_calendar import last_completed_trading_day
+        last_trade_day = last_completed_trading_day(broker)
+        if asof_date < last_trade_day:
+            log.warning(
+                "Bars data stale: asof=%s last_trade_day=%s",
+                asof, last_trade_day,
+            )
+            finish_run(run_id, status="skipped")
+            return RunResult(
+                run_id=run_id,
+                status="skipped",
+                asof=asof,
+                reason="stale_bars",
+            )
 
-            staleness = (today_ny - asof_date).days
+        # weekend gating MVP (holidays later via Alpaca calendar)
+        if _is_weekend(asof):
+            finish_run(run_id, status="skipped", asof=asof, summary=summary, reason="weekend")
+            log.info("Run skipped (weekend). run_id=%s asof=%s", run_id, asof)
+            return RunResult(run_id=run_id, status="skipped", asof=asof, summary=summary, reason="weekend")
 
-            if staleness > max_stale:
-                log.warning(
-                    "Bars data stale: asof=%s today=%s staleness_days=%s max_allowed=%s",
-                    asof, today_ny, staleness, max_stale
-                )
-                finish_run(run_id, status="skipped")
-                return RunResult(
-                    run_id=run_id,
-                    status="skipped",
-                    asof=asof,
-                    reason="stale_bars",
-                )
-
-            if require_latest:
-                from .market_calendar import last_completed_trading_day
-                last_trade_day = last_completed_trading_day(broker)
-                if asof_date < last_trade_day:
-                    log.warning(
-                        "Latest bars not available: asof=%s last_trade_day=%s",
-                        asof, last_trade_day
-                    )
-                    finish_run(run_id, status="skipped")
-                    return RunResult(
-                        run_id=run_id, status="skipped", asof=asof, reason="bars_not_latest"
-                    )
-
-            # weekend gating MVP (holidays later via Alpaca calendar)
-            if _is_weekend(asof):
-                finish_run(run_id, status="skipped", asof=asof, summary=summary, reason="weekend")
-                log.info("Run skipped (weekend). run_id=%s asof=%s", run_id, asof)
-                return RunResult(run_id=run_id, status="skipped", asof=asof, summary=summary, reason="weekend")
-
+        with connect() as conn:
             # Try to store asof_date if column exists
             try:
                 conn.execute("UPDATE runs SET asof_date=? WHERE id=?;", (asof, run_id))

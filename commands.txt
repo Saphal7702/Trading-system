@@ -12,11 +12,74 @@ pip install -e .
 
 #Git Branches
 main      → production (live)
-dev       → integration / paper
+paper     → paper (development)
 
 #Activate venv
 source .venv/bin/activate (Linux/Mac)
 .\.venv\Scripts\Activate.ps1 (Windows)
+
+/**********
+    UNIVERSE: sp500 is not just sp500 symbols. It is a list of sp500 plus custom/manually tested and added symbols. sp500 is just the name of the list for convenience.
+***********/
+
+/***********
+    FILTERS:
+    Layer1: Eligibility — pure structural filters - (universe_builder filter)
+      - US-domiciled common stock or REIT
+      - Primary listing on NYSE/Nasdaq (not NasdaqCM penny tier, not OTC)
+      - Market cap ≥ $X billion (S&P uses $8B; you might use $2-5B)
+      - ADV20 ≥ $25M (real liquidity for slippage assumptions)
+      - Price ≥ $10 (avoids penny-stock mechanics: tick noise, exchange rules, halt risk)
+      - Public history ≥ N years (e.g., 3 years post-IPO so backtest periods are valid)
+      - Not currently halted, delisted, in bankruptcy
+
+    New Universe      : trading build-custom-universe --universe-name coreAlpha --source alpaca --use-backtest-db --top 0 --report
+    Existing Universe : trading audit-universe --universe sp500 --dry-run
+                        trading audit-universe --universe sp500
+                        trading audit-universe --universe sp500 --remove-from-universe --report
+
+    Layer 2: Fitness — statistical, evidence-based - (Back test filter)
+      - Trend (have meaningful uptrends to ride)
+      - Mean-revert within the trend (RSI2 oversold then bounces, instead of crashing through)
+      - Don't gap violently on news (so your stops are honored)
+      - Have reasonable volatility (enough movement to generate trades, not so much that ATR exits whip)
+    
+    New Universe      :  trading trim-universe --backtest-run-id 1 --from-universe coreAlpha --to-universe coreAlpha_r1 --min-entries 3 --max-wr-chronic 35 --min-net-pnl -10 --min-entries-consistent 5 --report 
+    Existing Universe :  trading trim-universe --backtest-run-id <N> --dry-run
+                         trading trim-universe --backtest-run-id <N>
+                         trading trim-universe --backtest-run-id <N> --remove-from-universe --report
+************/
+
+/*************************************************************** Build Custom Universe from Scratch *******************************************************************************************/
+#Use all the tradable symbols from alpaca (assets_cache table) and fetch the daily bars to backtest database
+trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31 --source-alpaca (All tradeable Symbols) 
+
+#Use backtest daily bars to build custom universe in the actual trading database (universe_membership)
+trading build-custom-universe --universe-name coreAlpha --source alpaca --use-backtest-db --top 0 --report
+trading build-custom-universe --universe-name coreAlpha --source alpaca --use-backtest-db --min-adv20 25000000 --min-trend-pct 0.70 --min-rsi2-rate 0.65 --top 0 --report
+
+#Trim but loser (Instead of selection top 500 performers we cut lose chronic loosers) - Iterative Elemination Process by Losers
+#Iteration
+trading backtest --simulate-live --universe coreAlpha --start 2015-01-01 --end 2025-12-31 --initial-capital 1000 --max-positions 10 --per-position 100 --compound
+trading trim-universe --backtest-run-id 1 --from-universe coreAlpha --to-universe coreAlpha_r1 --min-entries 3 --max-wr-chronic 35 --min-net-pnl -10 --min-entries-consistent 5 --report 
+
+
+/*************************************************************** Build Custom Universe from SP500 Base (Currently active idea) *******************************************************************/
+#Use SP500 as base of the universe (list is updated quaterly: every March, June, September, December third Friday)
+trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31 --universe sp500 (sp500 Symbols) 
+
+trading update-universe-sp500 --dry-run
+trading update-universe-sp500
+
+#Filter 1
+trading audit-universe --universe sp500 --dry-run
+trading audit-universe --universe sp500 --remove-from-universe --report
+
+trading backtest --simulate-live --universe sp500 --start 2015-01-01 --end 2025-12-31 --initial-capital 1000 --max-positions 10 --per-position 100 --compound
+
+#Remove symbol from trading list i.e. add to the exclusion table
+trading exclude-symbol PSKY --reason data_anomaly --note "Stale GitHub CSV data — not an actual S&P 500 member."
+/***********************************************************************************************************************************************************************************/
 
 /*Load Universe Current SP:500*/
 trading load-universe --file data/sp500.csv
@@ -112,9 +175,13 @@ python -m pytest tests/test_circuit_breaker.py
 /**Back Testing**/
 
 Step 1 — Fetch historical bars (only needed once per date range):                                                                                                                                                                                       
-  trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31                                                                                                                                                                               
+  trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31 (Only SP500)  
+  trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31 --source-alpaca (All tradeable Symbols)                                                                                                                                                                       
                                                                                                                                                                                                                                                         
-Step 2 — Run the backtest:                                                                                                                                                                                                                              
+Step 2 — Run the backtest:    
+  # Main command:
+  trading backtest --simulate-live --universe coreAlpha --start 2020-01-01 --end 2025-12-31 --initial-capital 1000 --max-positions 10 --per-position 100 --compound
+
   # Default: both strategies, regime gates which signals fire each day                                                                                                                                                                                    
   trading backtest --start 2020-01-01 --end 2024-12-31                                                                                                                                                                                          
                                                                                                                                                                                                                                                           
