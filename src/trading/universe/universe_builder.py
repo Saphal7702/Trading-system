@@ -172,12 +172,7 @@ def _candidate_symbols(conn, source: str) -> list[str]:
     return [r["symbol"] for r in rows]
 
 def _exclude_set(cli_excludes: list[str]) -> set[str]:
-    env_str = os.getenv("TRADING_EXCLUDE_SYMBOLS", "")
-    parts: list[str] = []
-    if env_str:
-        parts.extend(env_str.split(","))
-    parts.extend(cli_excludes)
-    return {p.strip().upper() for p in parts if p and p.strip()}
+    return {p.strip().upper() for p in cli_excludes if p and p.strip()}
 
 
 def _compute_metrics(conn, symbol: str, asof: str, lookback_days: int) -> SymbolMetrics:

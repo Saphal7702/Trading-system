@@ -1,4 +1,4 @@
-/*********************************** Project Commands ****************************************************/
+/********************************************************************************* Project Commands ************************************************************************************************************/
 #Pyproject Info
 Database: Sqlite
 Broker: Alpaca
@@ -6,7 +6,8 @@ Broker: Alpaca
 #Project setup
 sudo apt install python3-venv -y
 python3 -m venv .venv
-source .venv/bin/activate
+deactivate 2>/dev/null || true  -> Deactivate 
+source .venv/bin/activate       -> Activate
 pip install --upgrade pip
 pip install -e .
 
@@ -17,6 +18,8 @@ paper     → paper (development)
 #Activate venv
 source .venv/bin/activate (Linux/Mac)
 .\.venv\Scripts\Activate.ps1 (Windows)
+
+/********************************************************************************* UNIVERSE ********************************************************************************************************************/
 
 /**********
     UNIVERSE: sp500 is not just sp500 symbols. It is a list of sp500 plus custom/manually tested and added symbols. sp500 is just the name of the list for convenience.
@@ -50,7 +53,7 @@ source .venv/bin/activate (Linux/Mac)
                          trading trim-universe --backtest-run-id <N> --remove-from-universe --report
 ************/
 
-/*************************************************************** Build Custom Universe from Scratch *******************************************************************************************/
+/********************************************************************************* Build Custom Universe from Scratch ******************************************************************************************/
 #Use all the tradable symbols from alpaca (assets_cache table) and fetch the daily bars to backtest database
 trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31 --source-alpaca (All tradeable Symbols) 
 
@@ -63,8 +66,7 @@ trading build-custom-universe --universe-name coreAlpha --source alpaca --use-ba
 trading backtest --simulate-live --universe coreAlpha --start 2015-01-01 --end 2025-12-31 --initial-capital 1000 --max-positions 10 --per-position 100 --compound
 trading trim-universe --backtest-run-id 1 --from-universe coreAlpha --to-universe coreAlpha_r1 --min-entries 3 --max-wr-chronic 35 --min-net-pnl -10 --min-entries-consistent 5 --report 
 
-
-/*************************************************************** Build Custom Universe from SP500 Base (Currently active idea) *******************************************************************/
+/********************************************************************************* Build Custom Universe from SP500 Base (Currently active idea) ***************************************************************/
 #Use SP500 as base of the universe (list is updated quaterly: every March, June, September, December third Friday)
 trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31 --universe sp500 (sp500 Symbols) 
 
@@ -79,16 +81,9 @@ trading backtest --simulate-live --universe sp500 --start 2015-01-01 --end 2025-
 
 #Remove symbol from trading list i.e. add to the exclusion table
 trading exclude-symbol PSKY --reason data_anomaly --note "Stale GitHub CSV data — not an actual S&P 500 member."
-/***********************************************************************************************************************************************************************************/
+/***************************************************************************************************************************************************************************************************************/
 
-/*Load Universe Current SP:500*/
-trading load-universe --file data/sp500.csv
-
-/*Pre executions*/
-trading fetch-bars --days 400
-trading preflight
-
-/*Risk Management*/
+/********************************************************************************* Risk Management *************************************************************************************************************/
 trading risk status
 trading risk set --state SELL_ONLY --reason "manual kill switch" --expires-minutes 240
 trading risk set --state NORMAL --reason "paper resume"
@@ -96,8 +91,16 @@ trading risk clear --reason "resume normal"
 trading risk reset-peak --reason "start new evaluation window"
 trading risk set --state HALT_ALL --reason "test halt"
 trading run-once
+/***************************************************************************************************************************************************************************************************************/
 
-/*Automated executions (Planning and Buying)*/
+/********************************************************************************* Manual executions (Planning and Buying) *************************************************************************************/
+/*Load Universe Current SP:500*/
+trading load-universe --file data/sp500.csv
+
+/*Pre executions*/
+trading fetch-bars --days 400
+trading preflight
+
 trading run-once
 trading show-intents --run-id X
 trading run-once --execute
@@ -112,14 +115,27 @@ trading exits --emit-intents
 trading execute --run-id X --submit
 trading run-once
 
-/*Policies*/
+/***Manual execution Run Example***/
+trading build-universe --top 200
+trading show-universe --limit 20
+trading plan
+trading show-intents --run-id X
+trading execute --run-id X --submit
+trading sync-assets
+trading sync-orders
+trading sync-positions
+trading exits
+trading exits --emit-intents
+trading execute --run-id X --submit
+trading run-once
+/***************************************************************************************************************************************************************************************************************/
+
+/***Policies***/
 trading policy-recommend
 trading policy-recommend --emit-json
 
-/*Performance, Analysis and Feedbacks*/
-trading exits
-trading exits --emit-intents --dry-run
-trading exits --trail-peak 8 --trail-dd 3
+/********************************************************************************* Performance, Analysis and Feedbacks *****************************************************************************************/
+trading analyze-slippage --broker alpaca --report --start 2026-01-01
 
 trading perf-by-signal --since 2026-02-01
 trading perf-by-signal-open
@@ -146,7 +162,6 @@ trading attrib-exit --mfe
 trading attrib-combo --mfe
 trading attrib-exit --key exit_take_profit_14pct --mfe --show 50
 
-
 trading realized
 trading realized --daily --last 20
 trading realized --monthly
@@ -156,23 +171,14 @@ trading realized --symbol ANET
 trading trades
 trading trades --open
 trading trades --closed --last 50
+/***************************************************************************************************************************************************************************************************************/
 
-/*Manual executions*/
-trading build-universe --top 200
-trading show-universe --limit 20
-trading plan
-trading show-intents --run-id X
-trading execute --run-id X --submit
-trading sync-assets
-trading sync-orders
-trading sync-positions
-
-/**Testing**/
+/********************************************************************************* Testing *********************************************************************************************************************/
 python -m pytest tests/ -v
 python -m pytest
 python -m pytest tests/test_circuit_breaker.py
 
-/**Back Testing**/
+/********************************************************************************* Back Testing ****************************************************************************************************************/
 
 Step 1 — Fetch historical bars (only needed once per date range):                                                                                                                                                                                       
   trading backtest-fetch-bars --start 2020-01-01 --end 2024-12-31 (Only SP500)  
@@ -211,10 +217,9 @@ All options:
                                                                                                                                                                                                                                                           
 Results are saved to backtest.sqlite and a performance report is printed to the terminal showing total return, Sharpe ratio, max drawdown, win rate, and the top trades by P&L.  
 
-/**************************************************************************************************************/
+/***************************************************************************************************************************************************************************************************************/
 
-
-/***********************************  Git Commands (This Project):  **********************************************************/
+/********************************************************************************* Git Commands (This Project):  ***********************************************************************************************/
 git branch                  -> Show Branches
 git checkout branchName     -> Switch to the Branch
 
@@ -226,7 +231,7 @@ git pull
 git merge --no-ff paper
 git push
 
-/***********************************  Git Other Commands:  **********************************************************/
+/********************************************************************************* Git Other Commands:  ********************************************************************************************************/
 #All Git Commands:
 git init	                -> Creates a new Git repository in the current directory.
 git status	                -> Shows the state of your working directory and staging area (which files are modified, staged, or untracked).
@@ -239,4 +244,4 @@ git pull origin main        -> Pull from Main
 git merge branchName        -> Merge the Branch
 git push origin main        -> Push to the Main
 git branch -d branchName    -> Delete the branch
-/**************************************************************************************************************/
+/***************************************************************************************************************************************************************************************************************/

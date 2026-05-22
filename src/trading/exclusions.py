@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
 
 from .db import connect
@@ -20,18 +19,12 @@ VALID_REASON_CODES = {
 def get_active_exclusions() -> set[str]:
     """
     Return set of currently excluded symbols (reinstated_at IS NULL).
-    Also includes symbols in TRADING_EXCLUDE_SYMBOLS env var for backward compat.
     """
     with connect() as conn:
         rows = conn.execute(
             "SELECT symbol FROM symbol_exclusions WHERE reinstated_at IS NULL"
         ).fetchall()
-    db_excluded = {r["symbol"] for r in rows}
-
-    env_str = os.getenv("TRADING_EXCLUDE_SYMBOLS", "").strip()
-    env_excluded = {s.strip().upper() for s in env_str.split(",") if s.strip()}
-
-    return db_excluded | env_excluded
+    return {r["symbol"] for r in rows}
 
 
 def add_exclusion(
@@ -147,36 +140,3 @@ def list_exclusions(
     return [dict(r) for r in rows]
 
 
-def migrate_from_env(dry_run: bool = False) -> dict:
-    """
-    One-time migration: read TRADING_EXCLUDE_SYMBOLS from env and
-    write each symbol to symbol_exclusions table.
-    Skips symbols already in the table.
-    """
-    env_str = os.getenv("TRADING_EXCLUDE_SYMBOLS", "").strip()
-    if not env_str:
-        return {"migrated": 0, "skipped": 0, "symbols": []}
-
-    symbols = [s.strip().upper() for s in env_str.split(",") if s.strip()]
-    migrated = []
-    skipped = []
-
-    for sym in symbols:
-        with connect() as conn:
-            exists = conn.execute(
-                "SELECT symbol FROM symbol_exclusions WHERE symbol=?", (sym,)
-            ).fetchone()
-        if exists:
-            skipped.append(sym)
-        elif not dry_run:
-            add_exclusion(
-                symbol=sym,
-                reason_code="chronic_loser",
-                reason_note="Migrated from TRADING_EXCLUDE_SYMBOLS env var",
-                excluded_by="system",
-            )
-            migrated.append(sym)
-        else:
-            migrated.append(sym)
-
-    return {"migrated": len(migrated), "skipped": len(skipped), "symbols": migrated}

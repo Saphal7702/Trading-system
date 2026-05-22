@@ -714,23 +714,6 @@ def cmd_show_exclusions(args) -> int:
     return 0
 
 
-def cmd_migrate_exclusions(args) -> int:
-    from .exclusions import migrate_from_env
-    result = migrate_from_env(dry_run=args.dry_run)
-    prefix = "[DRY RUN] " if args.dry_run else ""
-    print(f"\n=== {prefix}Exclusion Migration ===")
-    print(f"  Migrated: {result['migrated']}")
-    print(f"  Skipped (already in DB): {result['skipped']}")
-    if result['symbols']:
-        print(f"  Symbols: {', '.join(result['symbols'])}")
-    if args.dry_run:
-        print("\n  Run without --dry-run to apply.")
-    else:
-        print("\n  Done. You can now remove TRADING_EXCLUDE_SYMBOLS from .env")
-        print("  (keep it as empty or delete the line — the DB is now the source of truth)")
-    return 0
-
-
 def cmd_update_universe_sp500(args) -> int:
     from .universe.update_sp500 import update_sp500_universe
 
@@ -2115,16 +2098,6 @@ def main() -> int:
         help="Only show symbols whose review_after date has passed",
     )
 
-    # migrate-exclusions — one-time import from TRADING_EXCLUDE_SYMBOLS env var
-    p_mex = sub.add_parser(
-        "migrate-exclusions",
-        help="One-time migration: import TRADING_EXCLUDE_SYMBOLS env var into symbol_exclusions table",
-    )
-    p_mex.add_argument(
-        "--dry-run", action="store_true", default=False,
-        help="Show what would be migrated without writing",
-    )
-
     # build-custom-universe (Phase 1: structural-fit screen for MRIT/SMA)
     p_bcu = sub.add_parser(
         "build-custom-universe",
@@ -2145,7 +2118,7 @@ def main() -> int:
     p_bcu.add_argument("--lookback-days", type=int, default=756,
                        help="Trading-day lookback for RSI2 recovery sampling (default: 756)")
     p_bcu.add_argument("--exclude-symbols", default="",
-                       help="Comma-separated list of symbols to exclude (also reads TRADING_EXCLUDE_SYMBOLS)")
+                       help="Comma-separated list of symbols to exclude")
     p_bcu.add_argument("--report", action="store_true",
                        help="Save full per-symbol CSV report to reports/universe_build_<date>.csv")
     p_bcu.add_argument("--use-backtest-db", action="store_true", default=False,
@@ -2507,6 +2480,20 @@ def main() -> int:
                         help="Fetch bars for all Alpaca tradeable NYSE/NASDAQ symbols "
                              "instead of a universe or explicit symbol list")
 
+    p_as = sub.add_parser(
+        "analyze-slippage",
+        help="Quantify gap between signal-generation prices and actual broker fill prices",
+    )
+    p_as.add_argument("--start", default=None, help="Start date YYYY-MM-DD (default: earliest fill)")
+    p_as.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today)")
+    p_as.add_argument("--broker", default=None, help="Filter by broker name (e.g. alpaca-paper)")
+    p_as.add_argument("--report", action="store_true", help="Write per-execution CSV to reports/slippage_<date>.csv")
+    p_as.add_argument("--side", default=None, choices=["buy", "sell"], help="Filter to one direction")
+    p_as.add_argument("--bucket-by", default="all", choices=["all", "month"],
+                      help="Aggregate by month or single bucket (default: all)")
+    p_as.add_argument("--symbols", default=None,
+                      help="Comma-separated list of symbols to limit analysis to")
+
     args = p.parse_args()
 
     if args.cmd == "healthcheck":
@@ -2640,9 +2627,6 @@ def main() -> int:
 
     if args.cmd == "show-exclusions":
         return cmd_show_exclusions(args)
-
-    if args.cmd == "migrate-exclusions":
-        return cmd_migrate_exclusions(args)
 
     if args.cmd == "build-custom-universe":
         return cmd_build_custom_universe(args)
@@ -3043,12 +3027,27 @@ def main() -> int:
             return cmd_risk_set(args.state, args.reason, args.expires_minutes)
         if args.risk_cmd == "clear":
             from .risk.events import emit_event
-            s = get_settings() 
+            s = get_settings()
             env = getattr(s, 'env', 'paper')
             emit_event(env=env, event_type='OVERRIDE_CLEAR_NOTE', prev_state=None, new_state=None, metrics={}, reason=args.reason, actor='operator')
             return cmd_risk_clear()
         if args.risk_cmd == "reset-peak":
             return cmd_risk_reset_peak(args.reason)
         return 2
+
+    if args.cmd == "analyze-slippage":
+        from .analysis.slippage import analyze_slippage, SlippageConfig
+        syms = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else []
+        cfg = SlippageConfig(
+            start=args.start,
+            end=args.end,
+            broker=args.broker,
+            report=args.report,
+            side=args.side,
+            bucket_by=args.bucket_by,
+            symbols=syms,
+        )
+        analyze_slippage(cfg)
+        return 0
 
     return 1
