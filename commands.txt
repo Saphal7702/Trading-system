@@ -98,7 +98,7 @@ trading run-once
 trading load-universe --file data/sp500.csv
 
 /*Pre executions*/
-trading fetch-bars --days 400
+trading fetch-bars --days 400 --limit 0
 trading preflight
 
 trading run-once
@@ -174,6 +174,7 @@ trading trades --closed --last 50
 /***************************************************************************************************************************************************************************************************************/
 
 /********************************************************************************* Testing *********************************************************************************************************************/
+
 python -m pytest tests/ -v
 python -m pytest
 python -m pytest tests/test_circuit_breaker.py
@@ -219,7 +220,36 @@ Results are saved to backtest.sqlite and a performance report is printed to the 
 
 /***************************************************************************************************************************************************************************************************************/
 
+/********************************************************************************* Data Migration **************************************************************************************************************/
+SOURCE_DB="/home/saphal7702/Trading/Trading-paper/TradingData/trading.sqlite"
+TARGET_DB="/home/saphal7702/Trading/Trading-live/TradingData/trading.sqlite"
+
+# backup target first
+cp "$TARGET_DB" "${TARGET_DB}.bak_$(date +%Y%m%d_%H%M%S)"
+
+# export both tables from source
+sqlite3 "$SOURCE_DB" ".dump universe_membership symbol_exclusions" > /tmp/universe_tables.sql
+
+# drop both tables from target
+sqlite3 "$TARGET_DB" "
+DROP TABLE IF EXISTS universe_membership;
+DROP TABLE IF EXISTS symbol_exclusions;
+"
+
+# import both tables into target
+sqlite3 "$TARGET_DB" < /tmp/universe_tables.sql
+
+# verify
+sqlite3 "$TARGET_DB" "
+SELECT 'universe_membership' AS table_name, COUNT(*) FROM universe_membership
+UNION ALL
+SELECT 'symbol_exclusions' AS table_name, COUNT(*) FROM symbol_exclusions;
+"
+/********************************************************************************* Back Testing ****************************************************************************************************************/
+
 /********************************************************************************* Git Commands (This Project):  ***********************************************************************************************/
+git clone url               -> Clone github project
+
 git branch                  -> Show Branches
 git checkout branchName     -> Switch to the Branch
 
@@ -233,7 +263,7 @@ git push
 
 /********************************************************************************* Git Other Commands:  ********************************************************************************************************/
 #All Git Commands:
-git init	                -> Creates a new Git repository in the current directory.
+git init	                  -> Creates a new Git repository in the current directory.
 git status	                -> Shows the state of your working directory and staging area (which files are modified, staged, or untracked).
 git log	                    -> Shows the commit history
 git checkout -b branchName  -> Create a new Branch

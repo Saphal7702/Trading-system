@@ -150,10 +150,10 @@ def plan_intents(
       - max exposure per entry signal_key (non-negotiable)
 
     Defaults controlled by env:
-      TRADING_MAX_POSITIONS (default 5)
-      TRADING_PER_POSITION  (default 100)
-      TRADING_CASH_BUFFER   (default 25)
-      TRADING_ASSUMED_BP    (default 0)  # fallback if broker_accounts empty
+      TRADING_MAX_POSITIONS  (default 5)
+      TRADING_PER_POSITION   (default 100)  # flat $ per position; also fallback when compound sizing lacks equity data
+      TRADING_CASH_BUFFER    (default 25)
+      TRADING_POSITION_PCT   (default 0)    # fraction of live equity per position when TRADING_COMPOUND_SIZING=true (e.g. 0.10 = 10%)
 
       TRADING_MAX_EXPOSURE_PER_SIGNAL_KEY (default 300)
     """
@@ -166,9 +166,8 @@ def plan_intents(
     )
     compound_sizing = os.getenv("TRADING_COMPOUND_SIZING", "false").strip().lower() in ("1", "true", "yes", "on", "y")
     if compound_sizing:
-        assumed_bp_base = env_float("TRADING_ASSUMED_BP", 0.0)
-        if assumed_bp_base > 0:
-            position_pct = float(base_per_position) / assumed_bp_base
+        position_pct = env_float("TRADING_POSITION_PCT", 0.0)
+        if position_pct > 0:
             with connect() as _conn:
                 _row = _conn.execute(
                     "SELECT equity FROM broker_accounts ORDER BY last_synced_at DESC LIMIT 1"
@@ -243,8 +242,7 @@ def plan_intents(
     enforce_thr = _policy_enforce_threshold()
     policy_path = getattr(policy, "path", None) if policy else None
 
-    assumed_bp = env_float("TRADING_ASSUMED_BP", 0.0)
-    buying_power = _get_buying_power_fallback(default=assumed_bp)
+    buying_power = _get_buying_power_fallback(default=0.0)
 
     # Count currently held positions (>0 qty)
     held_symbols = [s for s, p in pos.items() if float(p.get("qty", 0.0) or 0.0) > 0.0]
