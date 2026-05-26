@@ -340,13 +340,22 @@ def run_once(
         from .regime import detect_regime
 
         def _plan():
-            #entry_mode = os.getenv("TRADING_ENTRY_MODE", "sma").strip().lower()
-            # options: sma | mrit | both
             regime = detect_regime(asof)
-            
+
+            mode = os.getenv("TRADING_STRATEGY_MODE", "swing").strip().lower()
+            if mode not in ("swing", "portfolio"):
+                log.warning("Unknown TRADING_STRATEGY_MODE=%s, defaulting to swing", mode)
+                mode = "swing"
+
             signals = []
-            signals += generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof, regime=regime)
-            signals += generate_signals_mrit(universe=universe, asof=asof, regime=regime)
+            if mode == "swing":
+                signals += generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof, regime=regime)
+                signals += generate_signals_mrit(universe=universe, asof=asof, regime=regime)
+            elif mode == "portfolio":
+                from .strategy_portfolio import generate_signals_portfolio
+                signals += generate_signals_portfolio(universe=universe, asof=asof, regime=regime)
+
+            log.info("STRATEGY MODE: %s | signals=%d", mode, len(signals))
             # de-dup symbols so that it don't double-buy same ticker
             seen = set()
             deduped = []

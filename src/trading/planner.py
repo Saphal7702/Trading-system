@@ -58,6 +58,11 @@ def _signal_key_for(action: str, reason: str) -> str | None:
     if a == "buy" and r.startswith("MRIT:"):
         return "mrit_rsi2_pullback_uptrend"
 
+    # PORTFOLIO mapping — required so entry_signal_key is stored in intents/positions
+    # and exits_advisor._exit_profile_name() can dispatch to the PORTFOLIO exit profile.
+    if a == "buy" and r.startswith("PORTFOLIO:"):
+        return "portfolio_momentum_strength"
+
     return None
 
 

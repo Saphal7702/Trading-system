@@ -138,6 +138,11 @@ class ExitRuleConfig:
     break_even_peak_gain_pct: float = 10.0
     break_even_floor_ret_pct: float = 2.0
 
+    # Portfolio-level dollar stop (PORTFOLIO profile only; 0 = disabled).
+    # Fires when abs(unrealized_pnl) / portfolio_equity * 100 >= this value.
+    # Read from TRADING_EXIT_PROFILE_PORTFOLIO_PORTFOLIO_STOP_PCT.
+    portfolio_stop_dollar_pct: float = 0.0
+
 
 _ENV_PREFIX = "TRADING_EXIT_"
 
@@ -394,6 +399,8 @@ def _rule_priority(signal_key: str) -> int:
     """
     if signal_key.startswith("exit_stop_loss"):
         return 100
+    if signal_key.startswith("exit_portfolio_stop"):
+        return 95
     if signal_key.startswith("exit_trailing"):
         return 90
     if signal_key.startswith("exit_break_even_floor"):
@@ -416,6 +423,8 @@ def _exit_profile_name(entry_signal_key: str) -> str:
     k = (entry_signal_key or "").lower()
     if k.startswith("mrit_"):
         return "MRIT"
+    if k.startswith("portfolio_"):
+        return "PORTFOLIO"
     return "DEFAULT"
 
 
@@ -449,6 +458,7 @@ def _apply_profile_overrides(base: ExitRuleConfig, profile: str) -> ExitRuleConf
     time_min = env_float_opt(pfx + "TIME_STOP_MIN_RET_PCT")
 
     enable_sma = env_bool_opt(pfx + "ENABLE_SMA_REVERSAL")
+    port_stop = env_float_opt(pfx + "PORTFOLIO_STOP_PCT")
 
     return ExitRuleConfig(
         stop_loss_pct=stop_loss if stop_loss is not None else base.stop_loss_pct,
@@ -462,7 +472,21 @@ def _apply_profile_overrides(base: ExitRuleConfig, profile: str) -> ExitRuleConf
         time_stop_days=time_days if time_days is not None else base.time_stop_days,
         time_stop_min_ret_pct=time_min if time_min is not None else base.time_stop_min_ret_pct,
         enable_sma_reversal=enable_sma if enable_sma is not None else base.enable_sma_reversal,
+        portfolio_stop_dollar_pct=port_stop if port_stop is not None else base.portfolio_stop_dollar_pct,
     )
+
+
+def _fetch_portfolio_equity(conn) -> float | None:
+    """Fetch current portfolio equity from the broker_accounts cache (latest row)."""
+    try:
+        r = conn.execute(
+            "SELECT equity FROM broker_accounts ORDER BY last_synced_at DESC LIMIT 1;"
+        ).fetchone()
+        if not r or r["equity"] is None:
+            return None
+        return float(r["equity"])
+    except Exception:
+        return None
 
 
 def evaluate_exit_advice(
@@ -482,6 +506,10 @@ def evaluate_exit_advice(
     with connect() as conn:
         asof_eff = asof or _resolve_asof_date(conn)
         metrics = _fetch_open_position_metrics(conn, asof)
+
+        # Lazy-loaded portfolio equity (fetched once if any PORTFOLIO position exists).
+        _portfolio_equity: float | None = None
+        _portfolio_equity_fetched: bool = False
 
         advice: list[dict[str, Any]] = []
         for m in metrics:
@@ -544,6 +572,30 @@ def evaluate_exit_advice(
                         f"[{profile}][ATR] Take: last={last_close:.2f} >= tp={tp_px:.2f} "
                         f"(entry={vwap_entry:.2f} atr={atr:.2f} period={atr_period})"
                     )
+
+            # 0.5) Portfolio-level dollar stop (PORTFOLIO profile only)
+            # Fires when the position's unrealized dollar loss exceeds
+            # portfolio_stop_dollar_pct % of total portfolio equity.
+            if (
+                action == "HOLD"
+                and profile == "PORTFOLIO"
+                and cfg_eff.portfolio_stop_dollar_pct > 0
+            ):
+                pnl = float(m["unrealized_pnl"]) if m.get("unrealized_pnl") is not None else None
+                if pnl is not None and pnl < 0:
+                    if not _portfolio_equity_fetched:
+                        _portfolio_equity = _fetch_portfolio_equity(conn)
+                        _portfolio_equity_fetched = True
+                    if _portfolio_equity is not None and _portfolio_equity > 0:
+                        loss_pct_of_port = abs(pnl) / _portfolio_equity * 100.0
+                        if loss_pct_of_port >= cfg_eff.portfolio_stop_dollar_pct:
+                            exit_signal = "exit_portfolio_stop_dollar"
+                            action = "SELL"
+                            rationale = (
+                                f"Portfolio-level stop: loss=${abs(pnl):.2f} = "
+                                f"{loss_pct_of_port:.2f}% of equity(${_portfolio_equity:.2f}) "
+                                f">= {cfg_eff.portfolio_stop_dollar_pct:.2f}%"
+                            )
 
             # 1) Hard stop loss
             if action == "HOLD" and ret <= -abs(cfg_eff.stop_loss_pct):

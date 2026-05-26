@@ -317,6 +317,140 @@ def _mrit_signals(
 
 
 # ---------------------------------------------------------------------------
+# Portfolio momentum signal generator — mirrors strategy_portfolio.py
+# Self-contained: uses pre-loaded bars only, no DB calls.
+# ---------------------------------------------------------------------------
+
+def _portfolio_signals(
+    symbols: list[str],
+    bars_by_sym: dict[str, list[tuple[str, float]]],
+    dates_by_sym: dict[str, list[str]],
+    spy_closes: list[float],    # SPY closes up to and including asof
+    asof: str,
+    regime_facts: dict,
+    *,
+    sma_long: int = 200,
+    sma_mid: int = 50,
+    ext_days: int = 20,
+    ext_max: float = 0.20,
+    return_days: int = 126,
+    top_pct: float = 0.25,
+    lookback_min: int = 210,
+) -> list[dict]:
+    """
+    Portfolio momentum signals for the backtest engine.
+
+    Mirrors strategy_portfolio.generate_signals_portfolio() exactly but
+    operates on pre-loaded bars (no live DB calls) for performance.
+
+    Entry conditions — ALL must pass:
+      a) price > SMA200   (long-term trend)
+      b) price > SMA50    (medium-term trend)
+      c) top 25% of universe by 6-month return  (P75 percentile)
+      d) RS vs SPY positive: sym_6m_return > spy_6m_return
+      e) not extended: (price / price_20d_ago - 1) < 20%
+
+    Emits buy signals only; no sell signals (exits handled by _check_exits).
+    Suppressed entirely in defensive/crash regime (same gate as MRIT).
+    """
+    # Regime gate: suppress in defensive/crash
+    if regime_facts["regime"] in ("defensive", "crash"):
+        return []
+
+    # SPY 6m return for RS check (None if insufficient history → RS check skipped)
+    spy_6m_return: float | None = None
+    if len(spy_closes) >= return_days + 1:
+        spy_6m_return = (spy_closes[-1] / spy_closes[-(return_days + 1)] - 1) * 100.0
+
+    # ── Pass 1: collect per-symbol metrics ───────────────────────────────────
+    sym_metrics: dict[str, dict] = {}
+    sym_6m_returns: dict[str, float] = {}
+
+    for sym in symbols:
+        if sym == "SPY":
+            continue
+        bars = bars_by_sym.get(sym)
+        if not bars:
+            continue
+        dates = dates_by_sym[sym]
+        closes = _closes_up_to(bars, dates, asof)
+        if len(closes) < lookback_min or len(closes) <= return_days:
+            continue
+
+        sma200_vals = _sma(closes, sma_long)
+        sma50_vals = _sma(closes, sma_mid)
+        i = len(closes) - 1
+
+        if sma200_vals[i] is None or sma50_vals[i] is None:
+            continue
+
+        price = closes[i]
+        s200 = float(sma200_vals[i])
+        s50 = float(sma50_vals[i])
+
+        # 6-month return (return_days trading days)
+        ret_6m = (closes[i] / closes[i - return_days] - 1) * 100.0
+
+        # 20-day extension check (fraction, not %)
+        if i < ext_days:
+            continue
+        ext_20d = closes[i] / closes[i - ext_days] - 1
+
+        sym_metrics[sym] = {
+            "price": price,
+            "sma200": s200,
+            "sma50": s50,
+            "ret_6m": ret_6m,
+            "ext_20d": ext_20d,
+        }
+        sym_6m_returns[sym] = ret_6m
+
+    # ── Compute P75 threshold (top top_pct% cutoff) ───────────────────────────
+    if sym_6m_returns:
+        returns_sorted = sorted(sym_6m_returns.values())
+        n = len(returns_sorted)
+        p75_idx = int(n * (1.0 - top_pct))
+        p75_threshold = returns_sorted[min(p75_idx, n - 1)]
+    else:
+        p75_threshold = float("inf")  # no candidates → no signals
+
+    # ── Pass 2: emit signals ──────────────────────────────────────────────────
+    signals: list[dict] = []
+    for sym, m in sym_metrics.items():
+        price = m["price"]
+        s200 = m["sma200"]
+        s50 = m["sma50"]
+        ret_6m = m["ret_6m"]
+        ext_20d = m["ext_20d"]
+
+        # a) Long-term trend
+        if price <= s200:
+            continue
+        # b) Medium-term trend
+        if price <= s50:
+            continue
+        # c) Top top_pct% by 6m return
+        if ret_6m < p75_threshold:
+            continue
+        # d) RS vs SPY positive (skipped when spy_6m_return is None)
+        if spy_6m_return is not None and (ret_6m - spy_6m_return) <= 0:
+            continue
+        # e) Not extended
+        if ext_20d >= ext_max:
+            continue
+
+        signals.append({
+            "symbol": sym,
+            "action": "buy",
+            "reason": "PORTFOLIO: momentum + trend + RS leader, not extended",
+            "strength": max(0.01, ret_6m),   # clamp positive; planner sorts DESC
+            "signal_key": "portfolio_momentum_strength",
+        })
+
+    return signals
+
+
+# ---------------------------------------------------------------------------
 # Exit rule checks — priority chain matches exits_advisor.evaluate_exit_advice()
 # ---------------------------------------------------------------------------
 
@@ -352,6 +486,19 @@ def _check_exits(
     mrit_time_stop_days: int = 30,
     mrit_time_stop_min_ret: float = 2.0,
     mrit_enable_sma_reversal: bool = True,
+    # PORTFOLIO profile exit params
+    portfolio_stop_loss_pct: float = 15.0,
+    portfolio_trail_activate_pct: float = 20.0,
+    portfolio_trail_dd_pct: float = 10.0,
+    portfolio_take_profit_pct: float = 99999.0,
+    portfolio_time_stop_days: int = 60,
+    portfolio_time_stop_min_ret: float = 0.0,
+    portfolio_early_fail_days: int = 999,
+    portfolio_early_fail_max_ret: float = 0.0,
+    portfolio_enable_sma_reversal: bool = False,
+    portfolio_break_even_peak_pct: float = 15.0,
+    portfolio_break_even_floor_pct: float = 3.0,
+    portfolio_stop_dollar_pct: float = 0.0,
 ) -> list[tuple[str, str]]:
     """
     Return (symbol, exit_reason) for positions that should be closed.
@@ -376,11 +523,45 @@ def _check_exits(
         days = holding_days.get(sym, 0)
 
         is_mrit = pos.signal_key.startswith("mrit_")
-        ef_days = mrit_early_fail_days if is_mrit else early_fail_days
-        ef_max = mrit_early_fail_max_ret if is_mrit else early_fail_max_ret
-        ts_days = mrit_time_stop_days if is_mrit else time_stop_days
-        ts_min = mrit_time_stop_min_ret if is_mrit else time_stop_min_ret
-        sma_rev = mrit_enable_sma_reversal if is_mrit else enable_sma_reversal
+        is_portfolio = pos.signal_key.startswith("portfolio_")
+
+        # Resolve per-profile params once; rules 1-7 use these local vars.
+        if is_portfolio:
+            sl_pct     = portfolio_stop_loss_pct
+            trail_peak = portfolio_trail_activate_pct
+            trail_dd   = portfolio_trail_dd_pct
+            tp_pct     = portfolio_take_profit_pct
+            ts_days    = portfolio_time_stop_days
+            ts_min     = portfolio_time_stop_min_ret
+            ef_days    = portfolio_early_fail_days
+            ef_max     = portfolio_early_fail_max_ret
+            sma_rev    = portfolio_enable_sma_reversal
+            be_peak    = portfolio_break_even_peak_pct
+            be_floor   = portfolio_break_even_floor_pct
+        elif is_mrit:
+            sl_pct     = stop_loss_pct
+            trail_peak = trail_activate_pct
+            trail_dd   = trail_dd_pct
+            tp_pct     = take_profit_pct
+            ts_days    = mrit_time_stop_days
+            ts_min     = mrit_time_stop_min_ret
+            ef_days    = mrit_early_fail_days
+            ef_max     = mrit_early_fail_max_ret
+            sma_rev    = mrit_enable_sma_reversal
+            be_peak    = break_even_peak_pct
+            be_floor   = break_even_floor_pct
+        else:
+            sl_pct     = stop_loss_pct
+            trail_peak = trail_activate_pct
+            trail_dd   = trail_dd_pct
+            tp_pct     = take_profit_pct
+            ts_days    = time_stop_days
+            ts_min     = time_stop_min_ret
+            ef_days    = early_fail_days
+            ef_max     = early_fail_max_ret
+            sma_rev    = enable_sma_reversal
+            be_peak    = break_even_peak_pct
+            be_floor   = break_even_floor_pct
 
         exit_reason: str | None = None
 
@@ -400,16 +581,27 @@ def _check_exits(
                 elif tp_px is not None and price >= tp_px:
                     exit_reason = f"atr_take_profit ret={ret:.2f}%"
 
+        # 0.5) Portfolio-level dollar stop (PORTFOLIO only; fires before hard stop)
+        # Mirrors exits_advisor priority-95 rule.
+        if exit_reason is None and is_portfolio and portfolio_stop_dollar_pct > 0:
+            current_equity = broker.equity(prices)
+            if current_equity > 0:
+                unrealized_pnl_dollars = (price - pos.entry_price) * pos.qty
+                if unrealized_pnl_dollars < 0:
+                    loss_pct_of_port = abs(unrealized_pnl_dollars) / current_equity * 100
+                    if loss_pct_of_port >= portfolio_stop_dollar_pct:
+                        exit_reason = f"portfolio_stop_dollar:{loss_pct_of_port:.2f}%_of_equity"
+
         # 1) Hard stop loss
-        if exit_reason is None and ret <= -abs(stop_loss_pct):
+        if exit_reason is None and ret <= -abs(sl_pct):
             exit_reason = f"stop_loss ret={ret:.2f}%"
 
         # 2) Trailing stop
-        if exit_reason is None and peak_gain >= trail_activate_pct and dd <= -abs(trail_dd_pct):
+        if exit_reason is None and peak_gain >= trail_peak and dd <= -abs(trail_dd):
             exit_reason = f"trailing_stop peak={peak_gain:.2f}% dd={dd:.2f}%"
 
         # 3) Break-even floor
-        if exit_reason is None and peak_gain >= break_even_peak_pct and ret < break_even_floor_pct:
+        if exit_reason is None and peak_gain >= be_peak and ret < be_floor:
             exit_reason = f"break_even_floor ret={ret:.2f}%"
 
         # 4) SMA reversal (per-profile enable flag)
@@ -431,7 +623,7 @@ def _check_exits(
             exit_reason = f"time_stop days={days} ret={ret:.2f}%"
 
         # 7) Take profit
-        if exit_reason is None and ret >= take_profit_pct:
+        if exit_reason is None and ret >= tp_pct:
             exit_reason = f"take_profit ret={ret:.2f}%"
 
         if exit_reason:
@@ -619,6 +811,19 @@ def run_backtest(
     simulate_live: bool = False,
     # Compound position sizing
     compound: bool = False,
+    # PORTFOLIO profile exit params (defaults match live .env TRADING_EXIT_PROFILE_PORTFOLIO_*)
+    portfolio_stop_loss_pct: float = 15.0,
+    portfolio_trail_activate_pct: float = 20.0,
+    portfolio_trail_dd_pct: float = 10.0,
+    portfolio_take_profit_pct: float = 99999.0,
+    portfolio_time_stop_days: int = 60,
+    portfolio_time_stop_min_ret: float = 0.0,
+    portfolio_early_fail_days: int = 999,
+    portfolio_early_fail_max_ret: float = 0.0,
+    portfolio_enable_sma_reversal: bool = False,
+    portfolio_break_even_peak_pct: float = 15.0,
+    portfolio_break_even_floor_pct: float = 3.0,
+    portfolio_stop_dollar_pct: float = 0.0,
 ) -> dict:
     """
     Run a backtest over [start, end].
@@ -633,8 +838,8 @@ def run_backtest(
 
     Fills model: signals on day T are filled at day T+1's close.
     """
-    if strategy not in ("sma", "mrit", "both"):
-        raise ValueError(f"Unknown strategy: {strategy!r}. Use 'sma', 'mrit', or 'both'.")
+    if strategy not in ("sma", "mrit", "both", "portfolio"):
+        raise ValueError(f"Unknown strategy: {strategy!r}. Use 'sma', 'mrit', 'both', or 'portfolio'.")
 
     if per_position_notional is None:
         per_position_notional = initial_capital / max_positions
@@ -677,6 +882,22 @@ def run_backtest(
         mrit_time_stop_days = _ei("TRADING_EXIT_PROFILE_MRIT_TIME_STOP_DAYS", mrit_time_stop_days)
         mrit_time_stop_min_ret = _ef("TRADING_EXIT_PROFILE_MRIT_TIME_STOP_MIN_RET_PCT", mrit_time_stop_min_ret)
         mrit_enable_sma_reversal = _eb("TRADING_EXIT_PROFILE_MRIT_ENABLE_SMA_REVERSAL", mrit_enable_sma_reversal)
+
+        if strategy == "portfolio":
+            portfolio_stop_loss_pct = _ef("TRADING_EXIT_PROFILE_PORTFOLIO_STOP_LOSS_PCT", portfolio_stop_loss_pct)
+            portfolio_trail_activate_pct = _ef("TRADING_EXIT_PROFILE_PORTFOLIO_TRAIL_PEAK_PCT", portfolio_trail_activate_pct)
+            portfolio_trail_dd_pct = _ef("TRADING_EXIT_PROFILE_PORTFOLIO_TRAIL_DD_PCT", portfolio_trail_dd_pct)
+            portfolio_take_profit_pct = _ef("TRADING_EXIT_PROFILE_PORTFOLIO_TAKE_PROFIT_PCT", portfolio_take_profit_pct)
+            portfolio_time_stop_days = _ei("TRADING_EXIT_PROFILE_PORTFOLIO_TIME_STOP_DAYS", portfolio_time_stop_days)
+            portfolio_time_stop_min_ret = _ef("TRADING_EXIT_PROFILE_PORTFOLIO_TIME_STOP_MIN_RET_PCT", portfolio_time_stop_min_ret)
+            portfolio_early_fail_days = _ei("TRADING_EXIT_PROFILE_PORTFOLIO_EARLY_FAIL_DAYS", portfolio_early_fail_days)
+            portfolio_early_fail_max_ret = _ef("TRADING_EXIT_PROFILE_PORTFOLIO_EARLY_FAIL_MAX_RET_PCT", portfolio_early_fail_max_ret)
+            portfolio_enable_sma_reversal = _eb("TRADING_EXIT_PROFILE_PORTFOLIO_ENABLE_SMA_REVERSAL", portfolio_enable_sma_reversal)
+            portfolio_break_even_peak_pct = _ef("TRADING_EXIT_PROFILE_PORTFOLIO_BREAKEVEN_PEAK_PCT", portfolio_break_even_peak_pct)
+            portfolio_break_even_floor_pct = _ef("TRADING_EXIT_PROFILE_PORTFOLIO_BREAKEVEN_FLOOR_PCT", portfolio_break_even_floor_pct)
+            _ps = os.environ.get("TRADING_EXIT_PROFILE_PORTFOLIO_PORTFOLIO_STOP_PCT")
+            portfolio_stop_dollar_pct = float(_ps) if _ps is not None else portfolio_stop_dollar_pct
+
         if not compound:  # CLI --compound takes priority; only override if not explicitly set
             compound = _eb("TRADING_COMPOUND_SIZING", compound)
         if atr_stop_cooldown_days == 0:
@@ -700,10 +921,32 @@ def run_backtest(
             (universe,),
         ).fetchall()
     from ..exclusions import get_active_exclusions
-    exclude_symbols = get_active_exclusions()
-    symbols = [r["symbol"] for r in sym_rows if r["symbol"] not in exclude_symbols]
-    if exclude_symbols:
-        print(f"Backtest exclusions filter: removed {len(sym_rows) - len(symbols)} of {len(sym_rows)} symbols")
+    if strategy == "portfolio":
+        excluded = get_active_exclusions("portfolio")
+    elif strategy == "mrit":
+        excluded = get_active_exclusions("mrit")
+    elif strategy == "sma":
+        excluded = get_active_exclusions("sma")
+    elif strategy == "both":
+        excluded = get_active_exclusions("mrit") | get_active_exclusions("sma")
+    else:
+        excluded = get_active_exclusions("all")
+    pool_syms = {r["symbol"] for r in sym_rows}
+    symbols = [r["symbol"] for r in sym_rows if r["symbol"] not in excluded]
+    if excluded:
+        removed_from_pool = len(sym_rows) - len(symbols)
+        already_absent = len(excluded - pool_syms)
+        if already_absent:
+            print(
+                f"Backtest exclusions filter: {removed_from_pool} removed from pool, "
+                f"{already_absent} already absent ({len(excluded)} total in exclusion set) "
+                f"— {strategy} scope"
+            )
+        else:
+            print(
+                f"Backtest exclusions filter: removed {removed_from_pool} of "
+                f"{len(sym_rows)} symbols — {strategy} scope"
+            )
     if not symbols:
         raise RuntimeError(
             f"No symbols in universe '{universe}'. "
@@ -877,6 +1120,18 @@ def run_backtest(
             mrit_time_stop_days=mrit_time_stop_days,
             mrit_time_stop_min_ret=mrit_time_stop_min_ret,
             mrit_enable_sma_reversal=mrit_enable_sma_reversal,
+            portfolio_stop_loss_pct=portfolio_stop_loss_pct,
+            portfolio_trail_activate_pct=portfolio_trail_activate_pct,
+            portfolio_trail_dd_pct=portfolio_trail_dd_pct,
+            portfolio_take_profit_pct=portfolio_take_profit_pct,
+            portfolio_time_stop_days=portfolio_time_stop_days,
+            portfolio_time_stop_min_ret=portfolio_time_stop_min_ret,
+            portfolio_early_fail_days=portfolio_early_fail_days,
+            portfolio_early_fail_max_ret=portfolio_early_fail_max_ret,
+            portfolio_enable_sma_reversal=portfolio_enable_sma_reversal,
+            portfolio_break_even_peak_pct=portfolio_break_even_peak_pct,
+            portfolio_break_even_floor_pct=portfolio_break_even_floor_pct,
+            portfolio_stop_dollar_pct=portfolio_stop_dollar_pct,
         )
         exit_syms = {sym for sym, _ in exits}
         for sym, reason in exits:
@@ -902,6 +1157,11 @@ def run_backtest(
         if strategy in ("mrit", "both"):
             raw_signals += _mrit_signals(
                 symbols, bars_by_sym, dates_by_sym, day, regime_facts,
+            )
+        if strategy == "portfolio":
+            raw_signals += _portfolio_signals(
+                symbols, bars_by_sym, dates_by_sym,
+                spy_closes_today, day, regime_facts,
             )
 
         # Dedup: keep strongest buy per symbol (in "both" mode two strategies may fire)

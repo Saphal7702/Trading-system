@@ -668,9 +668,10 @@ def cmd_exclude_symbol(args) -> int:
         reason_note=args.note,
         excluded_by="operator",
         review_after=args.review_after,
+        strategy_scope=args.scope,
     )
     status = "Added" if added else "Already excluded (note updated)"
-    print(f"{status}: {args.symbol.upper()} [{args.reason}]")
+    print(f"{status}: {args.symbol.upper()} [{args.reason}] scope={args.scope}")
     if args.note:
         print(f"  Note: {args.note}")
     if args.review_after:
@@ -696,18 +697,21 @@ def cmd_show_exclusions(args) -> int:
         reason_code=args.reason,
         include_reinstated=args.all,
         review_due=args.review_due,
+        strategy_scope=getattr(args, "scope", None),
+        strategy=getattr(args, "strategy", None),
     )
     if not rows:
         print("No exclusions found matching criteria.")
         return 0
-    print(f"\n{'Symbol':<8} {'Code':<16} {'Excluded':>12} {'Review':>12}  Note")
-    print("-" * 75)
+    print(f"\n{'Symbol':<8} {'Code':<16} {'Scope':<12} {'Excluded':>12} {'Review':>12}  Note")
+    print("-" * 88)
     for r in rows:
         status = "" if r["reinstated_at"] is None else " [REINSTATED]"
         review = r["review_after"] or "-"
         note = (r["reason_note"] or "")[:40]
+        scope = r.get("strategy_scope") or "all"
         print(
-            f"{r['symbol']:<8} {r['reason_code']:<16} "
+            f"{r['symbol']:<8} {r['reason_code']:<16} {scope:<12} "
             f"{r['excluded_at'][:10]:>12} {review:>12}  {note}{status}"
         )
     print(f"\nTotal: {len(rows)}")
@@ -2069,6 +2073,15 @@ def main() -> int:
         "--review-after", default=None, metavar="YYYY-MM-DD",
         help="Optional date to re-evaluate this exclusion",
     )
+    p_excl.add_argument(
+        "--scope", default="all",
+        choices=["all", "swing", "mrit", "portfolio"],
+        help=(
+            "Strategy scope for this exclusion (default: all). "
+            "'all'=every strategy, 'swing'=SMA+MRIT, 'mrit'=MRIT only, "
+            "'portfolio'=portfolio only. data_anomaly always uses 'all'."
+        ),
+    )
 
     # reinstate-symbol — mark a previously excluded symbol as active again
     p_rein = sub.add_parser(
@@ -2096,6 +2109,19 @@ def main() -> int:
     p_sex.add_argument(
         "--review-due", action="store_true", default=False,
         help="Only show symbols whose review_after date has passed",
+    )
+    p_sex.add_argument(
+        "--scope", default=None,
+        choices=["all", "swing", "mrit", "portfolio"],
+        help="Filter by exact strategy_scope value stored in the row",
+    )
+    p_sex.add_argument(
+        "--strategy", default=None,
+        choices=["mrit", "sma", "portfolio", "all"],
+        help=(
+            "Show exclusions that apply to this strategy (uses scope resolution). "
+            "mrit→all+swing+mrit, sma→all+swing, portfolio→all+portfolio"
+        ),
     )
 
     # build-custom-universe (Phase 1: structural-fit screen for MRIT/SMA)
@@ -2417,7 +2443,8 @@ def main() -> int:
     p_seed.add_argument("--reason", default="manual test")
 
     p_bt = sub.add_parser("backtest", help="Backtest a strategy on historical data (no live orders).")
-    p_bt.add_argument("--strategy", default="both", choices=["sma", "mrit", "both"], help="Strategy to backtest (default: both; regime gates which signals fire each day)")
+    p_bt.add_argument("--strategy", default="both", choices=["sma", "mrit", "both", "portfolio"],
+                    help="Strategy to backtest (default: both for swing modes; use 'portfolio' for portfolio mode in isolation)")
     p_bt.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
     p_bt.add_argument("--end", required=True, help="End date YYYY-MM-DD")
     p_bt.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
@@ -2461,6 +2488,17 @@ def main() -> int:
                     help="Compound position sizing: size each trade as a fixed %% of current equity (default: False = fixed notional)")
     p_bt.add_argument("--atr-stop-cooldown-days", type=int, default=0,
                     help="Days to block re-entry after an ATR stop loss exit (default: 0 = disabled; recommended: 20-30)")
+    # PORTFOLIO profile args (most useful knobs; use --simulate-live to pull the rest from .env)
+    p_bt.add_argument("--portfolio-stop-loss-pct", type=float, default=15.0,
+                    help="Portfolio hard stop loss %% (default: 15.0)")
+    p_bt.add_argument("--portfolio-trail-peak-pct", type=float, default=20.0,
+                    help="Portfolio trailing stop activation peak gain %% (default: 20.0)")
+    p_bt.add_argument("--portfolio-trail-dd-pct", type=float, default=10.0,
+                    help="Portfolio trailing stop drawdown-from-peak %% (default: 10.0)")
+    p_bt.add_argument("--portfolio-time-stop-days", type=int, default=60,
+                    help="Portfolio time-stop days (default: 60)")
+    p_bt.add_argument("--portfolio-stop-dollar-pct", type=float, default=0.0,
+                    help="Portfolio-level dollar stop %% of equity (default: 0 = disabled; e.g. 1.5 = exit when loss > 1.5%% of portfolio)")
 
     p_btfb = sub.add_parser(
         "backtest-fetch-bars",
@@ -2582,6 +2620,11 @@ def main() -> int:
             simulate_live=args.simulate_live,
             compound=args.compound,
             atr_stop_cooldown_days=args.atr_stop_cooldown_days,
+            portfolio_stop_loss_pct=args.portfolio_stop_loss_pct,
+            portfolio_trail_activate_pct=args.portfolio_trail_peak_pct,
+            portfolio_trail_dd_pct=args.portfolio_trail_dd_pct,
+            portfolio_time_stop_days=args.portfolio_time_stop_days,
+            portfolio_stop_dollar_pct=args.portfolio_stop_dollar_pct,
         )
         print_report(summary, strategy=args.strategy, start=args.start, end=args.end)
         return 0

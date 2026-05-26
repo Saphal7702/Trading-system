@@ -374,8 +374,9 @@ def trim_universe(cfg: TrimConfig) -> dict:
             for d in exclusion_queue:
                 conn.execute(
                     """INSERT INTO symbol_exclusions
-                       (symbol, reason_code, reason_note, excluded_by, excluded_at)
-                       VALUES (?, ?, ?, 'system', datetime('now'))
+                       (symbol, reason_code, reason_note, excluded_by, excluded_at,
+                        strategy_scope)
+                       VALUES (?, ?, ?, 'system', datetime('now'), 'mrit')
                        ON CONFLICT(symbol) DO NOTHING""",
                     (d.symbol, d.reason_code, d.reason_note),
                 )
