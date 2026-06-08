@@ -26,6 +26,9 @@ def init_backtest_db(db_path: str | None = None) -> None:
     for col_sql in [
         "ALTER TABLE backtest_trades ADD COLUMN signal_key TEXT",
         "ALTER TABLE backtest_runs ADD COLUMN compound INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE backtest_trades ADD COLUMN pyramid_adds INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE backtest_trades ADD COLUMN total_cost_basis REAL",
+        "ALTER TABLE backtest_trades ADD COLUMN avg_entry_price REAL",
     ]:
         try:
             conn.execute(col_sql)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import logging
 import math
 import os
 import statistics
@@ -9,8 +10,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
+log = logging.getLogger("trading")
+
 from .db import connect_backtest, init_backtest_db
-from .sim_broker import SimBroker
+from .sim_broker import SimBroker, SimPosition
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +457,38 @@ def _portfolio_signals(
 # Exit rule checks — priority chain matches exits_advisor.evaluate_exit_advice()
 # ---------------------------------------------------------------------------
 
+def _portfolio_pyramid_check(
+    pos: SimPosition,
+    current_price: float,
+    pyramid_rungs_hit: set[int],
+    ladder: list[float],
+    sizes: list[float],
+    max_mult: float,
+) -> Optional[tuple[int, float]]:
+    """
+    Check if a portfolio position has crossed a new pyramid rung.
+
+    Returns (rung_index, add_notional) if a rung is newly crossed and within the cap.
+    Returns None otherwise (already hit, gain too low, cap hit, no original price).
+
+    Gain is always measured from original_entry_price (not avg cost basis) so the
+    ladder thresholds stay fixed regardless of how many adds have occurred.
+    """
+    if pos.original_entry_price <= 0 or pos.entry_notional_original <= 0:
+        return None
+    gain_pct = (current_price / pos.original_entry_price - 1.0) * 100.0
+    for i, threshold in enumerate(ladder):
+        if i in pyramid_rungs_hit:
+            continue
+        if gain_pct >= threshold - 1e-9:  # epsilon guards float rounding (e.g. 12/10*100=19.9999...)
+            add_notional = pos.entry_notional_original * sizes[i]
+            # Enforce total exposure cap relative to original position size
+            if pos.entry_notional + add_notional > pos.entry_notional_original * max_mult:
+                continue  # would breach cap; check remaining rungs
+            return (i, add_notional)
+    return None
+
+
 def _check_exits(
     broker: SimBroker,
     prices: dict[str, float],
@@ -517,8 +552,13 @@ def _check_exits(
         price = prices.get(sym)
         if price is None:
             continue
-        ret = ((price - pos.entry_price) / pos.entry_price) * 100.0
-        peak_gain = ((pos.peak_price - pos.entry_price) / pos.entry_price) * 100.0
+        # Use original_entry_price as the fixed reference for ret and peak_gain so
+        # that pyramid adds (which raise the avg cost basis) don't shift the trailing
+        # stop's reference point. For non-pyramid positions original_entry_price ==
+        # entry_price, so behavior is byte-identical.
+        ref_price = pos.original_entry_price if pos.original_entry_price > 0 else pos.entry_price
+        ret = ((price - ref_price) / ref_price) * 100.0
+        peak_gain = ((pos.peak_price - ref_price) / ref_price) * 100.0
         dd = ((price - pos.peak_price) / pos.peak_price) * 100.0
         days = holding_days.get(sym, 0)
 
@@ -745,14 +785,16 @@ def _save_results(
             """
             INSERT INTO backtest_trades
                 (run_id, symbol, entry_date, exit_date, entry_price, exit_price,
-                 qty, realized_pnl, return_pct, exit_reason, signal_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 qty, realized_pnl, return_pct, exit_reason, signal_key,
+                 pyramid_adds, total_cost_basis, avg_entry_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (run_id, t["symbol"], t["entry_date"], t.get("exit_date"),
                  t["entry_price"], t.get("exit_price"), t["qty"],
                  t.get("realized_pnl"), t.get("return_pct"), t.get("exit_reason"),
-                 t.get("signal_key"))
+                 t.get("signal_key"),
+                 t.get("pyramid_adds", 0), t.get("total_cost_basis"), t.get("avg_entry_price"))
                 for t in trades
             ],
         )
@@ -903,6 +945,53 @@ def run_backtest(
         if atr_stop_cooldown_days == 0:
             atr_stop_cooldown_days = _ei("TRADING_ATR_STOP_COOLDOWN_DAYS", atr_stop_cooldown_days)
 
+    # -----------------------------------------------------------------------
+    # Pyramid ladder config (portfolio mode only; OFF by default)
+    # -----------------------------------------------------------------------
+    pyramid_enabled = False
+    pyramid_ladder: list[float] = []
+    pyramid_sizes: list[float] = []
+    pyramid_max_mult: float = 2.0
+
+    if strategy == "portfolio":
+        _penv = os.environ.get("TRADING_PORTFOLIO_PYRAMID_ENABLED", "0").strip().lower()
+        pyramid_enabled = _penv in ("1", "true", "yes", "on")
+        if pyramid_enabled:
+            try:
+                pyramid_ladder = [
+                    float(x) for x in
+                    os.environ.get("TRADING_PORTFOLIO_PYRAMID_LADDER", "20,50,100").split(",")
+                ]
+                pyramid_sizes = [
+                    float(x) for x in
+                    os.environ.get("TRADING_PORTFOLIO_PYRAMID_SIZES", "0.5,0.33,0.17").split(",")
+                ]
+                pyramid_max_mult = float(
+                    os.environ.get("TRADING_PORTFOLIO_PYRAMID_MAX_MULT", "2.0")
+                )
+                if len(pyramid_ladder) != len(pyramid_sizes):
+                    raise ValueError(
+                        f"PYRAMID_LADDER length ({len(pyramid_ladder)}) != "
+                        f"PYRAMID_SIZES length ({len(pyramid_sizes)})"
+                    )
+                if pyramid_ladder != sorted(pyramid_ladder) or len(set(pyramid_ladder)) != len(pyramid_ladder):
+                    raise ValueError(f"PYRAMID_LADDER must be strictly ascending: {pyramid_ladder}")
+                if any(x <= 0 for x in pyramid_ladder) or any(x <= 0 for x in pyramid_sizes):
+                    raise ValueError("All PYRAMID_LADDER and PYRAMID_SIZES values must be positive")
+                if 1.0 + sum(pyramid_sizes) > pyramid_max_mult:
+                    log.warning(
+                        "PYRAMID: 1.0+sum(SIZES)=%.2f exceeds MAX_MULT=%.2f; "
+                        "higher rungs may be skipped by the cap",
+                        1.0 + sum(pyramid_sizes), pyramid_max_mult,
+                    )
+                log.info(
+                    "PYRAMID enabled: ladder=%s sizes=%s max_mult=%.1f",
+                    pyramid_ladder, pyramid_sizes, pyramid_max_mult,
+                )
+            except (ValueError, TypeError) as e:
+                log.error("PYRAMID config error: %s — pyramiding disabled for this run", e)
+                pyramid_enabled = False
+
     init_backtest_db(backtest_db_path)
 
     # -----------------------------------------------------------------------
@@ -1051,20 +1140,26 @@ def run_backtest(
                 continue
 
             if order["action"] == "sell" and sym in broker.positions:
-                pos = broker.positions[sym]
-                qty, entry_price, pnl = broker.fill_sell(sym, price)
-                ret_pct = ((price - entry_price) / entry_price) * 100.0
+                pos = broker.positions[sym]  # capture before fill_sell pops it
+                qty, avg_ep, pnl = broker.fill_sell(sym, price)
+                # Use original_entry_price as reference (consistent with _check_exits).
+                # For non-pyramid positions original_entry_price == avg_ep.
+                ref_ep = pos.original_entry_price if pos.original_entry_price > 0 else avg_ep
+                ret_pct = ((price - ref_ep) / ref_ep) * 100.0
                 trades.append({
                     "symbol": sym,
                     "entry_date": pos.entry_date,
                     "exit_date": day,
-                    "entry_price": entry_price,
+                    "entry_price": ref_ep,
                     "exit_price": price,
                     "qty": qty,
                     "realized_pnl": pnl,
                     "return_pct": ret_pct,
                     "exit_reason": order.get("reason", "signal"),
                     "signal_key": pos.signal_key,
+                    "pyramid_adds": len(pos.pyramid_rungs_hit),
+                    "total_cost_basis": pos.entry_notional,
+                    "avg_entry_price": avg_ep,
                 })
                 holding_days.pop(sym, None)
                 filled_sells.add(sym)
@@ -1136,6 +1231,38 @@ def run_backtest(
         exit_syms = {sym for sym, _ in exits}
         for sym, reason in exits:
             pending_orders.append({"action": "sell", "symbol": sym, "reason": reason})
+
+        # 3.5) Pyramid adds: add capital to winning portfolio positions
+        # Immediate fills at today's close (not T+1) — threshold crossed is known today.
+        if pyramid_enabled and strategy == "portfolio":
+            for sym in list(broker.positions.keys()):
+                if sym in exit_syms:
+                    continue  # position already slated for exit
+                pos = broker.positions[sym]
+                if not pos.signal_key.startswith("portfolio_"):
+                    continue
+                price_today = prices.get(sym)
+                if price_today is None:
+                    continue
+                result = _portfolio_pyramid_check(
+                    pos, price_today,
+                    set(pos.pyramid_rungs_hit),
+                    pyramid_ladder, pyramid_sizes, pyramid_max_mult,
+                )
+                if result is None:
+                    continue
+                rung_idx, add_notional = result
+                qty_added = broker.fill_buy(
+                    sym, price_today, add_notional, day, pos.signal_key,
+                    _pyramid_rung=rung_idx,
+                )
+                if qty_added > 0:
+                    log.debug(
+                        "PYRAMID add #%d on %s: $%.2f at $%.2f (gain=%.1f%% from orig $%.2f)",
+                        rung_idx + 1, sym, add_notional, price_today,
+                        (price_today / pos.original_entry_price - 1.0) * 100.0,
+                        pos.original_entry_price,
+                    )
 
         # 4. Compute regime for today, then generate signals
         spy_closes_today = _closes_up_to(spy_bars, spy_dates, day)
@@ -1225,19 +1352,23 @@ def run_backtest(
     for sym in list(broker.positions.keys()):
         pos = broker.positions[sym]
         price = prices.get(sym, pos.entry_price)
-        qty, entry_price, pnl = broker.fill_sell(sym, price)
-        ret_pct = ((price - entry_price) / entry_price) * 100.0
+        qty, avg_ep, pnl = broker.fill_sell(sym, price)
+        ref_ep = pos.original_entry_price if pos.original_entry_price > 0 else avg_ep
+        ret_pct = ((price - ref_ep) / ref_ep) * 100.0
         trades.append({
             "symbol": sym,
             "entry_date": pos.entry_date,
             "exit_date": last_day,
-            "entry_price": entry_price,
+            "entry_price": ref_ep,
             "exit_price": price,
             "qty": qty,
             "realized_pnl": pnl,
             "return_pct": ret_pct,
             "exit_reason": "end_of_backtest",
             "signal_key": pos.signal_key,
+            "pyramid_adds": len(pos.pyramid_rungs_hit),
+            "total_cost_basis": pos.entry_notional,
+            "avg_entry_price": avg_ep,
         })
 
     # -----------------------------------------------------------------------

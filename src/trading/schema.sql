@@ -13,7 +13,11 @@ CREATE TABLE IF NOT EXISTS positions (
   opened_at TEXT NOT NULL,
   last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   entry_signal_key TEXT,
-  entry_notional REAL
+  entry_notional REAL,
+  original_entry_price REAL,
+  entry_notional_original REAL,
+  pyramid_rungs_hit TEXT NOT NULL DEFAULT '[]',
+  pyramid_last_check_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS orders (

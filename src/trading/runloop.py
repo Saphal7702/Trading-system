@@ -109,6 +109,86 @@ def _is_weekend(yyyy_mm_dd: str) -> bool:
     return d.weekday() >= 5  # 5=Sat, 6=Sun
 
 
+def _generate_pyramid_signals(asof: str) -> list:
+    """Generate pyramid add signals for open portfolio positions that have crossed a gain threshold."""
+    from .pyramid import load_pyramid_config, check_pyramid_add
+    from .strategy_sma import Signal
+    from .db import connect
+
+    config = load_pyramid_config()
+    if config is None:
+        return []
+
+    signals = []
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT
+                p.symbol,
+                p.entry_notional,
+                p.original_entry_price,
+                p.entry_notional_original,
+                p.pyramid_rungs_hit,
+                b.c AS last_close
+            FROM positions p
+            LEFT JOIN (
+                SELECT bd.symbol, bd.c
+                FROM bars_daily bd
+                JOIN (
+                    SELECT UPPER(symbol) AS symbol, MAX(t) AS tmax
+                    FROM bars_daily
+                    WHERE t <= ?
+                    GROUP BY UPPER(symbol)
+                ) mx ON UPPER(bd.symbol) = mx.symbol AND bd.t = mx.tmax
+            ) b ON UPPER(b.symbol) = UPPER(p.symbol)
+            WHERE p.qty > 0.000001
+              AND p.entry_signal_key LIKE 'portfolio_%'
+              AND p.entry_signal_key NOT LIKE 'portfolio_pyramid_add_%';
+        """, (asof,)).fetchall()
+
+    for r in rows:
+        sym = str(r["symbol"] or "").upper().strip()
+        if not sym:
+            continue
+        orig_ep = r["original_entry_price"]
+        orig_notional = r["entry_notional_original"]
+        curr_notional = r["entry_notional"]
+        last_close = r["last_close"]
+
+        if orig_ep is None or orig_notional is None or curr_notional is None or last_close is None:
+            continue
+
+        try:
+            orig_ep_f = float(orig_ep)
+            orig_notional_f = float(orig_notional)
+            curr_notional_f = float(curr_notional)
+            last_close_f = float(last_close)
+        except (TypeError, ValueError):
+            continue
+
+        try:
+            rungs_hit: set[int] = set(json.loads(r["pyramid_rungs_hit"] or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            rungs_hit = set()
+
+        result = check_pyramid_add(
+            original_entry_price=orig_ep_f,
+            entry_notional_original=orig_notional_f,
+            current_notional=curr_notional_f,
+            current_price=last_close_f,
+            rungs_hit=rungs_hit,
+            config=config,
+        )
+        if result is None:
+            continue
+
+        rung_idx, add_notional = result
+        reason = f"PYRAMID:rung={rung_idx}:add_notional={add_notional:.2f}"
+        signals.append(Signal(sym, "buy", reason, strength=1.0))
+        log.debug("PYRAMID signal: %s rung=%d add=$%.2f", sym, rung_idx, add_notional)
+
+    return signals
+
+
 def run_once(
     *,
     notes: str | None = None,
@@ -368,6 +448,13 @@ def run_once(
                 deduped.append(s)
             signals = deduped
 
+            # Pyramid adds injected AFTER de-dup (they target already-held symbols)
+            if mode == "portfolio":
+                pyramid_sigs = _generate_pyramid_signals(asof)
+                if pyramid_sigs:
+                    log.info("PYRAMID: injecting %d add signal(s)", len(pyramid_sigs))
+                signals += pyramid_sigs
+
             intents = plan_intents(
                 signals,
                 policy=policy,
@@ -475,6 +562,59 @@ def run_once(
             }
 
         step("lots_apply", _apply_lots)
+
+        # 7.55) Pyramid: persist rung state for filled adds
+        def _update_pyramid_rungs():
+            from .pyramid import is_pyramid_enabled
+            if not is_pyramid_enabled():
+                return {"skipped": True, "reason": "pyramid_disabled"}
+
+            with connect() as conn:
+                rows = conn.execute("""
+                    SELECT i.symbol, i.signal_key
+                    FROM intents i
+                    JOIN orders o ON o.intent_id = i.id
+                    WHERE i.run_id = ?
+                      AND i.signal_key LIKE 'portfolio_pyramid_add_rung%'
+                      AND o.filled_qty > 0;
+                """, (run_id,)).fetchall()
+
+                updated = 0
+                for r in rows:
+                    sym = str(r["symbol"] or "").upper().strip()
+                    sk = str(r["signal_key"] or "")
+                    try:
+                        rung_idx = int(sk[len("portfolio_pyramid_add_rung"):])
+                    except (ValueError, IndexError):
+                        continue
+
+                    pos_row = conn.execute(
+                        "SELECT pyramid_rungs_hit FROM positions WHERE symbol = ?",
+                        (sym,),
+                    ).fetchone()
+                    if not pos_row:
+                        continue
+
+                    try:
+                        rungs: set[int] = set(json.loads(pos_row["pyramid_rungs_hit"] or "[]"))
+                    except (json.JSONDecodeError, TypeError):
+                        rungs = set()
+
+                    rungs.add(rung_idx)
+                    conn.execute(
+                        """
+                        UPDATE positions
+                        SET pyramid_rungs_hit = ?,
+                            pyramid_last_check_at = datetime('now')
+                        WHERE symbol = ?;
+                        """,
+                        (json.dumps(sorted(rungs)), sym),
+                    )
+                    updated += 1
+
+            return {"updated": updated}
+
+        step("pyramid_rungs_update", _update_pyramid_rungs)
 
         # 7.6) Phase 3: Daily account snapshot (equity curve)
                 # 7.6) Phase 3: Daily account snapshot (equity curve)

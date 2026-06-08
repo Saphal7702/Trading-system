@@ -45,16 +45,29 @@ def sync_positions(broker: Broker) -> int:
 
             conn.execute(
                 """
-                INSERT INTO positions(symbol, qty, avg_entry_price, opened_at, last_updated_at, entry_signal_key, entry_notional)
-                VALUES (?, ?, ?, datetime('now'), datetime('now'), NULL, NULL)
+                INSERT INTO positions(
+                    symbol, qty, avg_entry_price, opened_at, last_updated_at,
+                    entry_signal_key, entry_notional,
+                    original_entry_price, entry_notional_original, pyramid_rungs_hit
+                )
+                VALUES (?, ?, ?, datetime('now'), datetime('now'), NULL, NULL, ?, NULL, '[]')
                 ON CONFLICT(symbol) DO UPDATE SET
-                qty=excluded.qty,
-                avg_entry_price=excluded.avg_entry_price,
-                last_updated_at=datetime('now'),
-                entry_signal_key=COALESCE(positions.entry_signal_key, excluded.entry_signal_key),
-                entry_notional=COALESCE(positions.entry_notional, excluded.entry_notional);
+                    qty=excluded.qty,
+                    avg_entry_price=excluded.avg_entry_price,
+                    last_updated_at=datetime('now'),
+                    entry_signal_key=COALESCE(positions.entry_signal_key, excluded.entry_signal_key),
+                    entry_notional=COALESCE(positions.entry_notional, excluded.entry_notional),
+                    original_entry_price=COALESCE(
+                        positions.original_entry_price,
+                        excluded.original_entry_price
+                    ),
+                    entry_notional_original=COALESCE(
+                        positions.entry_notional_original,
+                        positions.entry_notional
+                    ),
+                    pyramid_rungs_hit=COALESCE(positions.pyramid_rungs_hit, '[]');
                 """,
-                (sym, qty, avg),
+                (sym, qty, avg, avg),
             )
 
 
@@ -220,14 +233,15 @@ def backfill_position_entry_meta_from_executions() -> int:
             conn.execute(
                 """
                 UPDATE positions
-                SET entry_signal_key = COALESCE(entry_signal_key, ?),
-                    entry_notional    = COALESCE(entry_notional, ?),
-                    last_updated_at   = datetime('now')
+                SET entry_signal_key        = COALESCE(entry_signal_key, ?),
+                    entry_notional          = COALESCE(entry_notional, ?),
+                    entry_notional_original = COALESCE(entry_notional_original, entry_notional, ?),
+                    last_updated_at         = datetime('now')
                 WHERE symbol = ?
                   AND qty > 0
                   AND entry_signal_key IS NULL;
                 """,
-                (signal_key, entry_notional, sym),
+                (signal_key, entry_notional, entry_notional, sym),
             )
             updated += 1
 

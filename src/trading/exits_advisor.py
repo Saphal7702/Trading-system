@@ -206,7 +206,7 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
 
     -- Broker-synced truth: what is actually open right now
     open_positions AS (
-      SELECT UPPER(symbol) AS symbol, qty
+      SELECT UPPER(symbol) AS symbol, qty, original_entry_price
       FROM positions
       WHERE qty > 0.000001
     ),
@@ -242,9 +242,11 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
         c.qty_open,
         c.cost_basis,
         c.first_entry_at,
-        s.entry_signal_key
+        s.entry_signal_key,
+        op.original_entry_price
       FROM open_pos_core c
       LEFT JOIN entry_sig s ON s.symbol = c.symbol
+      LEFT JOIN open_positions op ON op.symbol = c.symbol
     ),
 
     last_close AS (
@@ -284,7 +286,8 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
       (100.0 * (lc.last_close - ps.peak_close) / NULLIF(ps.peak_close,0)) AS drawdown_from_peak_pct,
       (100.0 * (ps.peak_close - (op.cost_basis / NULLIF(op.qty_open,0))) / NULLIF((op.cost_basis / NULLIF(op.qty_open,0)),0)) AS peak_gain_pct,
       op.first_entry_at AS first_entry_at,
-      op.entry_signal_key AS entry_signal_key
+      op.entry_signal_key AS entry_signal_key,
+      op.original_entry_price AS original_entry_price
     FROM open_pos op
     JOIN last_close lc ON lc.symbol = op.symbol
     JOIN peak_since_entry ps ON ps.symbol = op.symbol
@@ -519,6 +522,22 @@ def evaluate_exit_advice(
             peak_gain = float(m["peak_gain_pct"]) if m["peak_gain_pct"] is not None else 0.0
             dd = float(m["drawdown_from_peak_pct"]) if m["drawdown_from_peak_pct"] is not None else 0.0
             entry_signal_key = str(m.get("entry_signal_key") or "unknown")
+
+            # For portfolio pyramid positions, anchor ret/peak_gain to original_entry_price
+            # so exit rules fire relative to the first-fill price, not the blended avg.
+            orig_ep = m.get("original_entry_price")
+            if (
+                orig_ep is not None
+                and float(orig_ep) > 0
+                and entry_signal_key.startswith("portfolio_")
+            ):
+                last_c = float(m["last_close"]) if m.get("last_close") is not None else None
+                peak_c = float(m["peak_close"]) if m.get("peak_close") is not None else None
+                orig_f = float(orig_ep)
+                if last_c is not None:
+                    ret = (last_c / orig_f - 1.0) * 100.0
+                if peak_c is not None:
+                    peak_gain = (peak_c / orig_f - 1.0) * 100.0
 
             profile = _exit_profile_name(entry_signal_key)
             cfg_eff = _apply_profile_overrides(cfg, profile)

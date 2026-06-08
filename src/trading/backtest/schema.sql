@@ -13,18 +13,21 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
 );
 
 CREATE TABLE IF NOT EXISTS backtest_trades (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id       INTEGER NOT NULL REFERENCES backtest_runs(id),
-    symbol       TEXT    NOT NULL,
-    entry_date   TEXT    NOT NULL,
-    exit_date    TEXT,
-    entry_price  REAL    NOT NULL,
-    exit_price   REAL,
-    qty          REAL    NOT NULL,
-    realized_pnl REAL,
-    return_pct   REAL,
-    exit_reason  TEXT,
-    signal_key   TEXT
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL REFERENCES backtest_runs(id),
+    symbol           TEXT    NOT NULL,
+    entry_date       TEXT    NOT NULL,
+    exit_date        TEXT,
+    entry_price      REAL    NOT NULL,   -- original entry price (frozen at first fill)
+    exit_price       REAL,
+    qty              REAL    NOT NULL,   -- total qty at exit (all fills combined)
+    realized_pnl     REAL,
+    return_pct       REAL,              -- measured from original entry price
+    exit_reason      TEXT,
+    signal_key       TEXT,
+    pyramid_adds     INTEGER NOT NULL DEFAULT 0,  -- fills beyond initial entry (0-N)
+    total_cost_basis REAL,              -- sum of all fill costs (initial + pyramid adds)
+    avg_entry_price  REAL               -- total_cost_basis / qty at exit
 );
 
 CREATE TABLE IF NOT EXISTS backtest_equity_curve (

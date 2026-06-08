@@ -63,6 +63,15 @@ def _signal_key_for(action: str, reason: str) -> str | None:
     if a == "buy" and r.startswith("PORTFOLIO:"):
         return "portfolio_momentum_strength"
 
+    # PYRAMID add: "PYRAMID:rung=0:add_notional=500.00"
+    if a == "buy" and r.startswith("PYRAMID:"):
+        try:
+            rung_part = next(p for p in r.split(":") if p.startswith("rung="))
+            rung_idx = int(rung_part.split("=")[1])
+            return f"portfolio_pyramid_add_rung{rung_idx}"
+        except (StopIteration, ValueError, IndexError):
+            return "portfolio_pyramid_add"
+
     return None
 
 
@@ -109,6 +118,16 @@ def _exposure_by_signal_key() -> dict[str, float]:
         ).fetchall()
 
     return {str(r["k"]): float(r["notional"] or 0.0) for r in rows}
+
+
+def _parse_pyramid_notional(reason: str) -> float:
+    """Parse add_notional from 'PYRAMID:rung=N:add_notional=X.XX' reason string."""
+    try:
+        part = next(p for p in reason.split(":") if p.startswith("add_notional="))
+        return float(part.split("=")[1])
+    except (StopIteration, ValueError, IndexError):
+        return 0.0
+
 
 def _get_buying_power_fallback(default: float = 0.0) -> float:
     """
@@ -255,7 +274,11 @@ def plan_intents(
 
     intents: list[Intent] = []
     buy_candidates: list[Signal] = []
+    pyramid_adds: list[Signal] = []
     risk_buys_blocked = 0
+    bypass_exposure_cap_for_pyramid = (
+        os.environ.get("TRADING_PYRAMID_BYPASS_EXPOSURE_CAP", "1").strip() not in ("0", "false", "no", "off")
+    )
 
     def _policy_sizing_for_entry(entry_key: str | None, base_notional: float | None) -> dict:
         out = {
@@ -371,8 +394,16 @@ def plan_intents(
                 )
 
         elif sig.action == "buy":
-            if holding:
+            is_pyramid = sig.reason.startswith("PYRAMID:")
+            if holding and not is_pyramid:
                 intents.append(Intent(sym, "hold", "Already holding; skip buy", sig.strength))
+            elif is_pyramid:
+                if not allow_buys:
+                    rs = risk_state or "RISK_BLOCK"
+                    intents.append(Intent(sym, "hold", f"Pyramid add blocked by risk state: {rs}", sig.strength))
+                    risk_buys_blocked += 1
+                else:
+                    pyramid_adds.append(Signal(sym, "buy", sig.reason, strength=sig.strength))
             else:
                 if not allow_buys:
                     rs = risk_state or "RISK_BLOCK"
@@ -594,6 +625,40 @@ def plan_intents(
                 )
             else:
                 intents.append(Intent(sym, "hold", "Budget/slots limited; skip buy", sig.strength))
+
+    # ---- Pyramid adds: bypass slots + exposure cap; cash check only ----
+    for sig in pyramid_adds:
+        sym = _norm_sym(sig.symbol)
+        entry_key = _signal_key_for("buy", sig.reason)
+        add_notional = _parse_pyramid_notional(sig.reason)
+        if add_notional <= 0:
+            intents.append(Intent(sym, "hold", "Pyramid: could not parse add_notional; skipped", sig.strength))
+            continue
+        if remaining_cash < add_notional:
+            intents.append(Intent(
+                sym, "hold",
+                f"Pyramid: insufficient cash for add ${add_notional:.2f}; skipped",
+                sig.strength,
+            ))
+            continue
+        if not bypass_exposure_cap_for_pyramid:
+            curr = float(exposure.get(entry_key or "UNKNOWN", 0.0))
+            planned = float(planned_exposure.get(entry_key or "UNKNOWN", 0.0))
+            if (curr + planned + add_notional) > float(max_exposure):
+                intents.append(Intent(
+                    sym, "hold",
+                    f"Pyramid: exposure cap hit for {entry_key}; skipped",
+                    sig.strength,
+                ))
+                continue
+        remaining_cash -= add_notional
+        if entry_key:
+            planned_exposure[entry_key] = float(planned_exposure.get(entry_key, 0.0)) + add_notional
+        intents.append(Intent(
+            sym, "buy", sig.reason, sig.strength,
+            target_notional=add_notional,
+            signal_key=entry_key,
+        ))
 
     return intents
 

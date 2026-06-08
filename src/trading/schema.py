@@ -7,6 +7,7 @@ def apply_schema(conn: sqlite3.Connection) -> None:
     _migrate_runs_regime_cols(conn)
     _migrate_symbol_exclusions(conn)
     _migrate_universe_membership_source(conn)
+    _migrate_positions_pyramid_cols(conn)
 
 
 def _migrate_runs_regime_cols(conn: sqlite3.Connection) -> None:
@@ -67,3 +68,31 @@ def _migrate_universe_membership_source(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE universe_membership ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';"
         )
+
+
+def _migrate_positions_pyramid_cols(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(positions);").fetchall()}
+    for col, defn in [
+        ("original_entry_price",    "REAL"),
+        ("entry_notional_original", "REAL"),
+        ("pyramid_rungs_hit",       "TEXT NOT NULL DEFAULT '[]'"),
+        ("pyramid_last_check_at",   "TEXT"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {defn};")
+
+    # Backfill: freeze original prices for existing open positions
+    conn.execute("""
+        UPDATE positions
+        SET original_entry_price = avg_entry_price
+        WHERE qty > 0
+          AND original_entry_price IS NULL
+          AND avg_entry_price IS NOT NULL;
+    """)
+    conn.execute("""
+        UPDATE positions
+        SET entry_notional_original = entry_notional
+        WHERE qty > 0
+          AND entry_notional_original IS NULL
+          AND entry_notional IS NOT NULL;
+    """)
