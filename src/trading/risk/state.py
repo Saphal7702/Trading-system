@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 from ..db import connect
+from ..utils import env_bool
 
 STATE_NORMAL = "NORMAL"
 STATE_PAUSE_BUYS = "PAUSE_BUYS"
@@ -194,6 +195,19 @@ def clear_operator_override(*, env: str) -> None:
             """,
             (_now_iso(), allow_buys, allow_sells, allow_broker, _now_iso(), env),
         )
+
+
+def halt_stop_loss_bypass_enabled() -> bool:
+    """
+    Whether TRADING_HALT_ALLOW_STOP_LOSS_EXITS is enabled for this process.
+
+    Opt-in, default off. When on, runloop.run_once is allowed — while state==HALT_ALL —
+    to execute ONLY already-recorded risk-reducing exit intents (see
+    exits_advisor.is_risk_reducing_exit_intent), instead of skipping the run entirely.
+    Read like every other TRADING_* flag, so paper and live can set it independently
+    via their own env files.
+    """
+    return env_bool("TRADING_HALT_ALLOW_STOP_LOSS_EXITS", False)
 
 
 def reset_peak(*, env: str, reason: str) -> None:

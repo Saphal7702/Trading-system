@@ -1143,3 +1143,50 @@ def emit_sell_intents(
             conn.commit()
 
     return summary
+
+
+def is_risk_reducing_exit_intent(*, action: str, signal_key: str | None) -> bool:
+    """
+    True if an intent is a system-generated, risk-reducing exit eligible to run through
+    the HALT_ALL stop-loss bypass (see TRADING_HALT_ALLOW_STOP_LOSS_EXITS / runloop.py).
+
+    Deliberately narrow: only sells whose signal_key was produced by this module's
+    exit rules (exit_stop_loss_*, exit_trailing_*, exit_time_stop_*, etc. — anything
+    prefixed 'exit_'). Buys, holds, and non-exit sells (e.g. manual/portfolio-trim
+    sells) never qualify.
+    """
+    if (action or "").strip().lower() != "sell":
+        return False
+    return (signal_key or "").strip().lower().startswith("exit_")
+
+
+def find_pending_halt_bypass_intents(conn, *, asof: str | None = None) -> list[dict[str, Any]]:
+    """
+    Pending risk-reducing exit intents eligible for the HALT_ALL stop-loss bypass:
+    action='sell', signal_key startswith 'exit_', and not already linked to an order
+    that is filled or still open (created/submitting/submitted).
+
+    No date filter is applied on purpose: a stop-loss intent that missed its window
+    on a prior HALT_ALL day must remain eligible today rather than going stale, since
+    the whole point of the bypass is to stop a position sitting unprotected past its
+    stop indefinitely. `asof` is accepted for future use/logging only.
+    """
+    rows = conn.execute(
+        """
+        SELECT i.id AS intent_id, i.run_id, i.symbol, i.action, i.signal_key, i.reason, i.created_at
+        FROM intents i
+        LEFT JOIN orders o
+          ON o.intent_id = i.id
+         AND o.status IN ('created','submitting','submitted','filled')
+        WHERE i.action = 'sell'
+          AND o.id IS NULL
+        ORDER BY i.created_at ASC, i.id ASC;
+        """
+    ).fetchall()
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not is_risk_reducing_exit_intent(action=r["action"], signal_key=r["signal_key"]):
+            continue
+        out.append(dict(r))
+    return out

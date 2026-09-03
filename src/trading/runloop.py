@@ -11,9 +11,10 @@ from .db import connect, init_db
 from .cooldown import is_in_cooldown
 from .lock import acquire_lock as shared_acquire_lock, release_lock as shared_release_lock, read_lock_info
 from trading.policy.loader import load_latest_policy, format_policy_summary
-from trading.risk.state import seed_risk_defaults, get_effective_state
-from trading.risk.circuit_breaker import evaluate_and_apply
+from trading.risk.state import seed_risk_defaults, get_effective_state, halt_stop_loss_bypass_enabled
+from trading.risk.circuit_breaker import evaluate_and_apply, compute_peak_and_dd
 from trading.risk.daily import upsert_risk_daily
+from trading.risk.events import emit_event
 
 import logging
 
@@ -189,6 +190,125 @@ def _generate_pyramid_signals(asof: str) -> list:
     return signals
 
 
+def _run_halt_all_exit_bypass(
+    *,
+    run_id: int,
+    env: str,
+    asof: str | None,
+    summary: dict,
+    broker,
+    risk_state: dict,
+) -> RunResult:
+    """
+    Minimal, isolated path taken instead of the full skip when state==HALT_ALL and
+    TRADING_HALT_ALLOW_STOP_LOSS_EXITS is enabled. Does NOT run planning/entries/buys —
+    it only submits already-recorded risk-reducing exit intents (see
+    exits_advisor.is_risk_reducing_exit_intent), through the normal order-submission
+    code path (execute_run/persist_orders/broker.place_market_order), and records an
+    unambiguous HALT_ALL_EXIT_BYPASS audit trail for every order it actually places.
+    """
+    from .exits_advisor import find_pending_halt_bypass_intents
+    from .execution import ProposedOrder, persist_orders, execute_run, _make_idempotency_key, _today_key
+
+    with connect() as conn:
+        eligible = find_pending_halt_bypass_intents(conn, asof=asof)
+
+    bypass_summary: dict = {"eligible": len(eligible), "submitted_symbols": []}
+    summary["steps"]["halt_exit_bypass"] = bypass_summary
+
+    if not eligible:
+        finish_run(run_id, status="partial_halt_exit_bypass", asof=asof, summary=summary, reason="halt_all_exit_bypass")
+        log.warning(
+            "HALT_ALL_EXIT_BYPASS run_id=%s: flag enabled but no eligible risk-reducing exit intents pending; nothing executed",
+            run_id,
+        )
+        return RunResult(run_id=run_id, status="partial_halt_exit_bypass", asof=asof, summary=summary, reason="halt_all_exit_bypass")
+
+    day = _today_key()
+    proposed = [
+        ProposedOrder(
+            symbol=str(r["symbol"]).strip().upper(),
+            side="sell",
+            qty=1.0,
+            reason=r["reason"],
+            idempotency_key=_make_idempotency_key(str(r["symbol"]).strip().upper(), "sell", day),
+            intent_id=int(r["intent_id"]),
+        )
+        for r in eligible
+    ]
+    persist_orders(run_id=run_id, orders=proposed)
+    intent_ids = {int(r["intent_id"]) for r in eligible}
+
+    exec_out = execute_run(
+        run_id=run_id,
+        submit=True,
+        allow_buys=False,
+        allow_sells=True,
+        risk_state="HALT_ALL",
+        intent_id_allowlist=intent_ids,
+    )
+    bypass_summary["execute"] = exec_out
+
+    # Audit trail: one HALT_ALL_EXIT_BYPASS risk_event per order actually submitted.
+    try:
+        equity = float(getattr(broker.get_account(), "equity", 0.0) or 0.0)
+    except Exception:
+        equity = None
+    peak, dd = compute_peak_and_dd(env=env, equity=equity)
+
+    placeholders = ",".join("?" for _ in intent_ids)
+    with connect() as conn:
+        submitted_rows = conn.execute(
+            f"""
+            SELECT o.symbol, o.broker_order_id, i.reason AS exit_reason, i.signal_key
+            FROM orders o
+            JOIN intents i ON i.id = o.intent_id
+            WHERE o.intent_id IN ({placeholders})
+              AND o.status = 'submitted';
+            """,
+            tuple(intent_ids),
+        ).fetchall()
+
+    submitted_symbols: list[str] = []
+    for r in submitted_rows:
+        submitted_symbols.append(r["symbol"])
+        emit_event(
+            env=env,
+            event_type="HALT_ALL_EXIT_BYPASS",
+            prev_state="HALT_ALL",
+            new_state="HALT_ALL",
+            metrics={
+                "symbol": r["symbol"],
+                "signal_key": r["signal_key"],
+                "exit_reason": r["exit_reason"],
+                "broker_order_id": r["broker_order_id"],
+                "equity": equity,
+                "peak_equity": peak,
+                "drawdown_pct": dd,
+                "asof": asof,
+                "halt_reason": risk_state.get("reason") if isinstance(risk_state, dict) else None,
+            },
+            reason="halt_all_exit_bypass",
+            actor="system",
+        )
+
+    bypass_summary["submitted_symbols"] = submitted_symbols
+    finish_run(run_id, status="partial_halt_exit_bypass", asof=asof, summary=summary, reason="halt_all_exit_bypass")
+
+    if submitted_symbols:
+        log.warning(
+            "HALT_ALL_EXIT_BYPASS run_id=%s: placed %s stop-loss exit order(s) while HALT_ALL active | symbols=%s",
+            run_id, len(submitted_symbols), ",".join(submitted_symbols),
+        )
+    else:
+        log.warning(
+            "HALT_ALL_EXIT_BYPASS run_id=%s: %s eligible exit intent(s) found but none were submitted (see execute step for skip reasons)",
+            run_id, len(eligible),
+        )
+
+    return RunResult(run_id=run_id, status="partial_halt_exit_bypass", asof=asof, summary=summary, reason="halt_all_exit_bypass")
+
+
 def run_once(
     *,
     notes: str | None = None,
@@ -326,6 +446,10 @@ def run_once(
 
         risk_pre = step('risk_state_pre', lambda: get_effective_state(env))
         if risk_pre.get('state') == 'HALT_ALL' and risk_pre.get('allow_broker') == 0:
+            if halt_stop_loss_bypass_enabled():
+                return _run_halt_all_exit_bypass(
+                    run_id=run_id, env=env, asof=asof, summary=summary, broker=broker, risk_state=risk_pre,
+                )
             finish_run(run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')
             log.warning('RUN SKIPPED run_id=%s reason=HALT_ALL (broker blocked)', run_id)
             return RunResult(run_id=run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')

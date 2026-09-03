@@ -92,7 +92,7 @@ def cmd_sync_positions() -> int:
     return 0
 
 def cmd_risk_status() -> int:
-    from .risk.state import get_effective_state
+    from .risk.state import get_effective_state, halt_stop_loss_bypass_enabled
     from .risk.limits import get_limits
     from .risk.circuit_breaker import compute_peak_and_dd, explain_risk_status
     s = get_settings()
@@ -119,6 +119,12 @@ def cmd_risk_status() -> int:
     )
     if equity is not None:
         log.info("RISK equity=%.2f peak=%.2f drawdown=%.2f%%", equity, peak, dd * 100.0)
+
+    log.info(
+        "HALT_EXIT_BYPASS env=%s enabled=%s (TRADING_HALT_ALLOW_STOP_LOSS_EXITS; when on, HALT_ALL still blocks buys/new entries but lets already-recorded stop-loss/exit_* sell intents execute)",
+        env,
+        halt_stop_loss_bypass_enabled(),
+    )
 
     log.info(
         "LIMITS pause_buys=%.2f%% sell_only=%.2f%% halt_all=%.2f%% reset<=%.2f%%",
