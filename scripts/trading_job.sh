@@ -91,7 +91,10 @@ case "$JOB" in
     # IMPORTANT: sync broker truth BEFORE crash-guard + emit intents
     run "$PY" -m trading sync-orders
     run "$PY" -m trading sync-positions
-    run "$PY" -m trading sync-assets
+    # sync-assets only refreshes a metadata cache; it must never block
+    # exits/run-once below (stop-losses), so don't let it abort the job.
+    run "$PY" -m trading sync-assets || \
+      echo "[$(date '+%F %T')] sync-assets failed; continuing to exits/run-once." | tee -a "$log"
     run "$PY" -m trading exits --emit-intents
     run "$PY" -m trading run-once --execute
     ;;

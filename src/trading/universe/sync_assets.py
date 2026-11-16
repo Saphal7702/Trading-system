@@ -11,12 +11,16 @@ def sync_assets_cache() -> int:
         asset_class=AssetClass.US_EQUITY,
         status=AssetStatus.ACTIVE,
     )
-    assets = broker.client.get_all_assets(req)
+    # Deliberately bypass get_all_assets()'s pydantic Asset model: Alpaca has
+    # added exchange codes (e.g. TXSE) that older alpaca-py AssetExchange
+    # enums don't know about, which makes the typed call raise a
+    # ValidationError for the *entire* response. We only need 5 plain
+    # fields, so hit the same endpoint and take the raw JSON directly.
+    assets = broker.client.get("/assets", req.to_request_fields())
 
     n = 0
     with connect() as conn:
-        for a in assets:
-            d = a.model_dump()  # alpaca-py models
+        for d in assets:  # raw dicts from the API, not alpaca-py models
             symbol = (d.get("symbol") or "").strip().upper()
             if not symbol:
                 continue
