@@ -11,9 +11,10 @@ from .db import connect, init_db
 from .cooldown import is_in_cooldown
 from .lock import acquire_lock as shared_acquire_lock, release_lock as shared_release_lock, read_lock_info
 from trading.policy.loader import load_latest_policy, format_policy_summary
-from trading.risk.state import seed_risk_defaults, get_effective_state
-from trading.risk.circuit_breaker import evaluate_and_apply
+from trading.risk.state import seed_risk_defaults, get_effective_state, halt_stop_loss_bypass_enabled
+from trading.risk.circuit_breaker import evaluate_and_apply, compute_peak_and_dd
 from trading.risk.daily import upsert_risk_daily
+from trading.risk.events import emit_event
 
 import logging
 
@@ -107,6 +108,205 @@ def _is_weekend(yyyy_mm_dd: str) -> bool:
     # yyyy_mm_dd expected from asof resolver
     d = datetime.strptime(yyyy_mm_dd, "%Y-%m-%d").date()
     return d.weekday() >= 5  # 5=Sat, 6=Sun
+
+
+def _generate_pyramid_signals(asof: str) -> list:
+    """Generate pyramid add signals for open portfolio positions that have crossed a gain threshold."""
+    from .pyramid import load_pyramid_config, check_pyramid_add
+    from .strategy_sma import Signal
+    from .db import connect
+
+    config = load_pyramid_config()
+    if config is None:
+        return []
+
+    signals = []
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT
+                p.symbol,
+                p.entry_notional,
+                p.original_entry_price,
+                p.entry_notional_original,
+                p.pyramid_rungs_hit,
+                b.c AS last_close
+            FROM positions p
+            LEFT JOIN (
+                SELECT bd.symbol, bd.c
+                FROM bars_daily bd
+                JOIN (
+                    SELECT UPPER(symbol) AS symbol, MAX(t) AS tmax
+                    FROM bars_daily
+                    WHERE t <= ?
+                    GROUP BY UPPER(symbol)
+                ) mx ON UPPER(bd.symbol) = mx.symbol AND bd.t = mx.tmax
+            ) b ON UPPER(b.symbol) = UPPER(p.symbol)
+            WHERE p.qty > 0.000001
+              AND p.entry_signal_key LIKE 'portfolio_%'
+              AND p.entry_signal_key NOT LIKE 'portfolio_pyramid_add_%';
+        """, (asof,)).fetchall()
+
+    for r in rows:
+        sym = str(r["symbol"] or "").upper().strip()
+        if not sym:
+            continue
+        orig_ep = r["original_entry_price"]
+        orig_notional = r["entry_notional_original"]
+        curr_notional = r["entry_notional"]
+        last_close = r["last_close"]
+
+        if orig_ep is None or orig_notional is None or curr_notional is None or last_close is None:
+            continue
+
+        try:
+            orig_ep_f = float(orig_ep)
+            orig_notional_f = float(orig_notional)
+            curr_notional_f = float(curr_notional)
+            last_close_f = float(last_close)
+        except (TypeError, ValueError):
+            continue
+
+        try:
+            rungs_hit: set[int] = set(json.loads(r["pyramid_rungs_hit"] or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            rungs_hit = set()
+
+        result = check_pyramid_add(
+            original_entry_price=orig_ep_f,
+            entry_notional_original=orig_notional_f,
+            current_notional=curr_notional_f,
+            current_price=last_close_f,
+            rungs_hit=rungs_hit,
+            config=config,
+        )
+        if result is None:
+            continue
+
+        rung_idx, add_notional = result
+        reason = f"PYRAMID:rung={rung_idx}:add_notional={add_notional:.2f}"
+        signals.append(Signal(sym, "buy", reason, strength=1.0))
+        log.debug("PYRAMID signal: %s rung=%d add=$%.2f", sym, rung_idx, add_notional)
+
+    return signals
+
+
+def _run_halt_all_exit_bypass(
+    *,
+    run_id: int,
+    env: str,
+    asof: str | None,
+    summary: dict,
+    broker,
+    risk_state: dict,
+) -> RunResult:
+    """
+    Minimal, isolated path taken instead of the full skip when state==HALT_ALL and
+    TRADING_HALT_ALLOW_STOP_LOSS_EXITS is enabled. Does NOT run planning/entries/buys —
+    it only submits already-recorded risk-reducing exit intents (see
+    exits_advisor.is_risk_reducing_exit_intent), through the normal order-submission
+    code path (execute_run/persist_orders/broker.place_market_order), and records an
+    unambiguous HALT_ALL_EXIT_BYPASS audit trail for every order it actually places.
+    """
+    from .exits_advisor import find_pending_halt_bypass_intents
+    from .execution import ProposedOrder, persist_orders, execute_run, _make_idempotency_key, _today_key
+
+    with connect() as conn:
+        eligible = find_pending_halt_bypass_intents(conn, asof=asof)
+
+    bypass_summary: dict = {"eligible": len(eligible), "submitted_symbols": []}
+    summary["steps"]["halt_exit_bypass"] = bypass_summary
+
+    if not eligible:
+        finish_run(run_id, status="partial_halt_exit_bypass", asof=asof, summary=summary, reason="halt_all_exit_bypass")
+        log.warning(
+            "HALT_ALL_EXIT_BYPASS run_id=%s: flag enabled but no eligible risk-reducing exit intents pending; nothing executed",
+            run_id,
+        )
+        return RunResult(run_id=run_id, status="partial_halt_exit_bypass", asof=asof, summary=summary, reason="halt_all_exit_bypass")
+
+    day = _today_key()
+    proposed = [
+        ProposedOrder(
+            symbol=str(r["symbol"]).strip().upper(),
+            side="sell",
+            qty=1.0,
+            reason=r["reason"],
+            idempotency_key=_make_idempotency_key(str(r["symbol"]).strip().upper(), "sell", day),
+            intent_id=int(r["intent_id"]),
+        )
+        for r in eligible
+    ]
+    persist_orders(run_id=run_id, orders=proposed)
+    intent_ids = {int(r["intent_id"]) for r in eligible}
+
+    exec_out = execute_run(
+        run_id=run_id,
+        submit=True,
+        allow_buys=False,
+        allow_sells=True,
+        risk_state="HALT_ALL",
+        intent_id_allowlist=intent_ids,
+    )
+    bypass_summary["execute"] = exec_out
+
+    # Audit trail: one HALT_ALL_EXIT_BYPASS risk_event per order actually submitted.
+    try:
+        equity = float(getattr(broker.get_account(), "equity", 0.0) or 0.0)
+    except Exception:
+        equity = None
+    peak, dd = compute_peak_and_dd(env=env, equity=equity)
+
+    placeholders = ",".join("?" for _ in intent_ids)
+    with connect() as conn:
+        submitted_rows = conn.execute(
+            f"""
+            SELECT o.symbol, o.broker_order_id, i.reason AS exit_reason, i.signal_key
+            FROM orders o
+            JOIN intents i ON i.id = o.intent_id
+            WHERE o.intent_id IN ({placeholders})
+              AND o.status = 'submitted';
+            """,
+            tuple(intent_ids),
+        ).fetchall()
+
+    submitted_symbols: list[str] = []
+    for r in submitted_rows:
+        submitted_symbols.append(r["symbol"])
+        emit_event(
+            env=env,
+            event_type="HALT_ALL_EXIT_BYPASS",
+            prev_state="HALT_ALL",
+            new_state="HALT_ALL",
+            metrics={
+                "symbol": r["symbol"],
+                "signal_key": r["signal_key"],
+                "exit_reason": r["exit_reason"],
+                "broker_order_id": r["broker_order_id"],
+                "equity": equity,
+                "peak_equity": peak,
+                "drawdown_pct": dd,
+                "asof": asof,
+                "halt_reason": risk_state.get("reason") if isinstance(risk_state, dict) else None,
+            },
+            reason="halt_all_exit_bypass",
+            actor="system",
+        )
+
+    bypass_summary["submitted_symbols"] = submitted_symbols
+    finish_run(run_id, status="partial_halt_exit_bypass", asof=asof, summary=summary, reason="halt_all_exit_bypass")
+
+    if submitted_symbols:
+        log.warning(
+            "HALT_ALL_EXIT_BYPASS run_id=%s: placed %s stop-loss exit order(s) while HALT_ALL active | symbols=%s",
+            run_id, len(submitted_symbols), ",".join(submitted_symbols),
+        )
+    else:
+        log.warning(
+            "HALT_ALL_EXIT_BYPASS run_id=%s: %s eligible exit intent(s) found but none were submitted (see execute step for skip reasons)",
+            run_id, len(eligible),
+        )
+
+    return RunResult(run_id=run_id, status="partial_halt_exit_bypass", asof=asof, summary=summary, reason="halt_all_exit_bypass")
 
 
 def run_once(
@@ -246,6 +446,10 @@ def run_once(
 
         risk_pre = step('risk_state_pre', lambda: get_effective_state(env))
         if risk_pre.get('state') == 'HALT_ALL' and risk_pre.get('allow_broker') == 0:
+            if halt_stop_loss_bypass_enabled():
+                return _run_halt_all_exit_bypass(
+                    run_id=run_id, env=env, asof=asof, summary=summary, broker=broker, risk_state=risk_pre,
+                )
             finish_run(run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')
             log.warning('RUN SKIPPED run_id=%s reason=HALT_ALL (broker blocked)', run_id)
             return RunResult(run_id=run_id, status='skipped', asof=asof, summary=summary, reason='halt_all')
@@ -340,13 +544,22 @@ def run_once(
         from .regime import detect_regime
 
         def _plan():
-            #entry_mode = os.getenv("TRADING_ENTRY_MODE", "sma").strip().lower()
-            # options: sma | mrit | both
             regime = detect_regime(asof)
-            
+
+            mode = os.getenv("TRADING_STRATEGY_MODE", "swing").strip().lower()
+            if mode not in ("swing", "portfolio"):
+                log.warning("Unknown TRADING_STRATEGY_MODE=%s, defaulting to swing", mode)
+                mode = "swing"
+
             signals = []
-            signals += generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof, regime=regime)
-            signals += generate_signals_mrit(universe=universe, asof=asof, regime=regime)
+            if mode == "swing":
+                signals += generate_signals_sma(fast=fast, slow=slow, universe=universe, asof=asof, regime=regime)
+                signals += generate_signals_mrit(universe=universe, asof=asof, regime=regime)
+            elif mode == "portfolio":
+                from .strategy_portfolio import generate_signals_portfolio
+                signals += generate_signals_portfolio(universe=universe, asof=asof, regime=regime)
+
+            log.info("STRATEGY MODE: %s | signals=%d", mode, len(signals))
             # de-dup symbols so that it don't double-buy same ticker
             seen = set()
             deduped = []
@@ -358,6 +571,13 @@ def run_once(
                     seen.add(s.symbol)
                 deduped.append(s)
             signals = deduped
+
+            # Pyramid adds injected AFTER de-dup (they target already-held symbols)
+            if mode == "portfolio":
+                pyramid_sigs = _generate_pyramid_signals(asof)
+                if pyramid_sigs:
+                    log.info("PYRAMID: injecting %d add signal(s)", len(pyramid_sigs))
+                signals += pyramid_sigs
 
             intents = plan_intents(
                 signals,
@@ -466,6 +686,59 @@ def run_once(
             }
 
         step("lots_apply", _apply_lots)
+
+        # 7.55) Pyramid: persist rung state for filled adds
+        def _update_pyramid_rungs():
+            from .pyramid import is_pyramid_enabled
+            if not is_pyramid_enabled():
+                return {"skipped": True, "reason": "pyramid_disabled"}
+
+            with connect() as conn:
+                rows = conn.execute("""
+                    SELECT i.symbol, i.signal_key
+                    FROM intents i
+                    JOIN orders o ON o.intent_id = i.id
+                    WHERE i.run_id = ?
+                      AND i.signal_key LIKE 'portfolio_pyramid_add_rung%'
+                      AND o.filled_qty > 0;
+                """, (run_id,)).fetchall()
+
+                updated = 0
+                for r in rows:
+                    sym = str(r["symbol"] or "").upper().strip()
+                    sk = str(r["signal_key"] or "")
+                    try:
+                        rung_idx = int(sk[len("portfolio_pyramid_add_rung"):])
+                    except (ValueError, IndexError):
+                        continue
+
+                    pos_row = conn.execute(
+                        "SELECT pyramid_rungs_hit FROM positions WHERE symbol = ?",
+                        (sym,),
+                    ).fetchone()
+                    if not pos_row:
+                        continue
+
+                    try:
+                        rungs: set[int] = set(json.loads(pos_row["pyramid_rungs_hit"] or "[]"))
+                    except (json.JSONDecodeError, TypeError):
+                        rungs = set()
+
+                    rungs.add(rung_idx)
+                    conn.execute(
+                        """
+                        UPDATE positions
+                        SET pyramid_rungs_hit = ?,
+                            pyramid_last_check_at = datetime('now')
+                        WHERE symbol = ?;
+                        """,
+                        (json.dumps(sorted(rungs)), sym),
+                    )
+                    updated += 1
+
+            return {"updated": updated}
+
+        step("pyramid_rungs_update", _update_pyramid_rungs)
 
         # 7.6) Phase 3: Daily account snapshot (equity curve)
                 # 7.6) Phase 3: Daily account snapshot (equity curve)

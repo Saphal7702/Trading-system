@@ -7,6 +7,7 @@ def apply_schema(conn: sqlite3.Connection) -> None:
     _migrate_runs_regime_cols(conn)
     _migrate_symbol_exclusions(conn)
     _migrate_universe_membership_source(conn)
+    _migrate_positions_pyramid_cols(conn)
 
 
 def _migrate_runs_regime_cols(conn: sqlite3.Connection) -> None:
@@ -38,6 +39,27 @@ def _migrate_symbol_exclusions(conn: sqlite3.Connection) -> None:
         ON symbol_exclusions(symbol)
         WHERE reinstated_at IS NULL;
     """)
+    # Additive migration: strategy_scope column (scopes exclusions by strategy)
+    existing = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(symbol_exclusions);"
+    ).fetchall()}
+    if "strategy_scope" not in existing:
+        conn.execute(
+            "ALTER TABLE symbol_exclusions ADD COLUMN strategy_scope TEXT "
+            "NOT NULL DEFAULT 'all';"
+        )
+        # Backfill: MRIT-derived reason codes → 'mrit'; data_anomaly stays 'all'
+        conn.execute(
+            "UPDATE symbol_exclusions "
+            "SET strategy_scope = 'mrit' "
+            "WHERE reason_code IN "
+            "  ('chronic_loser', 'gap_risk', 'earnings_risk', 'sp500_removal', 'manual') "
+            "AND strategy_scope = 'all';"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_symbol_exclusions_scope "
+        "ON symbol_exclusions(strategy_scope) WHERE reinstated_at IS NULL;"
+    )
 
 
 def _migrate_universe_membership_source(conn: sqlite3.Connection) -> None:
@@ -46,3 +68,31 @@ def _migrate_universe_membership_source(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE universe_membership ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';"
         )
+
+
+def _migrate_positions_pyramid_cols(conn: sqlite3.Connection) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(positions);").fetchall()}
+    for col, defn in [
+        ("original_entry_price",    "REAL"),
+        ("entry_notional_original", "REAL"),
+        ("pyramid_rungs_hit",       "TEXT NOT NULL DEFAULT '[]'"),
+        ("pyramid_last_check_at",   "TEXT"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {defn};")
+
+    # Backfill: freeze original prices for existing open positions
+    conn.execute("""
+        UPDATE positions
+        SET original_entry_price = avg_entry_price
+        WHERE qty > 0
+          AND original_entry_price IS NULL
+          AND avg_entry_price IS NOT NULL;
+    """)
+    conn.execute("""
+        UPDATE positions
+        SET entry_notional_original = entry_notional
+        WHERE qty > 0
+          AND entry_notional_original IS NULL
+          AND entry_notional IS NOT NULL;
+    """)

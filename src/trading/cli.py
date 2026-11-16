@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import re
 from .logging_setup import setup_logging
 from .config import get_settings
@@ -91,7 +92,7 @@ def cmd_sync_positions() -> int:
     return 0
 
 def cmd_risk_status() -> int:
-    from .risk.state import get_effective_state
+    from .risk.state import get_effective_state, halt_stop_loss_bypass_enabled
     from .risk.limits import get_limits
     from .risk.circuit_breaker import compute_peak_and_dd, explain_risk_status
     s = get_settings()
@@ -118,6 +119,12 @@ def cmd_risk_status() -> int:
     )
     if equity is not None:
         log.info("RISK equity=%.2f peak=%.2f drawdown=%.2f%%", equity, peak, dd * 100.0)
+
+    log.info(
+        "HALT_EXIT_BYPASS env=%s enabled=%s (TRADING_HALT_ALLOW_STOP_LOSS_EXITS; when on, HALT_ALL still blocks buys/new entries but lets already-recorded stop-loss/exit_* sell intents execute)",
+        env,
+        halt_stop_loss_bypass_enabled(),
+    )
 
     log.info(
         "LIMITS pause_buys=%.2f%% sell_only=%.2f%% halt_all=%.2f%% reset<=%.2f%%",
@@ -533,6 +540,99 @@ def cmd_lots_rebuild() -> int:
     return 0
 
 
+def cmd_show_pyramid_state(asof: str | None) -> int:
+    from .db import connect
+    from .pyramid import load_pyramid_config, is_pyramid_enabled
+    import json
+
+    config = load_pyramid_config()
+    enabled = is_pyramid_enabled()
+
+    log.info(
+        "PYRAMID enabled=%s ladder=%s sizes=%s max_mult=%s",
+        enabled,
+        getattr(config, "ladder", None),
+        getattr(config, "sizes", None),
+        getattr(config, "max_mult", None),
+    )
+
+    if not enabled:
+        log.info("Pyramiding is OFF. Set TRADING_PORTFOLIO_PYRAMID_ENABLED=1 to enable.")
+        return 0
+
+    with connect() as conn:
+        asof_eff = asof
+        if asof_eff is None:
+            r = conn.execute("SELECT MAX(t) AS t FROM bars_daily;").fetchone()
+            asof_eff = r["t"] if r and r["t"] else None
+
+        rows = conn.execute("""
+            SELECT
+                p.symbol,
+                p.entry_signal_key,
+                p.original_entry_price,
+                p.entry_notional,
+                p.entry_notional_original,
+                p.pyramid_rungs_hit,
+                p.pyramid_last_check_at,
+                b.c AS last_close
+            FROM positions p
+            LEFT JOIN (
+                SELECT UPPER(symbol) AS symbol, c
+                FROM bars_daily
+                WHERE t = ?
+            ) b ON b.symbol = UPPER(p.symbol)
+            WHERE p.qty > 0
+              AND p.entry_signal_key LIKE 'portfolio_%'
+              AND p.entry_signal_key NOT LIKE 'portfolio_pyramid_add_%'
+            ORDER BY p.symbol;
+        """, (asof_eff,)).fetchall()
+
+    if not rows:
+        log.info("No portfolio positions found.")
+        return 0
+
+    log.info("PYRAMID STATE asof=%s positions=%d", asof_eff, len(rows))
+    for r in rows:
+        sym = str(r["symbol"] or "").upper()
+        orig_ep = r["original_entry_price"]
+        last_c = r["last_close"]
+        orig_notional = r["entry_notional_original"]
+        curr_notional = r["entry_notional"]
+
+        try:
+            rungs_hit: list[int] = json.loads(r["pyramid_rungs_hit"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            rungs_hit = []
+
+        gain_str = "?"
+        if orig_ep is not None and last_c is not None and float(orig_ep) > 0:
+            gain_pct = (float(last_c) / float(orig_ep) - 1.0) * 100.0
+            gain_str = f"{gain_pct:+.1f}%"
+
+        next_rung = "none"
+        if config is not None:
+            for i, threshold in enumerate(config.ladder):
+                if i not in rungs_hit:
+                    next_rung = f"rung{i}@{threshold:.0f}%"
+                    break
+
+        log.info(
+            "  %s gain=%s orig_ep=%.2f curr_notional=%.2f orig_notional=%.2f "
+            "rungs_hit=%s next=%s last_check=%s",
+            sym,
+            gain_str,
+            float(orig_ep) if orig_ep else 0.0,
+            float(curr_notional) if curr_notional else 0.0,
+            float(orig_notional) if orig_notional else 0.0,
+            rungs_hit,
+            next_rung,
+            r["pyramid_last_check_at"] or "never",
+        )
+
+    return 0
+
+
 def cmd_positions(asof: str | None) -> int:
     from .db import connect
     from .asof import resolve_asof_date
@@ -668,9 +768,10 @@ def cmd_exclude_symbol(args) -> int:
         reason_note=args.note,
         excluded_by="operator",
         review_after=args.review_after,
+        strategy_scope=args.scope,
     )
     status = "Added" if added else "Already excluded (note updated)"
-    print(f"{status}: {args.symbol.upper()} [{args.reason}]")
+    print(f"{status}: {args.symbol.upper()} [{args.reason}] scope={args.scope}")
     if args.note:
         print(f"  Note: {args.note}")
     if args.review_after:
@@ -696,18 +797,21 @@ def cmd_show_exclusions(args) -> int:
         reason_code=args.reason,
         include_reinstated=args.all,
         review_due=args.review_due,
+        strategy_scope=getattr(args, "scope", None),
+        strategy=getattr(args, "strategy", None),
     )
     if not rows:
         print("No exclusions found matching criteria.")
         return 0
-    print(f"\n{'Symbol':<8} {'Code':<16} {'Excluded':>12} {'Review':>12}  Note")
-    print("-" * 75)
+    print(f"\n{'Symbol':<8} {'Code':<16} {'Scope':<12} {'Excluded':>12} {'Review':>12}  Note")
+    print("-" * 88)
     for r in rows:
         status = "" if r["reinstated_at"] is None else " [REINSTATED]"
         review = r["review_after"] or "-"
         note = (r["reason_note"] or "")[:40]
+        scope = r.get("strategy_scope") or "all"
         print(
-            f"{r['symbol']:<8} {r['reason_code']:<16} "
+            f"{r['symbol']:<8} {r['reason_code']:<16} {scope:<12} "
             f"{r['excluded_at'][:10]:>12} {review:>12}  {note}{status}"
         )
     print(f"\nTotal: {len(rows)}")
@@ -2069,6 +2173,15 @@ def main() -> int:
         "--review-after", default=None, metavar="YYYY-MM-DD",
         help="Optional date to re-evaluate this exclusion",
     )
+    p_excl.add_argument(
+        "--scope", default="all",
+        choices=["all", "swing", "mrit", "portfolio"],
+        help=(
+            "Strategy scope for this exclusion (default: all). "
+            "'all'=every strategy, 'swing'=SMA+MRIT, 'mrit'=MRIT only, "
+            "'portfolio'=portfolio only. data_anomaly always uses 'all'."
+        ),
+    )
 
     # reinstate-symbol — mark a previously excluded symbol as active again
     p_rein = sub.add_parser(
@@ -2096,6 +2209,19 @@ def main() -> int:
     p_sex.add_argument(
         "--review-due", action="store_true", default=False,
         help="Only show symbols whose review_after date has passed",
+    )
+    p_sex.add_argument(
+        "--scope", default=None,
+        choices=["all", "swing", "mrit", "portfolio"],
+        help="Filter by exact strategy_scope value stored in the row",
+    )
+    p_sex.add_argument(
+        "--strategy", default=None,
+        choices=["mrit", "sma", "portfolio", "all"],
+        help=(
+            "Show exclusions that apply to this strategy (uses scope resolution). "
+            "mrit→all+swing+mrit, sma→all+swing, portfolio→all+portfolio"
+        ),
     )
 
     # build-custom-universe (Phase 1: structural-fit screen for MRIT/SMA)
@@ -2253,6 +2379,9 @@ def main() -> int:
     p_e.add_argument("--limit", type=int, default=20)
 
     sub.add_parser("lots-rebuild", help="Rebuild FIFO lots + closings from executions (Phase 3)")
+    p_pyr = sub.add_parser("show-pyramid-state", help="Show pyramid state for open portfolio positions")
+    p_pyr.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD). Default: latest bars_daily date")
+
     p_pos = sub.add_parser("positions", help="Show open positions (lots-based) + unrealized P&L")
     p_pos.add_argument("--asof", required=False, help="Asof date (YYYY-MM-DD). Default: resolve_asof_date()")
 
@@ -2417,7 +2546,8 @@ def main() -> int:
     p_seed.add_argument("--reason", default="manual test")
 
     p_bt = sub.add_parser("backtest", help="Backtest a strategy on historical data (no live orders).")
-    p_bt.add_argument("--strategy", default="both", choices=["sma", "mrit", "both"], help="Strategy to backtest (default: both; regime gates which signals fire each day)")
+    p_bt.add_argument("--strategy", default="both", choices=["sma", "mrit", "both", "portfolio"],
+                    help="Strategy to backtest (default: both for swing modes; use 'portfolio' for portfolio mode in isolation)")
     p_bt.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
     p_bt.add_argument("--end", required=True, help="End date YYYY-MM-DD")
     p_bt.add_argument("--universe", default="sp500", help="Universe name (default: sp500)")
@@ -2461,6 +2591,19 @@ def main() -> int:
                     help="Compound position sizing: size each trade as a fixed %% of current equity (default: False = fixed notional)")
     p_bt.add_argument("--atr-stop-cooldown-days", type=int, default=0,
                     help="Days to block re-entry after an ATR stop loss exit (default: 0 = disabled; recommended: 20-30)")
+    # PORTFOLIO profile args (most useful knobs; use --simulate-live to pull the rest from .env)
+    p_bt.add_argument("--portfolio-stop-loss-pct", type=float, default=15.0,
+                    help="Portfolio hard stop loss %% (default: 15.0)")
+    p_bt.add_argument("--portfolio-trail-peak-pct", type=float, default=20.0,
+                    help="Portfolio trailing stop activation peak gain %% (default: 20.0)")
+    p_bt.add_argument("--portfolio-trail-dd-pct", type=float, default=10.0,
+                    help="Portfolio trailing stop drawdown-from-peak %% (default: 10.0)")
+    p_bt.add_argument("--portfolio-time-stop-days", type=int, default=60,
+                    help="Portfolio time-stop days (default: 60)")
+    p_bt.add_argument("--pyramid", action="store_true", default=False,
+                    help="Enable pyramiding for portfolio mode: add to winners at gain thresholds (default off)")
+    p_bt.add_argument("--portfolio-stop-dollar-pct", type=float, default=0.0,
+                    help="Portfolio-level dollar stop %% of equity (default: 0 = disabled; e.g. 1.5 = exit when loss > 1.5%% of portfolio)")
 
     p_btfb = sub.add_parser(
         "backtest-fetch-bars",
@@ -2551,6 +2694,8 @@ def main() -> int:
     if args.cmd == "backtest":
         from .backtest.engine import run_backtest
         from .backtest.report import print_report
+        if getattr(args, "pyramid", False):
+            os.environ["TRADING_PORTFOLIO_PYRAMID_ENABLED"] = "1"
         log.info(
             "BACKTEST starting strategy=%s start=%s end=%s universe=%s capital=%.2f",
             args.strategy, args.start, args.end, args.universe, args.initial_capital,
@@ -2582,6 +2727,11 @@ def main() -> int:
             simulate_live=args.simulate_live,
             compound=args.compound,
             atr_stop_cooldown_days=args.atr_stop_cooldown_days,
+            portfolio_stop_loss_pct=args.portfolio_stop_loss_pct,
+            portfolio_trail_activate_pct=args.portfolio_trail_peak_pct,
+            portfolio_trail_dd_pct=args.portfolio_trail_dd_pct,
+            portfolio_time_stop_days=args.portfolio_time_stop_days,
+            portfolio_stop_dollar_pct=args.portfolio_stop_dollar_pct,
         )
         print_report(summary, strategy=args.strategy, start=args.start, end=args.end)
         return 0
@@ -2642,6 +2792,9 @@ def main() -> int:
     
     if args.cmd == "lots-rebuild":
         return cmd_lots_rebuild()
+
+    if args.cmd == "show-pyramid-state":
+        return cmd_show_pyramid_state(getattr(args, "asof", None))
 
     if args.cmd == "positions":
         return cmd_positions(args.asof)

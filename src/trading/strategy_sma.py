@@ -64,7 +64,7 @@ def generate_signals_sma(
     syms = [r["symbol"] for r in rows]
 
     from .exclusions import get_active_exclusions
-    excluded = get_active_exclusions()
+    excluded = get_active_exclusions("sma")
     if excluded:
         before = len(syms)
         syms = [s for s in syms if s not in excluded]

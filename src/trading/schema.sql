@@ -13,7 +13,11 @@ CREATE TABLE IF NOT EXISTS positions (
   opened_at TEXT NOT NULL,
   last_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   entry_signal_key TEXT,
-  entry_notional REAL
+  entry_notional REAL,
+  original_entry_price REAL,
+  entry_notional_original REAL,
+  pyramid_rungs_hit TEXT NOT NULL DEFAULT '[]',
+  pyramid_last_check_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -308,7 +312,12 @@ CREATE TABLE IF NOT EXISTS symbol_exclusions (
   excluded_at      TEXT NOT NULL DEFAULT (datetime('now')),
   review_after     TEXT,        -- YYYY-MM-DD: re-evaluate after this date (nullable)
   reinstated_at    TEXT,        -- set when reinstated, NULL = currently excluded
-  reinstated_note  TEXT
+  reinstated_note  TEXT,
+  strategy_scope   TEXT NOT NULL DEFAULT 'all'
+  -- 'all' = applies to every strategy
+  -- 'swing' = SMA crossover + MRIT (both swing strategies)
+  -- 'mrit' = MRIT pullback only
+  -- 'portfolio' = momentum/trend portfolio only
 );
 
 CREATE INDEX IF NOT EXISTS ix_symbol_exclusions_active

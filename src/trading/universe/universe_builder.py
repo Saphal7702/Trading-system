@@ -558,12 +558,14 @@ def audit_existing_universe(cfg: BuilderConfig) -> dict:
 
     with connect() as conn:
         for sym, code, note in exclusion_queue:
+            scope = "all" if code == "data_anomaly" else "mrit"
             conn.execute(
                 """INSERT INTO symbol_exclusions
-                   (symbol, reason_code, reason_note, excluded_by, excluded_at)
-                   VALUES (?, ?, ?, 'system', datetime('now'))
+                   (symbol, reason_code, reason_note, excluded_by, excluded_at,
+                    strategy_scope)
+                   VALUES (?, ?, ?, 'system', datetime('now'), ?)
                    ON CONFLICT(symbol) DO NOTHING""",
-                (sym, code, note),
+                (sym, code, note, scope),
             )
         if cfg.remove_from_universe and exclusion_queue:
             syms_to_remove = [s for s, _, _ in exclusion_queue]

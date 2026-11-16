@@ -239,11 +239,27 @@ DROP TABLE IF EXISTS symbol_exclusions;
 # import both tables into target
 sqlite3 "$TARGET_DB" < /tmp/universe_tables.sql
 
-# verify
+# verify row counts
 sqlite3 "$TARGET_DB" "
 SELECT 'universe_membership' AS table_name, COUNT(*) FROM universe_membership
 UNION ALL
 SELECT 'symbol_exclusions' AS table_name, COUNT(*) FROM symbol_exclusions;
+"
+
+# verify strategy_scope backfill (should show 'all'=data_anomaly rows, 'mrit'=chronic_loser+others)
+sqlite3 "$TARGET_DB" "
+SELECT reason_code, strategy_scope, COUNT(*) AS cnt
+FROM symbol_exclusions
+WHERE reinstated_at IS NULL
+GROUP BY reason_code, strategy_scope
+ORDER BY strategy_scope, reason_code;
+"
+
+# confirm no data_anomaly rows ended up with non-'all' scope (should return 0 rows)
+sqlite3 "$TARGET_DB" "
+SELECT symbol, reason_code, strategy_scope
+FROM symbol_exclusions
+WHERE reason_code = 'data_anomaly' AND strategy_scope != 'all';
 "
 /********************************************************************************* Back Testing ****************************************************************************************************************/
 

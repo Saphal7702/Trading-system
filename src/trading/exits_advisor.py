@@ -138,6 +138,11 @@ class ExitRuleConfig:
     break_even_peak_gain_pct: float = 10.0
     break_even_floor_ret_pct: float = 2.0
 
+    # Portfolio-level dollar stop (PORTFOLIO profile only; 0 = disabled).
+    # Fires when abs(unrealized_pnl) / portfolio_equity * 100 >= this value.
+    # Read from TRADING_EXIT_PROFILE_PORTFOLIO_PORTFOLIO_STOP_PCT.
+    portfolio_stop_dollar_pct: float = 0.0
+
 
 _ENV_PREFIX = "TRADING_EXIT_"
 
@@ -201,7 +206,7 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
 
     -- Broker-synced truth: what is actually open right now
     open_positions AS (
-      SELECT UPPER(symbol) AS symbol, qty
+      SELECT UPPER(symbol) AS symbol, qty, original_entry_price
       FROM positions
       WHERE qty > 0.000001
     ),
@@ -237,9 +242,11 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
         c.qty_open,
         c.cost_basis,
         c.first_entry_at,
-        s.entry_signal_key
+        s.entry_signal_key,
+        op.original_entry_price
       FROM open_pos_core c
       LEFT JOIN entry_sig s ON s.symbol = c.symbol
+      LEFT JOIN open_positions op ON op.symbol = c.symbol
     ),
 
     last_close AS (
@@ -279,7 +286,8 @@ def _fetch_open_position_metrics(conn, asof: str | None) -> list[dict[str, Any]]
       (100.0 * (lc.last_close - ps.peak_close) / NULLIF(ps.peak_close,0)) AS drawdown_from_peak_pct,
       (100.0 * (ps.peak_close - (op.cost_basis / NULLIF(op.qty_open,0))) / NULLIF((op.cost_basis / NULLIF(op.qty_open,0)),0)) AS peak_gain_pct,
       op.first_entry_at AS first_entry_at,
-      op.entry_signal_key AS entry_signal_key
+      op.entry_signal_key AS entry_signal_key,
+      op.original_entry_price AS original_entry_price
     FROM open_pos op
     JOIN last_close lc ON lc.symbol = op.symbol
     JOIN peak_since_entry ps ON ps.symbol = op.symbol
@@ -394,6 +402,8 @@ def _rule_priority(signal_key: str) -> int:
     """
     if signal_key.startswith("exit_stop_loss"):
         return 100
+    if signal_key.startswith("exit_portfolio_stop"):
+        return 95
     if signal_key.startswith("exit_trailing"):
         return 90
     if signal_key.startswith("exit_break_even_floor"):
@@ -416,6 +426,8 @@ def _exit_profile_name(entry_signal_key: str) -> str:
     k = (entry_signal_key or "").lower()
     if k.startswith("mrit_"):
         return "MRIT"
+    if k.startswith("portfolio_"):
+        return "PORTFOLIO"
     return "DEFAULT"
 
 
@@ -449,6 +461,7 @@ def _apply_profile_overrides(base: ExitRuleConfig, profile: str) -> ExitRuleConf
     time_min = env_float_opt(pfx + "TIME_STOP_MIN_RET_PCT")
 
     enable_sma = env_bool_opt(pfx + "ENABLE_SMA_REVERSAL")
+    port_stop = env_float_opt(pfx + "PORTFOLIO_STOP_PCT")
 
     return ExitRuleConfig(
         stop_loss_pct=stop_loss if stop_loss is not None else base.stop_loss_pct,
@@ -462,7 +475,21 @@ def _apply_profile_overrides(base: ExitRuleConfig, profile: str) -> ExitRuleConf
         time_stop_days=time_days if time_days is not None else base.time_stop_days,
         time_stop_min_ret_pct=time_min if time_min is not None else base.time_stop_min_ret_pct,
         enable_sma_reversal=enable_sma if enable_sma is not None else base.enable_sma_reversal,
+        portfolio_stop_dollar_pct=port_stop if port_stop is not None else base.portfolio_stop_dollar_pct,
     )
+
+
+def _fetch_portfolio_equity(conn) -> float | None:
+    """Fetch current portfolio equity from the broker_accounts cache (latest row)."""
+    try:
+        r = conn.execute(
+            "SELECT equity FROM broker_accounts ORDER BY last_synced_at DESC LIMIT 1;"
+        ).fetchone()
+        if not r or r["equity"] is None:
+            return None
+        return float(r["equity"])
+    except Exception:
+        return None
 
 
 def evaluate_exit_advice(
@@ -483,6 +510,10 @@ def evaluate_exit_advice(
         asof_eff = asof or _resolve_asof_date(conn)
         metrics = _fetch_open_position_metrics(conn, asof)
 
+        # Lazy-loaded portfolio equity (fetched once if any PORTFOLIO position exists).
+        _portfolio_equity: float | None = None
+        _portfolio_equity_fetched: bool = False
+
         advice: list[dict[str, Any]] = []
         for m in metrics:
             symbol = str(m["symbol"]).upper()
@@ -491,6 +522,22 @@ def evaluate_exit_advice(
             peak_gain = float(m["peak_gain_pct"]) if m["peak_gain_pct"] is not None else 0.0
             dd = float(m["drawdown_from_peak_pct"]) if m["drawdown_from_peak_pct"] is not None else 0.0
             entry_signal_key = str(m.get("entry_signal_key") or "unknown")
+
+            # For portfolio pyramid positions, anchor ret/peak_gain to original_entry_price
+            # so exit rules fire relative to the first-fill price, not the blended avg.
+            orig_ep = m.get("original_entry_price")
+            if (
+                orig_ep is not None
+                and float(orig_ep) > 0
+                and entry_signal_key.startswith("portfolio_")
+            ):
+                last_c = float(m["last_close"]) if m.get("last_close") is not None else None
+                peak_c = float(m["peak_close"]) if m.get("peak_close") is not None else None
+                orig_f = float(orig_ep)
+                if last_c is not None:
+                    ret = (last_c / orig_f - 1.0) * 100.0
+                if peak_c is not None:
+                    peak_gain = (peak_c / orig_f - 1.0) * 100.0
 
             profile = _exit_profile_name(entry_signal_key)
             cfg_eff = _apply_profile_overrides(cfg, profile)
@@ -544,6 +591,30 @@ def evaluate_exit_advice(
                         f"[{profile}][ATR] Take: last={last_close:.2f} >= tp={tp_px:.2f} "
                         f"(entry={vwap_entry:.2f} atr={atr:.2f} period={atr_period})"
                     )
+
+            # 0.5) Portfolio-level dollar stop (PORTFOLIO profile only)
+            # Fires when the position's unrealized dollar loss exceeds
+            # portfolio_stop_dollar_pct % of total portfolio equity.
+            if (
+                action == "HOLD"
+                and profile == "PORTFOLIO"
+                and cfg_eff.portfolio_stop_dollar_pct > 0
+            ):
+                pnl = float(m["unrealized_pnl"]) if m.get("unrealized_pnl") is not None else None
+                if pnl is not None and pnl < 0:
+                    if not _portfolio_equity_fetched:
+                        _portfolio_equity = _fetch_portfolio_equity(conn)
+                        _portfolio_equity_fetched = True
+                    if _portfolio_equity is not None and _portfolio_equity > 0:
+                        loss_pct_of_port = abs(pnl) / _portfolio_equity * 100.0
+                        if loss_pct_of_port >= cfg_eff.portfolio_stop_dollar_pct:
+                            exit_signal = "exit_portfolio_stop_dollar"
+                            action = "SELL"
+                            rationale = (
+                                f"Portfolio-level stop: loss=${abs(pnl):.2f} = "
+                                f"{loss_pct_of_port:.2f}% of equity(${_portfolio_equity:.2f}) "
+                                f">= {cfg_eff.portfolio_stop_dollar_pct:.2f}%"
+                            )
 
             # 1) Hard stop loss
             if action == "HOLD" and ret <= -abs(cfg_eff.stop_loss_pct):
@@ -1072,3 +1143,50 @@ def emit_sell_intents(
             conn.commit()
 
     return summary
+
+
+def is_risk_reducing_exit_intent(*, action: str, signal_key: str | None) -> bool:
+    """
+    True if an intent is a system-generated, risk-reducing exit eligible to run through
+    the HALT_ALL stop-loss bypass (see TRADING_HALT_ALLOW_STOP_LOSS_EXITS / runloop.py).
+
+    Deliberately narrow: only sells whose signal_key was produced by this module's
+    exit rules (exit_stop_loss_*, exit_trailing_*, exit_time_stop_*, etc. — anything
+    prefixed 'exit_'). Buys, holds, and non-exit sells (e.g. manual/portfolio-trim
+    sells) never qualify.
+    """
+    if (action or "").strip().lower() != "sell":
+        return False
+    return (signal_key or "").strip().lower().startswith("exit_")
+
+
+def find_pending_halt_bypass_intents(conn, *, asof: str | None = None) -> list[dict[str, Any]]:
+    """
+    Pending risk-reducing exit intents eligible for the HALT_ALL stop-loss bypass:
+    action='sell', signal_key startswith 'exit_', and not already linked to an order
+    that is filled or still open (created/submitting/submitted).
+
+    No date filter is applied on purpose: a stop-loss intent that missed its window
+    on a prior HALT_ALL day must remain eligible today rather than going stale, since
+    the whole point of the bypass is to stop a position sitting unprotected past its
+    stop indefinitely. `asof` is accepted for future use/logging only.
+    """
+    rows = conn.execute(
+        """
+        SELECT i.id AS intent_id, i.run_id, i.symbol, i.action, i.signal_key, i.reason, i.created_at
+        FROM intents i
+        LEFT JOIN orders o
+          ON o.intent_id = i.id
+         AND o.status IN ('created','submitting','submitted','filled')
+        WHERE i.action = 'sell'
+          AND o.id IS NULL
+        ORDER BY i.created_at ASC, i.id ASC;
+        """
+    ).fetchall()
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not is_risk_reducing_exit_intent(action=r["action"], signal_key=r["signal_key"]):
+            continue
+        out.append(dict(r))
+    return out

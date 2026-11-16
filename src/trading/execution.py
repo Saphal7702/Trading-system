@@ -32,6 +32,7 @@ def execute_run(
     allow_buys: bool = True,
     allow_sells: bool = True,
     risk_state: str | None = None,
+    intent_id_allowlist: set[int] | None = None,
 ) -> dict[str, Any]:
     """
     Core execution routine (Phase 2): callable from CLI and runloop.
@@ -45,6 +46,17 @@ def execute_run(
       - paper-gated via is_paper_submit_allowed()
       - safety rails: daily trade cap, open-order protection, cooldown (planner + execution backup)
       - NEW: execution-layer risk gating (PAUSE_BUYS / SELL_ONLY / HALT_ALL)
+
+    intent_id_allowlist:
+      - Opt-in restriction used ONLY by the HALT_ALL stop-loss exit bypass
+        (see runloop._run_halt_all_exit_bypass). When None (default), behavior is
+        completely unchanged: intents are built/persisted from the normal pipeline
+        (build_orders_from_intents / build_orders_from_intent_queue).
+      - When provided, the normal intent->order build step is skipped entirely (the
+        caller is expected to have already persisted the specific orders it wants
+        submitted, e.g. via persist_orders), and order selection for submission is
+        additionally filtered to orders whose intent_id is in this set. This keeps
+        the bypass from ever sweeping up unrelated pending intents/orders.
 
     Locking note:
       - keep SQLite write transactions short
@@ -189,42 +201,55 @@ def execute_run(
     # 1) Build + persist (idempotent) from intents
     # Phase 6: intent-queue execution (execute pending intents across runs)
     # Toggle with TRADING_EXECUTION_MODE=run|queue (default queue).
-    exec_mode = os.getenv("TRADING_EXECUTION_MODE", "queue").strip().lower()
-    lookback_days = env_int("TRADING_INTENT_QUEUE_LOOKBACK_DAYS", 7)
+    if intent_id_allowlist is None:
+        exec_mode = os.getenv("TRADING_EXECUTION_MODE", "queue").strip().lower()
+        lookback_days = env_int("TRADING_INTENT_QUEUE_LOOKBACK_DAYS", 7)
 
-    if exec_mode == "run":
-        proposed = build_orders_from_intents(run_id=run_id, default_qty=qty_default)
-    else:
-        proposed = build_orders_from_intent_queue(
-            run_id=run_id,
-            default_qty=qty_default,
-            lookback_days=lookback_days,
+        if exec_mode == "run":
+            proposed = build_orders_from_intents(run_id=run_id, default_qty=qty_default)
+        else:
+            proposed = build_orders_from_intent_queue(
+                run_id=run_id,
+                default_qty=qty_default,
+                lookback_days=lookback_days,
+            )
+
+        inserted = persist_orders(run_id=run_id, orders=proposed)
+
+        summary["proposed"] = len(proposed)
+        summary["inserted"] = inserted
+
+        log.info(
+            "Execute(run_id=%s): proposed=%s | inserted_into_db=%s | retry_failed=%s | per_pos=$%.2f | haircut=%.4f | risk_state=%s | allow_buys=%s allow_sells=%s",
+            run_id,
+            len(proposed),
+            inserted,
+            retry_failed,
+            per_position_notional,
+            notional_haircut,
+            risk_state,
+            bool(allow_buys),
+            bool(allow_sells),
         )
 
-    inserted = persist_orders(run_id=run_id, orders=proposed)
+        if not proposed:
+            log.info("No actionable intents (buy/sell). Nothing to do.")
+            return summary
 
-    summary["proposed"] = len(proposed)
-    summary["inserted"] = inserted
-
-    log.info(
-        "Execute(run_id=%s): proposed=%s | inserted_into_db=%s | retry_failed=%s | per_pos=$%.2f | haircut=%.4f | risk_state=%s | allow_buys=%s allow_sells=%s",
-        run_id,
-        len(proposed),
-        inserted,
-        retry_failed,
-        per_position_notional,
-        notional_haircut,
-        risk_state,
-        bool(allow_buys),
-        bool(allow_sells),
-    )
-
-    if not proposed:
-        log.info("No actionable intents (buy/sell). Nothing to do.")
-        return summary
-
-    for o in proposed:
-        log.info("PROPOSED %s %s qty=%s | %s", o.side.upper(), o.symbol, o.qty, o.reason)
+        for o in proposed:
+            log.info("PROPOSED %s %s qty=%s | %s", o.side.upper(), o.symbol, o.qty, o.reason)
+    else:
+        # Bypass mode: caller already persisted the specific orders it wants submitted.
+        summary["proposed"] = len(intent_id_allowlist)
+        summary["inserted"] = 0
+        log.info(
+            "Execute(run_id=%s): intent_id_allowlist mode | restricted to %s pre-persisted intent(s) | risk_state=%s allow_buys=%s allow_sells=%s",
+            run_id,
+            len(intent_id_allowlist),
+            risk_state,
+            bool(allow_buys),
+            bool(allow_sells),
+        )
 
     if not submit:
         summary["skipped_reason"] = "dry_run"
@@ -260,6 +285,13 @@ def execute_run(
             except Exception:
                 pass
 
+        allowlist_clause = ""
+        query_params: list = [run_id, *eligible_statuses]
+        if intent_id_allowlist is not None:
+            allow_placeholders = ",".join("?" for _ in intent_id_allowlist)
+            allowlist_clause = f" AND o.intent_id IN ({allow_placeholders})"
+            query_params.extend(int(x) for x in intent_id_allowlist)
+
         db_orders_local = conn.execute(
             f"""
             SELECT
@@ -272,12 +304,13 @@ def execute_run(
               ON i.id = o.intent_id
             WHERE o.run_id = ?
               AND o.status IN ({placeholders})
+              {allowlist_clause}
             ORDER BY
               CASE o.side WHEN 'sell' THEN 0 ELSE 1 END,
               COALESCE(i.final_rank, 0) DESC,
               o.id ASC;
             """,
-            (run_id, *eligible_statuses),
+            tuple(query_params),
         ).fetchall()
 
         already_local = conn.execute(
